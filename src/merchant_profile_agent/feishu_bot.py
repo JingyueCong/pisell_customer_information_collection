@@ -15,7 +15,14 @@ LOGGER = logging.getLogger("merchant_profile_agent.feishu_bot")
 SAVE_COMMANDS = {"结束并保存", "/save"}
 DISCARD_COMMANDS = {"放弃本次对话", "/discard"}
 HELP_COMMANDS = {"/help", "帮助"}
-GROUP_ENABLE_COMMANDS = {"开启自动总结", "开启群总结", "启用自动总结"}
+GROUP_ENABLE_COMMANDS = {
+    "开始记录",
+    "开始收集",
+    "开始群记录",
+    "开启自动总结",
+    "开启群总结",
+    "启用自动总结",
+}
 GROUP_PAUSE_COMMANDS = {"暂停自动总结", "暂停群总结", "关闭自动总结"}
 GROUP_SUMMARIZE_COMMANDS = {"立即总结", "现在总结", "总结本段"}
 NATURAL_SAVE_CONFIRMATIONS = {
@@ -487,7 +494,12 @@ class FeishuBotController:
             return
         if not session.group_summary_enabled:
             if mentioned and _matches_command(text, HELP_COMMANDS):
-                await self._reply(message, "请 @机器人 回复“开启自动总结”。")
+                await self._reply(message, "请 @机器人 回复“开始记录”。")
+            elif mentioned:
+                await self._reply(
+                    message,
+                    "本群尚未开始记录。请先 @机器人 回复“开始记录”。",
+                )
             return
         if mentioned and _matches_command(text, GROUP_PAUSE_COMMANDS):
             session.group_summary_enabled = False
@@ -515,6 +527,17 @@ class FeishuBotController:
             await self._reply(message, _links_text(session.last_documents))
             return
         if mentioned and _is_group_save_confirmation(text):
+            if session.group_buffer:
+                if session.group_followup_pending:
+                    ready = await self._summarize_group_followup(
+                        session, message, reply_on_success=False
+                    )
+                else:
+                    ready = await self._summarize_group(
+                        session, message, reply_on_success=False
+                    )
+                if not ready:
+                    return
             await self._save(message, session, "结束并保存")
             return
         if not mentioned and (
@@ -575,10 +598,16 @@ class FeishuBotController:
         except Exception:
             LOGGER.exception("automatic group summary failed")
 
-    async def _summarize_group(self, session: Session, message: Any) -> None:
+    async def _summarize_group(
+        self,
+        session: Session,
+        message: Any,
+        *,
+        reply_on_success: bool = True,
+    ) -> bool:
         if not session.group_buffer:
             await self._reply(message, "暂无新的群消息可总结。")
-            return
+            return False
         segment = list(session.group_buffer)
         session.messages = segment
         try:
@@ -589,18 +618,26 @@ class FeishuBotController:
                 f"本群摘要已绑定 {session.merchant.get('name') if session.merchant else '其他商户'}；"
                 "切换商户前请 @机器人 回复 /discard。",
             )
-            return
+            return False
         except MerchantApiError:
             LOGGER.exception("group summary API request failed")
             await self._reply(message, "本段总结失败，消息仍保留，将稍后重试。")
-            return
+            return False
         session.clear_group_buffer()
-        await self._reply(message, _group_summary_text(preview))
+        if reply_on_success:
+            await self._reply(message, _group_summary_text(preview))
+        return True
 
-    async def _summarize_group_followup(self, session: Session, message: Any) -> None:
+    async def _summarize_group_followup(
+        self,
+        session: Session,
+        message: Any,
+        *,
+        reply_on_success: bool = True,
+    ) -> bool:
         if not session.group_buffer:
             await self._reply(message, "请 @机器人 补充商户名称或需要确认的内容。")
-            return
+            return False
         previous_messages = list(session.messages)
         session.messages = [*previous_messages, *session.group_buffer]
         try:
@@ -612,12 +649,12 @@ class FeishuBotController:
                 f"当前草稿属于 {session.merchant.get('name') if session.merchant else '其他商户'}；"
                 "如需切换，请先 @机器人 回复 /discard。",
             )
-            return
+            return False
         except MerchantApiError:
             session.messages = previous_messages
             LOGGER.exception("group follow-up analysis failed")
             await self._reply(message, "补充信息处理失败，消息仍保留，请稍后重试。")
-            return
+            return False
         session.clear_group_buffer()
         updates = preview.get("profile_updates")
         session.group_followup_pending = not (
@@ -626,7 +663,9 @@ class FeishuBotController:
             and isinstance(updates, list)
             and updates
         )
-        await self._reply(message, _group_summary_text(preview))
+        if reply_on_success:
+            await self._reply(message, _group_summary_text(preview))
+        return True
 
     async def _save(self, message: Any, session: Session, confirmation: str) -> None:
         preview = session.preview or {}

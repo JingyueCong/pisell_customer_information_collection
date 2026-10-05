@@ -223,6 +223,34 @@ class FeishuBotTests(unittest.TestCase):
         self.assertEqual(self.api.calls, [])
         self.assertEqual(self.channel.replies, [])
 
+    def test_group_mentioned_message_before_enable_explains_how_to_start(self) -> None:
+        self.run_group("保存吧", mentioned=True)
+
+        self.assertEqual(self.api.calls, [])
+        self.assertIn("开始记录", self.channel.replies[-1][1]["text"])
+
+    def test_group_start_recording_alias_and_save_flush_pending_messages(self) -> None:
+        self.bot = FeishuBotController(
+            api=self.api,  # type: ignore[arg-type]
+            channel=self.channel,
+            sessions=self.sessions,
+            group_message_threshold=20,
+            group_idle_seconds=600,
+            group_idle_min_messages=5,
+        )
+        self.run_group("开始记录", mentioned=True, message_id="om_start")
+        self.run_group("青禾便当联系人是林经理", message_id="om_contact")
+        self.run_group("电话是040304020402", message_id="om_phone")
+
+        calls_before_save = len(self.api.calls)
+        replies_before_save = len(self.channel.replies)
+        self.run_group("保存吧", mentioned=True, message_id="om_save")
+
+        paths = [path for path, _ in self.api.calls[calls_before_save:]]
+        self.assertEqual(paths, ["/v1/profile/analyze", "/v1/profile/read", "/v1/profile/commit"])
+        self.assertEqual(len(self.channel.replies), replies_before_save + 1)
+        self.assertIn("已写入", self.channel.replies[-1][1]["text"])
+
     def test_group_summarizes_shared_chat_after_threshold(self) -> None:
         self.run_group("开启自动总结", mentioned=True)
         self.run_group(
