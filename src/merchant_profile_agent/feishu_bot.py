@@ -121,6 +121,7 @@ class Session:
     conversation_id: str = field(default_factory=lambda: str(uuid.uuid4()))
     messages: list[dict[str, str]] = field(default_factory=list)
     current_profile: dict[str, Any] = field(default_factory=dict)
+    current_profile_loaded: bool = False
     merchant: dict[str, Any] | None = None
     preview: dict[str, Any] | None = None
     last_documents: list[dict[str, str]] = field(default_factory=list)
@@ -133,11 +134,13 @@ class Session:
     group_idle_task: asyncio.Task[Any] | None = field(default=None, repr=False)
     touched_at: float = field(default_factory=time.monotonic)
 
-    def reset_draft(self) -> None:
+    def reset_draft(self, *, preserve_merchant: bool = False) -> None:
+        merchant = self.merchant if preserve_merchant else None
         self.conversation_id = str(uuid.uuid4())
         self.messages.clear()
         self.current_profile.clear()
-        self.merchant = None
+        self.current_profile_loaded = False
+        self.merchant = merchant
         self.preview = None
         self.group_followup_pending = False
         self.touched_at = time.monotonic()
@@ -355,6 +358,10 @@ def _preview_text(result: dict[str, Any]) -> str:
 def _group_summary_text(result: dict[str, Any]) -> str:
     sections: list[str] = []
 
+    merchant = result.get("merchant")
+    if isinstance(merchant, dict) and merchant.get("name"):
+        sections.append(f"商户：{merchant['name']}")
+
     def add_section(title: str, raw_items: Any) -> None:
         if not isinstance(raw_items, list):
             return
@@ -481,6 +488,17 @@ class FeishuBotController:
             await self._reply(message, "服务暂不可用，未写入知识库。")
 
     async def _analyze_session(self, session: Session) -> dict[str, Any]:
+        if session.merchant and not session.current_profile_loaded:
+            read = await self._post(
+                "/v1/profile/read",
+                {
+                    "merchant_name": session.merchant["name"],
+                    "merchant_id": session.merchant.get("id"),
+                },
+            )
+            profile = read.get("profile")
+            session.current_profile = profile if isinstance(profile, dict) else {}
+            session.current_profile_loaded = True
         preview = await self._post(
             "/v1/profile/analyze",
             {"messages": session.messages, "current_profile": session.current_profile},
@@ -501,6 +519,7 @@ class FeishuBotController:
                 )
                 profile = read.get("profile")
                 session.current_profile = profile if isinstance(profile, dict) else {}
+                session.current_profile_loaded = True
                 if session.current_profile.get("fields"):
                     preview = await self._post(
                         "/v1/profile/analyze",
@@ -509,6 +528,11 @@ class FeishuBotController:
                             "current_profile": session.current_profile,
                         },
                     )
+        if session.merchant and not (
+            isinstance(preview.get("merchant"), dict)
+            and preview["merchant"].get("name")
+        ):
+            preview["merchant"] = dict(session.merchant)
         session.preview = preview
         return preview
 
@@ -750,6 +774,6 @@ class FeishuBotController:
                 message,
                 reply_text,
             )
-            session.reset_draft()
+            session.reset_draft(preserve_merchant=_is_group_message(message))
             return
         await self._reply(message, "提交未完成，草稿已保留。")

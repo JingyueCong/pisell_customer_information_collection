@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pisell-merchant-profile-agent"
-version = "0.3.3"
+version = "0.3.4"
 description = "A standalone, API-first merchant profile collection agent"
 readme = "README.md"
 requires-python = ">=3.11"

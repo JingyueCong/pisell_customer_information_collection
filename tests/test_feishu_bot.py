@@ -121,6 +121,54 @@ class MissingMerchantThenCorrectionApi(FakeApi):
         raise AssertionError(path)
 
 
+class PronounContinuationApi(FakeApi):
+    def post(self, path, payload):
+        self.calls.append((path, copy.deepcopy(payload)))
+        if path == "/v1/profile/analyze":
+            content = "\n".join(item["content"] for item in payload["messages"])
+            first_segment = "联系人" in content
+            return {
+                "merchant": {
+                    "name": "汪汪咖啡店" if first_segment else None,
+                    "id": None,
+                },
+                "reply": "已识别。",
+                "profile_updates": [
+                    {
+                        "field_path": (
+                            "contacts.primary.name" if first_segment else "business.sales_team"
+                        ),
+                        "value": "李经理" if first_segment else "有 POS 机业务员，规模不小",
+                        "source_ref": payload["messages"][0]["source_ref"],
+                        "replace_confirmed": False,
+                        "state": "explicit",
+                        "document_type": (
+                            "business-contacts" if first_segment else "merchant-overview"
+                        ),
+                    }
+                ],
+                "conflicts": [],
+                "save_readiness": "ready",
+                "next_question": None,
+                "summary_points": [
+                    "联系人是李经理"
+                    if first_segment
+                    else "他们有 POS 机业务员，规模不小"
+                ],
+                "decisions": [],
+                "action_items": [],
+                "information_gaps": [],
+            }
+        if path == "/v1/profile/read":
+            return {"profile": {"fields": {}, "event_count": 0}}
+        if path == "/v1/profile/commit":
+            return {
+                "write_performed": True,
+                "result": {"store_status": "stored", "documents": []},
+            }
+        raise AssertionError(path)
+
+
 class FeishuBotTests(unittest.TestCase):
     def setUp(self) -> None:
         self.api = FakeApi()
@@ -387,6 +435,47 @@ class FeishuBotTests(unittest.TestCase):
         self.assertTrue(any("Dandong咖啡厅" in item["content"] for item in corrected_messages))
         commit = next(payload for path, payload in api.calls if path == "/v1/profile/commit")
         self.assertEqual(commit["merchant"]["name"], "Dandong咖啡厅")
+
+    def test_group_pronoun_after_save_reuses_last_merchant(self) -> None:
+        api = PronounContinuationApi()
+        bot = FeishuBotController(
+            api=api,  # type: ignore[arg-type]
+            channel=self.channel,
+            sessions=SessionStore(),
+            group_message_threshold=1,
+            group_idle_seconds=600,
+            group_idle_min_messages=1,
+        )
+
+        async def scenario() -> None:
+            base = {
+                "chat_id": "oc_pronoun",
+                "chat_type": "group",
+                "sender_name": "测试成员",
+            }
+            await bot.on_message(Message("开始记录", mentioned_bot=True, **base))
+            await bot.on_message(
+                Message("汪汪咖啡店联系人是李经理", message_id="om_first", **base)
+            )
+            await bot.on_message(
+                Message("保存吧", message_id="om_save_first", mentioned_bot=True, **base)
+            )
+            await bot.on_message(
+                Message("他们有 POS 机业务员，规模不小", message_id="om_pronoun", **base)
+            )
+            self.assertIn("商户：汪汪咖啡店", self.channel.replies[-1][1]["text"])
+            await bot.on_message(
+                Message("保存吧", message_id="om_save_second", mentioned_bot=True, **base)
+            )
+
+        asyncio.run(scenario())
+
+        commits = [payload for path, payload in api.calls if path == "/v1/profile/commit"]
+        self.assertEqual(len(commits), 2)
+        self.assertEqual(commits[1]["merchant"]["name"], "汪汪咖啡店")
+        reads = [payload for path, payload in api.calls if path == "/v1/profile/read"]
+        self.assertGreaterEqual(len(reads), 2)
+        self.assertEqual(reads[-1]["merchant_name"], "汪汪咖啡店")
 
     def test_group_mentioned_sentence_is_not_save_confirmation(self) -> None:
         self.run_group("开启自动总结", mentioned=True)
