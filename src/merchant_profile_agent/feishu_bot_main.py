@@ -18,6 +18,17 @@ def _required(name: str) -> str:
     return value
 
 
+def _integer(name: str, default: int, minimum: int, maximum: int) -> int:
+    raw = os.environ.get(name, str(default))
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ConfigurationError(f"{name} must be an integer") from exc
+    if not minimum <= value <= maximum:
+        raise ConfigurationError(f"{name} must be between {minimum} and {maximum}")
+    return value
+
+
 def build_channel():
     try:
         from lark_channel import FeishuChannel, LogLevel, PolicyConfig, SecurityConfig
@@ -39,7 +50,9 @@ def build_channel():
         for item in os.environ.get("FEISHU_BOT_SENDER_ALLOWLIST", "").split(",")
         if item.strip()
     ]
-    policy_options: dict[str, object] = {"require_mention": True}
+    # Passive group collection is gated again inside the controller by an
+    # explicit @bot enable command. Save/control commands still require @bot.
+    policy_options: dict[str, object] = {"require_mention": False}
     if group_allowlist:
         policy_options.update(
             {"group_policy": "allowlist", "group_allowlist": group_allowlist}
@@ -70,6 +83,15 @@ def build_channel():
         channel=channel,
         sessions=SessionStore(
             ttl_seconds=int(os.environ.get("FEISHU_BOT_SESSION_TTL", "14400"))
+        ),
+        group_message_threshold=_integer(
+            "FEISHU_GROUP_SUMMARY_MESSAGE_THRESHOLD", 20, 5, 100
+        ),
+        group_idle_seconds=_integer(
+            "FEISHU_GROUP_SUMMARY_IDLE_SECONDS", 600, 60, 3_600
+        ),
+        group_idle_min_messages=_integer(
+            "FEISHU_GROUP_SUMMARY_IDLE_MIN_MESSAGES", 5, 2, 50
         ),
     )
     channel.on("message", controller.on_message)

@@ -35,6 +35,9 @@ def extraction(**overrides):
         "assumptions": [],
         "information_gaps": [],
         "next_question": None,
+        "summary_points": ["联系人已确认"],
+        "decisions": [],
+        "action_items": [],
     }
     value.update(overrides)
     return value

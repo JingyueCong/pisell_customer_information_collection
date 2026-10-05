@@ -15,6 +15,9 @@ LOGGER = logging.getLogger("merchant_profile_agent.feishu_bot")
 SAVE_COMMANDS = {"结束并保存", "/save"}
 DISCARD_COMMANDS = {"放弃本次对话", "/discard"}
 HELP_COMMANDS = {"/help", "帮助"}
+GROUP_ENABLE_COMMANDS = {"开启自动总结", "开启群总结", "启用自动总结"}
+GROUP_PAUSE_COMMANDS = {"暂停自动总结", "暂停群总结", "关闭自动总结"}
+GROUP_SUMMARIZE_COMMANDS = {"立即总结", "现在总结", "总结本段"}
 NATURAL_SAVE_CONFIRMATIONS = {
     "结束并保存",
     "保存",
@@ -114,6 +117,12 @@ class Session:
     merchant: dict[str, Any] | None = None
     preview: dict[str, Any] | None = None
     last_documents: list[dict[str, str]] = field(default_factory=list)
+    group_summary_enabled: bool = False
+    group_buffer: list[dict[str, str]] = field(default_factory=list)
+    group_pending_count: int = 0
+    group_generation: int = 0
+    group_last_message: Any = None
+    group_idle_task: asyncio.Task[Any] | None = field(default=None, repr=False)
     touched_at: float = field(default_factory=time.monotonic)
 
     def reset_draft(self) -> None:
@@ -123,6 +132,19 @@ class Session:
         self.merchant = None
         self.preview = None
         self.touched_at = time.monotonic()
+
+    def clear_group_buffer(self) -> None:
+        self.group_buffer.clear()
+        self.group_pending_count = 0
+        self.group_generation += 1
+        self.group_last_message = None
+        self.cancel_idle_task()
+
+    def cancel_idle_task(self) -> None:
+        task = self.group_idle_task
+        self.group_idle_task = None
+        if task is not None and task is not asyncio.current_task() and not task.done():
+            task.cancel()
 
 
 class SessionStore:
@@ -138,7 +160,9 @@ class SessionStore:
         return session
 
     def discard(self, key: str) -> None:
-        self._sessions.pop(key, None)
+        session = self._sessions.pop(key, None)
+        if session is not None:
+            session.cancel_idle_task()
 
     def prune(self) -> None:
         now = time.monotonic()
@@ -148,16 +172,20 @@ class SessionStore:
             if now - value.touched_at > self.ttl_seconds
         ]
         for key in expired:
-            self._sessions.pop(key, None)
+            self.discard(key)
         if len(self._sessions) > self.maximum:
             oldest = sorted(self._sessions, key=lambda key: self._sessions[key].touched_at)
             for key in oldest[: len(self._sessions) - self.maximum]:
-                self._sessions.pop(key, None)
+                self.discard(key)
 
 
 def _session_key(message: Any) -> str:
     conversation = getattr(message, "conversation", None)
     thread_id = getattr(conversation, "thread_id", None) or "root"
+    if _is_group_message(message):
+        return ":".join(
+            [str(getattr(message, "chat_id", "unknown")), "group", str(thread_id)]
+        )
     return ":".join(
         [
             str(getattr(message, "chat_id", "unknown")),
@@ -165,6 +193,10 @@ def _session_key(message: Any) -> str:
             str(thread_id),
         ]
     )
+
+
+def _is_group_message(message: Any) -> bool:
+    return str(getattr(message, "chat_type", "")).lower() in {"group", "topic"}
 
 
 def _source_ref(message: Any) -> str:
@@ -182,6 +214,21 @@ def _is_save_confirmation(text: str) -> bool:
     if text in SAVE_COMMANDS:
         return True
     return _normalize_intent_text(text) in NATURAL_SAVE_CONFIRMATIONS
+
+
+def _matches_command(text: str, commands: set[str]) -> bool:
+    normalized = _normalize_intent_text(text)
+    return normalized in commands
+
+
+def _is_group_save_confirmation(text: str) -> bool:
+    normalized = _normalize_intent_text(text)
+    return normalized == "/save" or normalized in NATURAL_SAVE_CONFIRMATIONS
+
+
+def _is_effective_group_message(text: str) -> bool:
+    compact = _normalize_intent_text(text)
+    return len(compact) >= 2 and bool(re.search(r"[0-9A-Za-z\u3400-\u9fff]{2}", compact))
 
 
 def _is_link_request(text: str) -> bool:
@@ -263,6 +310,47 @@ def _preview_text(result: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _group_summary_text(result: dict[str, Any]) -> str:
+    sections: list[str] = []
+
+    def add_section(title: str, raw_items: Any) -> None:
+        if not isinstance(raw_items, list):
+            return
+        items = [str(item).strip() for item in raw_items if str(item).strip()]
+        if not items:
+            return
+        sections.append(title + "：\n" + "\n".join(f"- {item}" for item in items[:5]))
+
+    add_section("阶段总结", result.get("summary_points"))
+    add_section("已决定", result.get("decisions"))
+    add_section("待办", result.get("action_items"))
+
+    updates = result.get("profile_updates")
+    if isinstance(updates, list) and updates:
+        lines = [
+            f"- {_field_label(item.get('field_path'))}：{item.get('value')}"
+            for item in updates[:20]
+            if isinstance(item, dict)
+        ]
+        if lines:
+            sections.append("可写入知识库：\n" + "\n".join(lines))
+
+    gaps = result.get("information_gaps")
+    add_section("待确认", gaps)
+    if result.get("next_question") and not gaps:
+        sections.append("待确认：\n- " + str(result["next_question"]))
+
+    if not sections:
+        sections.append("本段没有需要记录的商户信息。")
+    if result.get("save_readiness") == "ready" and updates:
+        sections.append("如需写入，请 @机器人 回复“保存吧”。")
+    return "\n\n".join(sections)
+
+
+class MerchantSwitchError(RuntimeError):
+    pass
+
+
 class FeishuBotController:
     def __init__(
         self,
@@ -270,10 +358,16 @@ class FeishuBotController:
         api: MerchantApiClient,
         channel: ReplyChannel,
         sessions: SessionStore | None = None,
+        group_message_threshold: int = 20,
+        group_idle_seconds: int = 600,
+        group_idle_min_messages: int = 5,
     ) -> None:
         self.api = api
         self.channel = channel
         self.sessions = sessions or SessionStore()
+        self.group_message_threshold = group_message_threshold
+        self.group_idle_seconds = group_idle_seconds
+        self.group_idle_min_messages = group_idle_min_messages
 
     async def _post(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
         return await asyncio.to_thread(self.api.post, path, payload)
@@ -287,6 +381,12 @@ class FeishuBotController:
         text = str(getattr(message, "body_text", "") or "").strip()
         if not text:
             return
+        if _is_group_message(message):
+            await self._on_group_message(message, text)
+            return
+        await self._on_direct_message(message, text)
+
+    async def _on_direct_message(self, message: Any, text: str) -> None:
         key = _session_key(message)
         if text in HELP_COMMANDS:
             await self._reply(
@@ -317,41 +417,7 @@ class FeishuBotController:
             }
         )
         try:
-            preview = await self._post(
-                "/v1/profile/analyze",
-                {"messages": session.messages, "current_profile": session.current_profile},
-            )
-            merchant = preview.get("merchant")
-            if isinstance(merchant, dict) and merchant.get("name"):
-                if session.merchant and session.merchant.get("name") != merchant.get("name"):
-                    session.messages.pop()
-                    await self._reply(
-                        message,
-                        f"当前草稿属于 {session.merchant.get('name')}。"
-                        "如需切换商户，请先回复 /discard，再开始新的资料收集。",
-                    )
-                    return
-                changed = not session.merchant or session.merchant.get("name") != merchant.get("name")
-                session.merchant = {"name": merchant.get("name"), "id": merchant.get("id")}
-                if changed:
-                    read = await self._post(
-                        "/v1/profile/read",
-                        {
-                            "merchant_name": session.merchant["name"],
-                            "merchant_id": session.merchant.get("id"),
-                        },
-                    )
-                    profile = read.get("profile")
-                    session.current_profile = profile if isinstance(profile, dict) else {}
-                    if session.current_profile.get("fields"):
-                        preview = await self._post(
-                            "/v1/profile/analyze",
-                            {
-                                "messages": session.messages,
-                                "current_profile": session.current_profile,
-                            },
-                        )
-            session.preview = preview
+            preview = await self._analyze_session(session)
             reply_text = _preview_text(preview)
             session.messages.append(
                 {
@@ -361,9 +427,159 @@ class FeishuBotController:
                 }
             )
             await self._reply(message, reply_text)
+        except MerchantSwitchError:
+            session.messages.pop()
+            await self._reply(
+                message,
+                f"当前草稿属于 {session.merchant.get('name') if session.merchant else '其他商户'}。"
+                "如需切换，请先回复 /discard。",
+            )
         except MerchantApiError:
             LOGGER.exception("merchant API request failed")
             await self._reply(message, "服务暂不可用，未写入知识库。")
+
+    async def _analyze_session(self, session: Session) -> dict[str, Any]:
+        preview = await self._post(
+            "/v1/profile/analyze",
+            {"messages": session.messages, "current_profile": session.current_profile},
+        )
+        merchant = preview.get("merchant")
+        if isinstance(merchant, dict) and merchant.get("name"):
+            if session.merchant and session.merchant.get("name") != merchant.get("name"):
+                raise MerchantSwitchError
+            changed = not session.merchant or session.merchant.get("name") != merchant.get("name")
+            session.merchant = {"name": merchant.get("name"), "id": merchant.get("id")}
+            if changed:
+                read = await self._post(
+                    "/v1/profile/read",
+                    {
+                        "merchant_name": session.merchant["name"],
+                        "merchant_id": session.merchant.get("id"),
+                    },
+                )
+                profile = read.get("profile")
+                session.current_profile = profile if isinstance(profile, dict) else {}
+                if session.current_profile.get("fields"):
+                    preview = await self._post(
+                        "/v1/profile/analyze",
+                        {
+                            "messages": session.messages,
+                            "current_profile": session.current_profile,
+                        },
+                    )
+        session.preview = preview
+        return preview
+
+    async def _on_group_message(self, message: Any, text: str) -> None:
+        key = _session_key(message)
+        session = self.sessions.get(key)
+        mentioned = bool(getattr(message, "mentioned_bot", False))
+
+        if mentioned and _matches_command(text, GROUP_ENABLE_COMMANDS):
+            session.group_summary_enabled = True
+            await self._reply(
+                message,
+                "自动总结已开启：20 条有效消息，或至少 5 条后安静 10 分钟。"
+                "群消息会发送给 AI 生成摘要；不会自动写知识库。",
+            )
+            return
+        if not session.group_summary_enabled:
+            if mentioned and _matches_command(text, HELP_COMMANDS):
+                await self._reply(message, "请 @机器人 回复“开启自动总结”。")
+            return
+        if mentioned and _matches_command(text, GROUP_PAUSE_COMMANDS):
+            session.group_summary_enabled = False
+            session.clear_group_buffer()
+            await self._reply(message, "自动总结已暂停。")
+            return
+        if mentioned and _matches_command(text, GROUP_SUMMARIZE_COMMANDS):
+            await self._summarize_group(session, message)
+            return
+        if mentioned and _matches_command(text, HELP_COMMANDS):
+            await self._reply(
+                message,
+                "群总结已开启。可用：立即总结、暂停自动总结、保存吧、/discard。",
+            )
+            return
+        if mentioned and _matches_command(text, DISCARD_COMMANDS):
+            session.reset_draft()
+            session.clear_group_buffer()
+            await self._reply(message, "已放弃当前摘要草稿，自动总结仍开启。")
+            return
+        if mentioned and _is_link_request(text):
+            await self._reply(message, _links_text(session.last_documents))
+            return
+        if mentioned and _is_group_save_confirmation(text):
+            await self._save(message, session, "结束并保存")
+            return
+        if not mentioned and (
+            _is_group_save_confirmation(text)
+            or _matches_command(text, GROUP_ENABLE_COMMANDS)
+            or _matches_command(text, GROUP_PAUSE_COMMANDS)
+            or _matches_command(text, GROUP_SUMMARIZE_COMMANDS)
+            or _matches_command(text, DISCARD_COMMANDS)
+        ):
+            return
+        if not _is_effective_group_message(text):
+            return
+
+        sender_name = str(getattr(message, "sender_name", "") or "").strip()
+        content = f"{sender_name}：{text}" if sender_name else text
+        session.group_buffer.append(
+            {"role": "user", "content": content, "source_ref": _source_ref(message)}
+        )
+        session.group_pending_count += 1
+        session.group_generation += 1
+        session.group_last_message = message
+        if session.group_pending_count >= self.group_message_threshold:
+            session.cancel_idle_task()
+            await self._summarize_group(session, message)
+            return
+        self._schedule_idle_summary(session)
+
+    def _schedule_idle_summary(self, session: Session) -> None:
+        session.cancel_idle_task()
+        generation = session.group_generation
+        session.group_idle_task = asyncio.create_task(
+            self._summarize_after_idle(session, generation)
+        )
+
+    async def _summarize_after_idle(self, session: Session, generation: int) -> None:
+        try:
+            await asyncio.sleep(self.group_idle_seconds)
+            if (
+                session.group_summary_enabled
+                and session.group_generation == generation
+                and session.group_pending_count >= self.group_idle_min_messages
+                and session.group_last_message is not None
+            ):
+                await self._summarize_group(session, session.group_last_message)
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            LOGGER.exception("automatic group summary failed")
+
+    async def _summarize_group(self, session: Session, message: Any) -> None:
+        if not session.group_buffer:
+            await self._reply(message, "暂无新的群消息可总结。")
+            return
+        segment = list(session.group_buffer)
+        session.messages = segment
+        try:
+            preview = await self._analyze_session(session)
+        except MerchantSwitchError:
+            await self._reply(
+                message,
+                f"本群摘要已绑定 {session.merchant.get('name') if session.merchant else '其他商户'}；"
+                "切换商户前请 @机器人 回复 /discard。",
+            )
+            return
+        except MerchantApiError:
+            LOGGER.exception("group summary API request failed")
+            await self._reply(message, "本段总结失败，消息仍保留，将稍后重试。")
+            return
+        session.clear_group_buffer()
+        await self._reply(message, _group_summary_text(preview))
 
     async def _save(self, message: Any, session: Session, confirmation: str) -> None:
         preview = session.preview or {}

@@ -24,6 +24,9 @@ Keep the knowledge base minimal:
   conditions, quantities, dates, contact details, or other operational meaning.
 - Do not try to make the profile complete. information_gaps and next_question should cover only a
   detail that blocks the current useful update; otherwise leave them empty/null.
+- For group conversations, also return short summary_points, explicit decisions, and explicit
+  action_items. These are conversational summaries only; do not turn them into profile updates
+  unless they are durable merchant facts explicitly stated by a user.
 
 Use only these field prefixes:
 - business.*, contacts.*
@@ -79,6 +82,21 @@ OUTPUT_SCHEMA: dict[str, Any] = {
         "assumptions": {"type": "array", "items": {"type": "string"}},
         "information_gaps": {"type": "array", "items": {"type": "string"}},
         "next_question": {"type": ["string", "null"]},
+        "summary_points": {
+            "type": "array",
+            "items": {"type": "string"},
+            "maxItems": 5,
+        },
+        "decisions": {
+            "type": "array",
+            "items": {"type": "string"},
+            "maxItems": 5,
+        },
+        "action_items": {
+            "type": "array",
+            "items": {"type": "string"},
+            "maxItems": 5,
+        },
     },
     "required": [
         "merchant_name",
@@ -89,6 +107,9 @@ OUTPUT_SCHEMA: dict[str, Any] = {
         "assumptions",
         "information_gaps",
         "next_question",
+        "summary_points",
+        "decisions",
+        "action_items",
     ],
 }
 
@@ -201,6 +222,9 @@ class MerchantProfileAgent:
             "assumptions": extracted.get("assumptions", []),
             "information_gaps": extracted.get("information_gaps", []),
             "next_question": next_question.strip() if isinstance(next_question, str) else None,
+            "summary_points": extracted.get("summary_points", []),
+            "decisions": extracted.get("decisions", []),
+            "action_items": extracted.get("action_items", []),
             "model": self.client.model,
         }
         if result["save_readiness"] == "needs_confirmation" and not result["next_question"]:
