@@ -230,6 +230,39 @@ def _matches_command(text: str, commands: set[str]) -> bool:
     return normalized in commands
 
 
+def _is_group_enable_intent(text: str) -> bool:
+    normalized = _normalize_intent_text(text)
+    if normalized in GROUP_ENABLE_COMMANDS:
+        return True
+    if not normalized or len(normalized) > 36:
+        return False
+    if any(
+        term in normalized
+        for term in ("不要", "不用", "不需要", "别", "无需", "停止", "暂停", "关闭", "取消")
+    ):
+        return False
+
+    start_terms = ("开始", "开启", "启动", "启用", "打开", "进入")
+    record_terms = ("记录", "收集", "整理", "总结", "归纳", "录入", "记一下", "记下来")
+    request_terms = ("请", "帮我", "帮忙", "麻烦", "我们", "可以", "现在", "接下来", "从现在")
+    context_terms = ("群", "群聊", "聊天", "对话", "商户", "客户", "资料", "信息", "内容", "后面", "接下来")
+
+    has_start = any(term in normalized for term in start_terms)
+    has_record = any(term in normalized for term in record_terms)
+    has_request = any(term in normalized for term in request_terms)
+    has_context = any(term in normalized for term in context_terms)
+    starts_like_command = normalized.startswith(start_terms)
+
+    if has_start and has_record and (starts_like_command or has_request):
+        return True
+    if has_record and has_request and has_context:
+        return True
+    return any(
+        phrase in normalized
+        for phrase in ("可以开始了", "现在开始吧", "准备好了开始吧", "开始工作吧")
+    )
+
+
 def _is_group_save_confirmation(text: str) -> bool:
     normalized = _normalize_intent_text(text)
     return normalized == "/save" or normalized in NATURAL_SAVE_CONFIRMATIONS
@@ -484,7 +517,7 @@ class FeishuBotController:
         session = self.sessions.get(key)
         mentioned = bool(getattr(message, "mentioned_bot", False))
 
-        if mentioned and _matches_command(text, GROUP_ENABLE_COMMANDS):
+        if mentioned and _is_group_enable_intent(text):
             session.group_summary_enabled = True
             await self._reply(
                 message,

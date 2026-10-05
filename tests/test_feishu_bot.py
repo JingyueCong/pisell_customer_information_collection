@@ -251,6 +251,55 @@ class FeishuBotTests(unittest.TestCase):
         self.assertEqual(len(self.channel.replies), replies_before_save + 1)
         self.assertIn("已写入", self.channel.replies[-1][1]["text"])
 
+    def test_group_semantic_start_intents_are_supported(self) -> None:
+        examples = [
+            "接下来请帮我收集群里的商户资料",
+            "从现在开始帮忙整理客户信息",
+            "我们可以开始了，帮我记一下",
+            "麻烦启动群聊总结",
+        ]
+        for index, text in enumerate(examples):
+            with self.subTest(text=text):
+                channel = FakeChannel()
+                bot = FeishuBotController(
+                    api=self.api,  # type: ignore[arg-type]
+                    channel=channel,
+                    sessions=SessionStore(),
+                )
+                asyncio.run(
+                    bot.on_message(
+                        Message(
+                            text,
+                            chat_id=f"oc_semantic_{index}",
+                            chat_type="group",
+                            mentioned_bot=True,
+                        )
+                    )
+                )
+                self.assertIn("自动总结已开启", channel.replies[-1][1]["text"])
+
+    def test_group_negative_or_incidental_recording_language_does_not_start(self) -> None:
+        examples = ["不要开始记录", "请停止记录", "门店开始记录每日销售额"]
+        for index, text in enumerate(examples):
+            with self.subTest(text=text):
+                channel = FakeChannel()
+                bot = FeishuBotController(
+                    api=self.api,  # type: ignore[arg-type]
+                    channel=channel,
+                    sessions=SessionStore(),
+                )
+                asyncio.run(
+                    bot.on_message(
+                        Message(
+                            text,
+                            chat_id=f"oc_negative_{index}",
+                            chat_type="group",
+                            mentioned_bot=True,
+                        )
+                    )
+                )
+                self.assertIn("尚未开始记录", channel.replies[-1][1]["text"])
+
     def test_group_summarizes_shared_chat_after_threshold(self) -> None:
         self.run_group("开启自动总结", mentioned=True)
         self.run_group(
