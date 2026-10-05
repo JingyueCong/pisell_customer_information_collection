@@ -20,7 +20,7 @@ def _required(name: str) -> str:
 
 def build_channel():
     try:
-        from lark_channel import FeishuChannel, PolicyConfig, SecurityConfig
+        from lark_channel import FeishuChannel, LogLevel, PolicyConfig, SecurityConfig
     except ImportError as exc:
         raise ConfigurationError(
             "install the Feishu bot extra: pip install -e '.[feishu]'"
@@ -49,6 +49,9 @@ def build_channel():
     channel = FeishuChannel(
         app_id=app_id,
         app_secret=app_secret,
+        # INFO includes the SDK's full WebSocket URL. Keep temporary connection
+        # parameters out of persistent launchd logs.
+        log_level=LogLevel.WARNING,
         policy=PolicyConfig(**policy_options),
         security=SecurityConfig(
             mode="strict",
