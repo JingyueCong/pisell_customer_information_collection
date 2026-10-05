@@ -67,6 +67,39 @@ DOCUMENT_LABELS = {
     "commercial": "商务信息",
     "store-profile": "门店资料",
 }
+FIELD_LABELS = {
+    "business.name": "商户名称",
+    "business.type": "业务类型",
+    "business.description": "简介",
+    "contacts.primary.name": "主要联系人",
+    "contacts.primary.role": "联系人职位",
+    "contacts.primary.phone": "联系电话",
+    "contacts.primary.email": "联系邮箱",
+    "contacts.secondary.name": "备用联系人",
+    "contacts.secondary.phone": "备用电话",
+    "contacts.secondary.email": "备用邮箱",
+    "menu.url": "菜单链接",
+    "menu.link": "菜单链接",
+    "content.url": "内容链接",
+    "content.link": "内容链接",
+    "stores.primary.name": "门店名称",
+    "stores.primary.address": "门店地址",
+    "stores.primary.phone": "门店电话",
+}
+FIELD_SUFFIX_LABELS = {
+    "name": "名称",
+    "type": "类型",
+    "description": "说明",
+    "role": "职位",
+    "phone": "电话",
+    "email": "邮箱",
+    "address": "地址",
+    "url": "链接",
+    "link": "链接",
+    "status": "状态",
+    "hours": "营业时间",
+    "notes": "备注",
+}
 
 
 class ReplyChannel(Protocol):
@@ -197,6 +230,14 @@ def _links_text(documents: list[dict[str, str]]) -> str:
     )
 
 
+def _field_label(field_path: Any) -> str:
+    path = str(field_path or "")
+    if path in FIELD_LABELS:
+        return FIELD_LABELS[path]
+    suffix = path.rsplit(".", 1)[-1]
+    return FIELD_SUFFIX_LABELS.get(suffix, suffix.replace("_", " ") or "资料")
+
+
 def _preview_text(result: dict[str, Any]) -> str:
     lines: list[str] = []
     updates = result.get("profile_updates")
@@ -204,7 +245,7 @@ def _preview_text(result: dict[str, Any]) -> str:
         lines.append("待保存：")
         for item in updates[:20]:
             if isinstance(item, dict):
-                lines.append(f"- {item.get('field_path')} → {item.get('value')}")
+                lines.append(f"- {_field_label(item.get('field_path'))}：{item.get('value')}")
     conflicts = result.get("conflicts")
     if isinstance(conflicts, list) and conflicts:
         if lines:
@@ -212,11 +253,11 @@ def _preview_text(result: dict[str, Any]) -> str:
         lines.append("有旧值冲突，请确认是否替换。")
     readiness = result.get("save_readiness")
     if readiness == "ready" and updates:
-        lines.extend(["", "回复「结束并保存」确认；尚未写入知识库。"])
+        lines.extend(["", "回复“保存吧”写入。"])
     elif result.get("next_question"):
         if lines:
             lines.append("")
-        lines.extend([str(result["next_question"]), "尚未写入知识库。"])
+        lines.append(str(result["next_question"]))
     else:
         lines.append(str(result.get("reply") or "没有需要记录的信息。"))
     return "\n".join(lines)
@@ -353,15 +394,19 @@ class FeishuBotController:
             return
         store_result = result.get("result") if isinstance(result.get("result"), dict) else {}
         if result.get("write_performed") or store_result.get("duplicate"):
-            document_count = int(store_result.get("wiki_documents_updated") or 0)
             duplicate = "（此前已保存，本次未重复写入）" if store_result.get("duplicate") else ""
             documents = _document_links(store_result)
             if documents:
                 session.last_documents = documents
-            link_suffix = "\n" + _links_text(documents) if documents else ""
+            if documents:
+                reply_text = "已写入：\n" + "\n".join(
+                    f"- {item['label']}：{item['url']}" for item in documents
+                )
+            else:
+                reply_text = f"已写入知识库。{duplicate}"
             await self._reply(
                 message,
-                f"已写入知识库，更新 {document_count} 个页面。{duplicate}{link_suffix}",
+                reply_text,
             )
             session.reset_draft()
             return

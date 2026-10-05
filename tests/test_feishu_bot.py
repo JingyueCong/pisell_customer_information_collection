@@ -96,7 +96,9 @@ class FeishuBotTests(unittest.TestCase):
             ["/v1/profile/analyze", "/v1/profile/read"],
         )
         reply = self.channel.replies[-1][1]["text"]
-        self.assertIn("尚未写入知识库", reply)
+        self.assertIn("主要联系人：林经理", reply)
+        self.assertNotIn("contacts.primary.name", reply)
+        self.assertIn("保存吧", reply)
         self.assertNotIn("已识别联系人", reply)
 
     def test_exact_save_command_commits_latest_preview(self) -> None:
@@ -107,7 +109,7 @@ class FeishuBotTests(unittest.TestCase):
         self.assertEqual(path, "/v1/profile/commit")
         self.assertEqual(payload["confirmation"], "结束并保存")
         self.assertEqual(payload["merchant"]["name"], "青禾便当")
-        self.assertIn("已写入知识库", self.channel.replies[-1][1]["text"])
+        self.assertIn("已写入：", self.channel.replies[-1][1]["text"])
         self.assertIn("https://example.feishu.cn/wiki/contacts", self.channel.replies[-1][1]["text"])
 
     def test_natural_save_confirmation_and_follow_up_links(self) -> None:
