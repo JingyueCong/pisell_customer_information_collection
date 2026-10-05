@@ -4,6 +4,7 @@ set -eu
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 PROJECT_DIR=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
 ENV_FILE=${MERCHANT_AGENT_ENV_FILE:-"$PROJECT_DIR/.env"}
+PYTHON_BIN=${MERCHANT_AGENT_PYTHON:-python3}
 VENV_DIR="$PROJECT_DIR/.venv"
 LOG_DIR="$HOME/Library/Logs/Pisell"
 LAUNCH_DIR="$HOME/Library/LaunchAgents"
@@ -16,12 +17,12 @@ if [ ! -f "$ENV_FILE" ]; then
 fi
 
 chmod 600 "$ENV_FILE"
-python3 -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)' || {
+"$PYTHON_BIN" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)' || {
   echo "Python 3.11 or newer is required." >&2
   exit 1
 }
 
-python3 -m venv "$VENV_DIR"
+"$PYTHON_BIN" -m venv "$VENV_DIR"
 mkdir -p "$LOG_DIR" "$LAUNCH_DIR"
 
 escape_sed() {

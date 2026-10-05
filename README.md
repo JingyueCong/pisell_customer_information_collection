@@ -89,6 +89,12 @@ chmod 600 .env
 curl http://127.0.0.1:8090/healthz
 ```
 
+如果系统 `python3` 低于 3.11，可显式指定已有的 Python：
+
+```bash
+MERCHANT_AGENT_PYTHON=/absolute/path/to/python3.12 ./scripts/install_launchd.sh
+```
+
 服务日志位于：
 
 ```text
