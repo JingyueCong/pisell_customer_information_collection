@@ -42,7 +42,7 @@ def valid_request():
         "messages": [
             {
                 "role": "user",
-                "content": "青禾便当的联系人是林经理",
+                "content": "你好，今天挺忙的。青禾便当的联系人是林经理，麻烦了。",
                 "source_ref": "feishu://chat/oc/message/om",
             }
         ],
@@ -82,6 +82,12 @@ class KnowledgeStoreTests(unittest.TestCase):
         self.assertEqual(
             close["specific"]["profile_updates"][0]["state"], "explicit"
         )
+        history = store.committer.committed["message_history"]
+        self.assertEqual(
+            history,
+            [{"role": "user", "content": "contacts.primary.name: 林经理"}],
+        )
+        self.assertNotIn("今天挺忙", str(history))
 
 
 if __name__ == "__main__":

@@ -80,22 +80,27 @@ def _source_ref(message: Any) -> str:
 
 
 def _preview_text(result: dict[str, Any]) -> str:
-    lines = [str(result.get("reply") or "已整理本次信息。")]
+    lines: list[str] = []
     updates = result.get("profile_updates")
     if isinstance(updates, list) and updates:
-        lines.extend(["", "待保存更新"])
+        lines.append("待保存：")
         for item in updates[:20]:
             if isinstance(item, dict):
                 lines.append(f"- {item.get('field_path')} → {item.get('value')}")
     conflicts = result.get("conflicts")
     if isinstance(conflicts, list) and conflicts:
-        lines.extend(["", "存在旧值冲突，请明确确认是否替换后再保存。"])
+        if lines:
+            lines.append("")
+        lines.append("有旧值冲突，请确认是否替换。")
     readiness = result.get("save_readiness")
     if readiness == "ready" and updates:
-        lines.extend(["", "确认无误后回复：结束并保存"])
+        lines.extend(["", "回复「结束并保存」确认；尚未写入知识库。"])
     elif result.get("next_question"):
-        lines.extend(["", str(result["next_question"])])
-    lines.append("\n草稿尚未写入飞书知识库。")
+        if lines:
+            lines.append("")
+        lines.extend([str(result["next_question"]), "尚未写入知识库。"])
+    else:
+        lines.append(str(result.get("reply") or "没有需要记录的信息。"))
     return "\n".join(lines)
 
 
@@ -127,14 +132,14 @@ class FeishuBotController:
         if text in HELP_COMMANDS:
             await self._reply(
                 message,
-                "告诉我商户名称和需要补充的资料；我会先展示预览。"
-                "\n\n- 回复 结束并保存：提交到飞书知识库"
-                "\n- 回复 /discard：放弃当前草稿",
+                "发送商户名称和要记录的资料。"
+                "\n- 结束并保存：确认写入"
+                "\n- /discard：放弃草稿",
             )
             return
         if text in DISCARD_COMMANDS:
             self.sessions.discard(key)
-            await self._reply(message, "已放弃当前草稿，飞书知识库没有发生写入。")
+            await self._reply(message, "已放弃，未写入知识库。")
             return
 
         session = self.sessions.get(key)
@@ -196,7 +201,7 @@ class FeishuBotController:
             await self._reply(message, reply_text)
         except MerchantApiError:
             LOGGER.exception("merchant API request failed")
-            await self._reply(message, "商户资料服务暂时不可用，本次内容没有写入知识库。")
+            await self._reply(message, "服务暂不可用，未写入知识库。")
 
     async def _save(
         self, message: Any, key: str, session: Session, confirmation: str
@@ -210,7 +215,7 @@ class FeishuBotController:
             or not isinstance(updates, list)
             or not updates
         ):
-            await self._reply(message, "当前草稿还不能保存，请先提供商户名称并解决缺失项或冲突。")
+            await self._reply(message, "暂不能保存，请补充商户名称或解决冲突。")
             return
         try:
             result = await self._post(
@@ -225,7 +230,7 @@ class FeishuBotController:
             )
         except MerchantApiError:
             LOGGER.exception("merchant profile commit failed")
-            await self._reply(message, "保存失败，知识库没有被标记为成功；草稿仍保留，可稍后重试。")
+            await self._reply(message, "保存失败，草稿已保留，请稍后重试。")
             return
         store_result = result.get("result") if isinstance(result.get("result"), dict) else {}
         if result.get("write_performed") or store_result.get("duplicate"):
@@ -233,8 +238,8 @@ class FeishuBotController:
             duplicate = "（此前已保存，本次未重复写入）" if store_result.get("duplicate") else ""
             await self._reply(
                 message,
-                f"已提交到飞书知识库，更新 {document_count} 个商户档案页面。{duplicate}",
+                f"已写入知识库，更新 {document_count} 个页面。{duplicate}",
             )
             self.sessions.discard(key)
             return
-        await self._reply(message, "提交未完成，草稿仍保留；请联系管理员检查知识库连接。")
+        await self._reply(message, "提交未完成，草稿已保留。")

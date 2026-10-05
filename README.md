@@ -11,6 +11,7 @@
 - 使用 OpenAI Responses API + Strict Structured Outputs；
 - 默认模型为 `gpt-6-luna`，可通过环境变量替换；
 - 只保留用户明确提供的事实，推断不会进入 `profile_updates`；
+- 默认采用简短记录：忽略寒暄、重复、主观评价和无关背景，只保留后续经营、配置、支持或合规真正需要的稳定事实；
 - 自动拒绝密码、验证码、Token、API Key、CVV 等敏感字段；
 - 不保存会话，调用方负责传入需要保留的消息和当前档案；
 - 标准库实现，无运行时第三方 Python 依赖。

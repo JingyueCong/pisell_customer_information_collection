@@ -62,6 +62,10 @@ class AgentTests(unittest.TestCase):
         self.assertEqual(result["save_readiness"], "ready")
         self.assertFalse(result["write_performed"])
         self.assertEqual(result["model"], "test-model")
+        self.assertIn(
+            "Keep the knowledge base minimal",
+            client.calls[0]["system_prompt"],
+        )
 
     def test_rejects_assistant_message_as_fact_source(self) -> None:
         client = FakeClient(
@@ -91,4 +95,3 @@ class AgentTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

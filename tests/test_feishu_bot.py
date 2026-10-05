@@ -82,7 +82,9 @@ class FeishuBotTests(unittest.TestCase):
             [path for path, _ in self.api.calls],
             ["/v1/profile/analyze", "/v1/profile/read"],
         )
-        self.assertIn("草稿尚未写入", self.channel.replies[-1][1]["text"])
+        reply = self.channel.replies[-1][1]["text"]
+        self.assertIn("尚未写入知识库", reply)
+        self.assertNotIn("已识别联系人", reply)
 
     def test_exact_save_command_commits_latest_preview(self) -> None:
         self.run_message("青禾便当的联系人是林经理")
@@ -92,14 +94,14 @@ class FeishuBotTests(unittest.TestCase):
         self.assertEqual(path, "/v1/profile/commit")
         self.assertEqual(payload["confirmation"], "结束并保存")
         self.assertEqual(payload["merchant"]["name"], "青禾便当")
-        self.assertIn("已提交到飞书知识库", self.channel.replies[-1][1]["text"])
+        self.assertIn("已写入知识库", self.channel.replies[-1][1]["text"])
 
     def test_discard_never_commits(self) -> None:
         self.run_message("青禾便当的联系人是林经理")
         self.run_message("/discard")
 
         self.assertNotIn("/v1/profile/commit", [path for path, _ in self.api.calls])
-        self.assertIn("没有发生写入", self.channel.replies[-1][1]["text"])
+        self.assertIn("未写入知识库", self.channel.replies[-1][1]["text"])
 
 
 if __name__ == "__main__":

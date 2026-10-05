@@ -128,7 +128,11 @@ class P1KnowledgeStore:
         merchant_name, merchant_id = self._merchant(
             {"merchant_name": merchant.get("name"), "merchant_id": merchant.get("id")}
         )
-        messages = validate_messages(request.get("messages"))
+        # Validate the submitted conversation, but do not persist it verbatim.
+        # Only the accepted facts below belong in the durable P1 event; the
+        # source_ref on each fact preserves traceability without storing chat
+        # filler, repetition, or unrelated background.
+        validate_messages(request.get("messages"))
         raw_updates = request.get("updates")
         if not isinstance(raw_updates, list) or not raw_updates:
             raise ProfileValidationError("updates must be a non-empty array")
@@ -227,8 +231,11 @@ class P1KnowledgeStore:
                 agent=self.agent,
                 conversation_id=conversation_id.strip(),
                 message_history=[
-                    {"role": item["role"], "content": item["content"]}
-                    for item in messages
+                    {
+                        "role": "user",
+                        "content": f"{item['field_path']}: {item['value']}",
+                    }
+                    for item in updates
                 ],
                 close_result=close_result,
             )
