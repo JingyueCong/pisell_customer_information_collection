@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pisell-merchant-profile-agent"
+version = "0.1.0"
+description = "A standalone, API-first merchant profile collection agent"
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "Proprietary"}
+authors = [{name = "PiSell"}]
+dependencies = []
+
+[project.scripts]
+merchant-profile-agent = "merchant_profile_agent.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
