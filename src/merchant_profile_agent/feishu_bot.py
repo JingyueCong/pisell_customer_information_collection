@@ -774,7 +774,7 @@ class FeishuBotController:
                     ]
                     await self._reply(
                         message,
-                        "检测到已有资料不同，暂未写入：\n"
+                        "检测到知识库现有资料不同，暂未写入：\n"
                         + "\n".join(lines)
                         + "\n如需用新值替换，请 @机器人 回复“确认替换”。",
                     )
