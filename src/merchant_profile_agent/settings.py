@@ -48,6 +48,10 @@ class Settings:
     model: str = "gpt-6-luna"
     openai_timeout: int = 60
     max_body_bytes: int = 65_536
+    knowledge_store: str = "disabled"
+    p1_root: str = ""
+    feishu_data_layer_config: str = ""
+    lark_cli: str = "lark-cli"
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -63,6 +67,23 @@ class Settings:
             raise ConfigurationError("MERCHANT_AGENT_MODEL is required")
         if not host:
             raise ConfigurationError("MERCHANT_AGENT_HOST is required")
+        knowledge_store = os.environ.get(
+            "MERCHANT_AGENT_KNOWLEDGE_STORE", "disabled"
+        ).strip().lower()
+        if knowledge_store not in {"disabled", "p1"}:
+            raise ConfigurationError(
+                "MERCHANT_AGENT_KNOWLEDGE_STORE must be disabled or p1"
+            )
+        p1_root = os.environ.get("PISELL_P1_ROOT", "").strip()
+        feishu_data_layer_config = os.environ.get(
+            "PISELL_FEISHU_DATA_LAYER_CONFIG", ""
+        ).strip()
+        if knowledge_store == "p1" and not p1_root:
+            raise ConfigurationError("PISELL_P1_ROOT is required for the p1 knowledge store")
+        if knowledge_store == "p1" and not feishu_data_layer_config:
+            raise ConfigurationError(
+                "PISELL_FEISHU_DATA_LAYER_CONFIG is required for the p1 knowledge store"
+            )
         return cls(
             api_key=api_key,
             openai_api_key=openai_api_key,
@@ -73,5 +94,8 @@ class Settings:
             max_body_bytes=_integer(
                 "MERCHANT_AGENT_MAX_BODY_BYTES", 65_536, 1_024, 1_048_576
             ),
+            knowledge_store=knowledge_store,
+            p1_root=p1_root,
+            feishu_data_layer_config=feishu_data_layer_config,
+            lark_cli=os.environ.get("LARK_CLI", "lark-cli").strip() or "lark-cli",
         )
-

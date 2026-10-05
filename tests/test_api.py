@@ -15,6 +15,19 @@ class FakeAgent:
         return {"merchant": {"name": "青禾便当", "id": None}, "write_performed": False}
 
 
+class FakeKnowledgeStore:
+    name = "fake"
+
+    def read_profile(self, request):
+        return {"profile": {"merchant": {"name": request["merchant_name"]}}, "write_performed": False}
+
+    def commit_profile(self, request):
+        return {
+            "write_performed": True,
+            "result": {"store_status": "stored", "wiki_documents_updated": 2},
+        }
+
+
 class ApiTests(unittest.TestCase):
     def setUp(self) -> None:
         settings = Settings(
@@ -23,7 +36,9 @@ class ApiTests(unittest.TestCase):
             host="127.0.0.1",
             port=0,
         )
-        self.server = create_server(settings, FakeAgent())  # type: ignore[arg-type]
+        self.server = create_server(
+            settings, FakeAgent(), FakeKnowledgeStore()  # type: ignore[arg-type]
+        )
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
         self.base_url = f"http://127.0.0.1:{self.server.server_address[1]}"
@@ -49,6 +64,7 @@ class ApiTests(unittest.TestCase):
 
         self.assertEqual(status, 200)
         self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["knowledge_store"], "fake")
 
     def test_analyze_requires_bearer_token(self) -> None:
         with self.assertRaises(urllib.error.HTTPError) as caught:
@@ -89,6 +105,27 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(result["save_readiness"], "needs_confirmation")
         self.assertEqual(result["conflicts"][0]["current_value"], "林经理")
+
+    def test_read_uses_shared_knowledge_store(self) -> None:
+        status, result = self.request(
+            "/v1/profile/read",
+            {"merchant_name": "青禾便当", "merchant_id": None},
+            token="a" * 24,
+        )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(result["profile"]["merchant"]["name"], "青禾便当")
+        self.assertFalse(result["write_performed"])
+
+    def test_commit_uses_shared_knowledge_store(self) -> None:
+        status, result = self.request(
+            "/v1/profile/commit",
+            {"confirmation": "结束并保存"},
+            token="a" * 24,
+        )
+
+        self.assertEqual(status, 200)
+        self.assertTrue(result["write_performed"])
 
 
 if __name__ == "__main__":

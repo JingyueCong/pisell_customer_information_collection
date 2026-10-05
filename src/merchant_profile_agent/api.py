@@ -12,6 +12,12 @@ from urllib.parse import urlsplit
 
 from . import __version__
 from .agent import MerchantProfileAgent
+from .knowledge_store import (
+    DisabledKnowledgeStore,
+    KnowledgeStore,
+    KnowledgeStoreError,
+    KnowledgeStoreUnavailable,
+)
 from .openai_client import OpenAIClientError
 from .settings import Settings
 from .validation import ProfileValidationError, validate_update_set
@@ -53,11 +59,40 @@ def openapi_document() -> dict[str, Any]:
                     },
                 }
             },
+            "/v1/profile/read": {
+                "post": {
+                    "security": [{"bearerAuth": []}],
+                    "responses": {
+                        "200": {"description": "Current profile rebuilt from Feishu Events"},
+                        "400": {"description": "Invalid request"},
+                        "401": {"description": "Unauthorized"},
+                        "503": {"description": "Knowledge store unavailable"},
+                    },
+                }
+            },
+            "/v1/profile/commit": {
+                "post": {
+                    "security": [{"bearerAuth": []}],
+                    "responses": {
+                        "200": {"description": "Confirmed Event and Wiki projection commit"},
+                        "400": {"description": "Invalid or unconfirmed request"},
+                        "401": {"description": "Unauthorized"},
+                        "502": {"description": "Knowledge store operation failed"},
+                        "503": {"description": "Knowledge store unavailable"},
+                    },
+                }
+            },
         },
     }
 
 
-def create_server(settings: Settings, agent: MerchantProfileAgent) -> ThreadingHTTPServer:
+def create_server(
+    settings: Settings,
+    agent: MerchantProfileAgent,
+    knowledge_store: KnowledgeStore | None = None,
+) -> ThreadingHTTPServer:
+    store = knowledge_store or DisabledKnowledgeStore()
+
     class Handler(BaseHTTPRequestHandler):
         server_version = "PiSellMerchantProfileAgent/" + __version__
 
@@ -119,6 +154,7 @@ def create_server(settings: Settings, agent: MerchantProfileAgent) -> ThreadingH
                         "service": "pisell-merchant-profile-agent",
                         "version": __version__,
                         "model": settings.model,
+                        "knowledge_store": store.name,
                     },
                 )
                 return
@@ -157,6 +193,10 @@ def create_server(settings: Settings, agent: MerchantProfileAgent) -> ThreadingH
                         raw_updates,
                         request.get("current_profile", {}),
                     )
+                elif path == "/v1/profile/read":
+                    result = store.read_profile(request)
+                elif path == "/v1/profile/commit":
+                    result = store.commit_profile(request)
                 else:
                     self._send_json(
                         HTTPStatus.NOT_FOUND,
@@ -168,6 +208,25 @@ def create_server(settings: Settings, agent: MerchantProfileAgent) -> ThreadingH
                 self._send_json(
                     HTTPStatus.BAD_REQUEST,
                     {"error": "invalid_request", "message": str(exc), "request_id": request_id},
+                    request_id=request_id,
+                )
+                return
+            except KnowledgeStoreUnavailable as exc:
+                self._send_json(
+                    HTTPStatus.SERVICE_UNAVAILABLE,
+                    {
+                        "error": "knowledge_store_unavailable",
+                        "message": str(exc),
+                        "request_id": request_id,
+                    },
+                    request_id=request_id,
+                )
+                return
+            except KnowledgeStoreError:
+                LOGGER.exception("Knowledge-store request failed request_id=%s", request_id)
+                self._send_json(
+                    HTTPStatus.BAD_GATEWAY,
+                    {"error": "knowledge_store_failure", "request_id": request_id},
                     request_id=request_id,
                 )
                 return
@@ -191,4 +250,3 @@ def create_server(settings: Settings, agent: MerchantProfileAgent) -> ThreadingH
             self._send_json(HTTPStatus.OK, result, request_id=request_id)
 
     return ThreadingHTTPServer((settings.host, settings.port), Handler)
-

@@ -6,6 +6,7 @@ from pathlib import Path
 
 from .agent import MerchantProfileAgent
 from .api import create_server
+from .knowledge_store import KnowledgeStoreUnavailable, create_knowledge_store
 from .openai_client import OpenAIResponsesClient
 from .settings import ConfigurationError, Settings, load_env_file
 
@@ -30,9 +31,17 @@ def main() -> int:
         model=settings.model,
         timeout=settings.openai_timeout,
     )
-    server = create_server(settings, MerchantProfileAgent(client))
+    try:
+        knowledge_store = create_knowledge_store(settings)
+    except KnowledgeStoreUnavailable as exc:
+        parser.error(str(exc))
+    server = create_server(settings, MerchantProfileAgent(client), knowledge_store)
     logging.getLogger("merchant_profile_agent").info(
-        "listening on http://%s:%d model=%s", settings.host, settings.port, settings.model
+        "listening on http://%s:%d model=%s knowledge_store=%s",
+        settings.host,
+        settings.port,
+        settings.model,
+        knowledge_store.name,
     )
     try:
         server.serve_forever()
@@ -45,4 +54,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

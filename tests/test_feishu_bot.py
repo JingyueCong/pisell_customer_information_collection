@@ -1,0 +1,106 @@
+from __future__ import annotations
+
+import asyncio
+import unittest
+from dataclasses import dataclass, field
+
+from merchant_profile_agent.feishu_bot import FeishuBotController, SessionStore
+
+
+@dataclass
+class Conversation:
+    thread_id: str | None = None
+
+
+@dataclass
+class Message:
+    body_text: str
+    message_id: str = "om_test"
+    chat_id: str = "oc_test"
+    sender_id: str = "ou_test"
+    conversation: Conversation = field(default_factory=Conversation)
+
+
+class FakeChannel:
+    def __init__(self) -> None:
+        self.replies = []
+
+    async def reply(self, message, content, opts=None):
+        self.replies.append((message, content, opts))
+
+
+class FakeApi:
+    def __init__(self) -> None:
+        self.calls = []
+
+    def post(self, path, payload):
+        self.calls.append((path, payload))
+        if path == "/v1/profile/analyze":
+            return {
+                "merchant": {"name": "青禾便当", "id": None},
+                "reply": "已识别联系人。",
+                "profile_updates": [
+                    {
+                        "field_path": "contacts.primary.name",
+                        "value": "林经理",
+                        "source_ref": payload["messages"][0]["source_ref"],
+                        "replace_confirmed": False,
+                        "state": "explicit",
+                        "document_type": "business-contacts",
+                    }
+                ],
+                "conflicts": [],
+                "save_readiness": "ready",
+                "next_question": None,
+            }
+        if path == "/v1/profile/read":
+            return {"profile": {"fields": {}, "event_count": 0}}
+        if path == "/v1/profile/commit":
+            return {
+                "write_performed": True,
+                "result": {"store_status": "stored", "wiki_documents_updated": 2},
+            }
+        raise AssertionError(path)
+
+
+class FeishuBotTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.api = FakeApi()
+        self.channel = FakeChannel()
+        self.sessions = SessionStore()
+        self.bot = FeishuBotController(
+            api=self.api, channel=self.channel, sessions=self.sessions  # type: ignore[arg-type]
+        )
+
+    def run_message(self, text: str) -> None:
+        asyncio.run(self.bot.on_message(Message(text)))
+
+    def test_normal_message_only_previews(self) -> None:
+        self.run_message("青禾便当的联系人是林经理")
+
+        self.assertEqual(
+            [path for path, _ in self.api.calls],
+            ["/v1/profile/analyze", "/v1/profile/read"],
+        )
+        self.assertIn("草稿尚未写入", self.channel.replies[-1][1]["text"])
+
+    def test_exact_save_command_commits_latest_preview(self) -> None:
+        self.run_message("青禾便当的联系人是林经理")
+        self.run_message("结束并保存")
+
+        path, payload = self.api.calls[-1]
+        self.assertEqual(path, "/v1/profile/commit")
+        self.assertEqual(payload["confirmation"], "结束并保存")
+        self.assertEqual(payload["merchant"]["name"], "青禾便当")
+        self.assertIn("已提交到飞书知识库", self.channel.replies[-1][1]["text"])
+
+    def test_discard_never_commits(self) -> None:
+        self.run_message("青禾便当的联系人是林经理")
+        self.run_message("/discard")
+
+        self.assertNotIn("/v1/profile/commit", [path for path, _ in self.api.calls])
+        self.assertIn("没有发生写入", self.channel.replies[-1][1]["text"])
+
+
+if __name__ == "__main__":
+    unittest.main()
