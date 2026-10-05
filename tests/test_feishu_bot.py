@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import unittest
 from dataclasses import dataclass, field
 
@@ -79,6 +80,43 @@ class FakeApi:
                         },
                     ],
                 },
+            }
+        raise AssertionError(path)
+
+
+class MissingMerchantThenCorrectionApi(FakeApi):
+    def post(self, path, payload):
+        self.calls.append((path, copy.deepcopy(payload)))
+        if path == "/v1/profile/analyze":
+            content = "\n".join(item["content"] for item in payload["messages"])
+            has_merchant = "Dandong" in content
+            return {
+                "merchant": {"name": "Dandong咖啡厅" if has_merchant else None, "id": None},
+                "reply": "已补充商户名称。" if has_merchant else "请补充商户名称。",
+                "profile_updates": [
+                    {
+                        "field_path": "contacts.primary.name",
+                        "value": "林经理",
+                        "source_ref": payload["messages"][0]["source_ref"],
+                        "replace_confirmed": False,
+                        "state": "explicit",
+                        "document_type": "business-contacts",
+                    }
+                ],
+                "conflicts": [],
+                "save_readiness": "ready" if has_merchant else "missing_info",
+                "next_question": None if has_merchant else "商户名称是什么？",
+                "summary_points": ["主要联系人是林经理"],
+                "decisions": [],
+                "action_items": [],
+                "information_gaps": [] if has_merchant else ["商户名称"],
+            }
+        if path == "/v1/profile/read":
+            return {"profile": {"fields": {}, "event_count": 0}}
+        if path == "/v1/profile/commit":
+            return {
+                "write_performed": True,
+                "result": {"store_status": "stored", "documents": []},
             }
         raise AssertionError(path)
 
@@ -221,6 +259,57 @@ class FeishuBotTests(unittest.TestCase):
         self.run_group("保存吧", mentioned=True, message_id="om_four")
         self.assertEqual(self.api.calls[-1][0], "/v1/profile/commit")
         self.assertIn("已写入", self.channel.replies[-1][1]["text"])
+
+    def test_group_missing_merchant_followup_is_reanalyzed_immediately(self) -> None:
+        api = MissingMerchantThenCorrectionApi()
+        bot = FeishuBotController(
+            api=api,  # type: ignore[arg-type]
+            channel=self.channel,
+            sessions=SessionStore(),
+            group_message_threshold=1,
+            group_idle_seconds=600,
+            group_idle_min_messages=1,
+        )
+
+        async def scenario() -> None:
+            base = {
+                "chat_id": "oc_correction",
+                "chat_type": "group",
+                "sender_name": "测试成员",
+            }
+            await bot.on_message(Message("开启自动总结", mentioned_bot=True, **base))
+            await bot.on_message(Message("主要联系人是林经理", message_id="om_detail", **base))
+            await bot.on_message(
+                Message("保存吧", message_id="om_save_one", mentioned_bot=True, **base)
+            )
+            await bot.on_message(
+                Message("商户名 Dandong咖啡厅", message_id="om_name_one", **base)
+            )
+            replies_before_mention = len(self.channel.replies)
+            await bot.on_message(
+                Message(
+                    "Dandong咖啡厅",
+                    message_id="om_name_two",
+                    mentioned_bot=True,
+                    **base,
+                )
+            )
+            self.assertEqual(len(self.channel.replies), replies_before_mention + 1)
+            self.assertIn("可写入知识库", self.channel.replies[-1][1]["text"])
+            await bot.on_message(
+                Message("保存吧", message_id="om_save_two", mentioned_bot=True, **base)
+            )
+
+        asyncio.run(scenario())
+
+        analyzes = [payload for path, payload in api.calls if path == "/v1/profile/analyze"]
+        corrected_messages = analyzes[-1]["messages"]
+        self.assertTrue(
+            any("主要联系人是林经理" in item["content"] for item in corrected_messages)
+        )
+        self.assertTrue(any("Dandong咖啡厅" in item["content"] for item in corrected_messages))
+        commit = next(payload for path, payload in api.calls if path == "/v1/profile/commit")
+        self.assertEqual(commit["merchant"]["name"], "Dandong咖啡厅")
 
     def test_group_mentioned_sentence_is_not_save_confirmation(self) -> None:
         self.run_group("开启自动总结", mentioned=True)

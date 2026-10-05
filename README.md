@@ -170,7 +170,8 @@ API 会在写入前重新读取飞书中的最新 Event 链并再次检查冲突
 
 官方 Channel SDK 的[快速开始](https://github.com/larksuite/channel-sdk-python/blob/main/docs/quickstart.md)
 也列出了上述机器人、长连接、消息事件和权限要求；SDK 的[安全配置](https://github.com/larksuite/channel-sdk-python/blob/main/docs/security.md)
-说明了生产环境的 strict 模式。本项目默认启用 strict 模式；私聊可直接使用，群聊必须 @ 机器人。
+私聊可直接使用；群聊必须先 `@机器人 开启自动总结`，开启后才会接收普通群消息，
+保存和控制指令仍必须明确 `@机器人`。
 
 将应用凭据只写入 Mac mini 的 `.env`：
 
@@ -207,6 +208,8 @@ MERCHANT_AGENT_PYTHON=/absolute/path/to/python3.12 ./scripts/install_feishu_bot_
 若已有至少 5 条消息但群聊安静 10 分钟，也会自动总结。寒暄、表情和过短消息不计入。
 自动总结只发到群里，不写知识库；保存必须明确 `@机器人 保存吧`。还支持
 `@机器人 立即总结`、`@机器人 暂停自动总结` 和 `@机器人 /discard`。
+如果保存时缺少商户名称或存在冲突，按提示 `@机器人` 补充内容后会立即重新分析，
+不必等待下一次自动总结。
 
 群普通消息会在该群明确开启后发送给配置的 OpenAI 模型。飞书应用需额外开通
 `im:message.group_msg`；外部群仍应保持关闭。

@@ -122,6 +122,7 @@ class Session:
     group_pending_count: int = 0
     group_generation: int = 0
     group_last_message: Any = None
+    group_followup_pending: bool = False
     group_idle_task: asyncio.Task[Any] | None = field(default=None, repr=False)
     touched_at: float = field(default_factory=time.monotonic)
 
@@ -131,6 +132,7 @@ class Session:
         self.current_profile.clear()
         self.merchant = None
         self.preview = None
+        self.group_followup_pending = False
         self.touched_at = time.monotonic()
 
     def clear_group_buffer(self) -> None:
@@ -493,7 +495,10 @@ class FeishuBotController:
             await self._reply(message, "自动总结已暂停。")
             return
         if mentioned and _matches_command(text, GROUP_SUMMARIZE_COMMANDS):
-            await self._summarize_group(session, message)
+            if session.group_followup_pending:
+                await self._summarize_group_followup(session, message)
+            else:
+                await self._summarize_group(session, message)
             return
         if mentioned and _matches_command(text, HELP_COMMANDS):
             await self._reply(
@@ -531,6 +536,17 @@ class FeishuBotController:
         session.group_pending_count += 1
         session.group_generation += 1
         session.group_last_message = message
+        if mentioned:
+            session.cancel_idle_task()
+            if session.group_followup_pending:
+                await self._summarize_group_followup(session, message)
+            else:
+                await self._summarize_group(session, message)
+            return
+        if session.group_followup_pending:
+            # Keep nearby, unmentioned corrections so the next explicit @bot
+            # follow-up can reconcile them with the existing unsaved summary.
+            return
         if session.group_pending_count >= self.group_message_threshold:
             session.cancel_idle_task()
             await self._summarize_group(session, message)
@@ -581,6 +597,37 @@ class FeishuBotController:
         session.clear_group_buffer()
         await self._reply(message, _group_summary_text(preview))
 
+    async def _summarize_group_followup(self, session: Session, message: Any) -> None:
+        if not session.group_buffer:
+            await self._reply(message, "请 @机器人 补充商户名称或需要确认的内容。")
+            return
+        previous_messages = list(session.messages)
+        session.messages = [*previous_messages, *session.group_buffer]
+        try:
+            preview = await self._analyze_session(session)
+        except MerchantSwitchError:
+            session.messages = previous_messages
+            await self._reply(
+                message,
+                f"当前草稿属于 {session.merchant.get('name') if session.merchant else '其他商户'}；"
+                "如需切换，请先 @机器人 回复 /discard。",
+            )
+            return
+        except MerchantApiError:
+            session.messages = previous_messages
+            LOGGER.exception("group follow-up analysis failed")
+            await self._reply(message, "补充信息处理失败，消息仍保留，请稍后重试。")
+            return
+        session.clear_group_buffer()
+        updates = preview.get("profile_updates")
+        session.group_followup_pending = not (
+            session.merchant
+            and preview.get("save_readiness") == "ready"
+            and isinstance(updates, list)
+            and updates
+        )
+        await self._reply(message, _group_summary_text(preview))
+
     async def _save(self, message: Any, session: Session, confirmation: str) -> None:
         preview = session.preview or {}
         merchant = session.merchant
@@ -591,7 +638,14 @@ class FeishuBotController:
             or not isinstance(updates, list)
             or not updates
         ):
-            await self._reply(message, "暂不能保存，请补充商户名称或解决冲突。")
+            if _is_group_message(message):
+                session.group_followup_pending = True
+                await self._reply(
+                    message,
+                    "暂不能保存。请 @机器人 补充商户名称或冲突确认，我会立即更新摘要。",
+                )
+            else:
+                await self._reply(message, "暂不能保存，请补充商户名称或解决冲突。")
             return
         try:
             result = await self._post(
