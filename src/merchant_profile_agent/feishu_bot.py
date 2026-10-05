@@ -131,6 +131,7 @@ class Session:
     group_generation: int = 0
     group_last_message: Any = None
     group_followup_pending: bool = False
+    group_save_pending: bool = False
     group_idle_task: asyncio.Task[Any] | None = field(default=None, repr=False)
     touched_at: float = field(default_factory=time.monotonic)
 
@@ -143,6 +144,7 @@ class Session:
         self.merchant = merchant
         self.preview = None
         self.group_followup_pending = False
+        self.group_save_pending = False
         self.touched_at = time.monotonic()
 
     def clear_group_buffer(self) -> None:
@@ -384,6 +386,17 @@ def _group_summary_text(result: dict[str, Any]) -> str:
         if lines:
             sections.append("可写入知识库：\n" + "\n".join(lines))
 
+    conflicts = result.get("conflicts")
+    if isinstance(conflicts, list) and conflicts:
+        lines = [
+            f"- {_field_label(item.get('field_path'))}："
+            f"{item.get('current_value')} → {item.get('proposed_value')}"
+            for item in conflicts[:10]
+            if isinstance(item, dict)
+        ]
+        if lines:
+            sections.append("资料冲突：\n" + "\n".join(lines))
+
     gaps = result.get("information_gaps")
     add_section("待确认", gaps)
     if result.get("next_question") and not gaps:
@@ -565,7 +578,14 @@ class FeishuBotController:
             return
         if mentioned and _matches_command(text, GROUP_SUMMARIZE_COMMANDS):
             if session.group_followup_pending:
-                await self._summarize_group_followup(session, message)
+                save_pending = session.group_save_pending
+                analyzed = await self._summarize_group_followup(
+                    session,
+                    message,
+                    reply_on_success=not save_pending,
+                )
+                if analyzed and save_pending and not session.group_followup_pending:
+                    await self._save(message, session, "结束并保存")
             else:
                 await self._summarize_group(session, message)
             return
@@ -619,7 +639,14 @@ class FeishuBotController:
         if mentioned:
             session.cancel_idle_task()
             if session.group_followup_pending:
-                await self._summarize_group_followup(session, message)
+                save_pending = session.group_save_pending
+                analyzed = await self._summarize_group_followup(
+                    session,
+                    message,
+                    reply_on_success=not save_pending,
+                )
+                if analyzed and save_pending and not session.group_followup_pending:
+                    await self._save(message, session, "结束并保存")
             else:
                 await self._summarize_group(session, message)
             return
@@ -681,7 +708,7 @@ class FeishuBotController:
             await self._reply(message, "本段总结失败，消息仍保留，将稍后重试。")
             return False
         session.clear_group_buffer()
-        if reply_on_success:
+        if reply_on_success or session.group_followup_pending:
             await self._reply(message, _group_summary_text(preview))
         return True
 
@@ -720,7 +747,7 @@ class FeishuBotController:
             and isinstance(updates, list)
             and updates
         )
-        if reply_on_success:
+        if reply_on_success or session.group_followup_pending:
             await self._reply(message, _group_summary_text(preview))
         return True
 
@@ -736,10 +763,38 @@ class FeishuBotController:
         ):
             if _is_group_message(message):
                 session.group_followup_pending = True
-                await self._reply(
-                    message,
-                    "暂不能保存。请 @机器人 补充商户名称或冲突确认，我会立即更新摘要。",
-                )
+                session.group_save_pending = True
+                conflicts = preview.get("conflicts")
+                if isinstance(conflicts, list) and conflicts:
+                    lines = [
+                        f"- {_field_label(item.get('field_path'))}："
+                        f"{item.get('current_value')} → {item.get('proposed_value')}"
+                        for item in conflicts[:10]
+                        if isinstance(item, dict)
+                    ]
+                    await self._reply(
+                        message,
+                        "检测到已有资料不同，暂未写入：\n"
+                        + "\n".join(lines)
+                        + "\n如需用新值替换，请 @机器人 回复“确认替换”。",
+                    )
+                elif not merchant:
+                    await self._reply(
+                        message,
+                        "未识别到商户名称，暂未写入。请 @机器人 补充商户名称。",
+                    )
+                elif not isinstance(updates, list) or not updates:
+                    session.group_followup_pending = False
+                    session.group_save_pending = False
+                    await self._reply(message, "没有需要写入的新资料。")
+                else:
+                    question = str(
+                        preview.get("next_question") or "请补充缺少的资料。"
+                    )
+                    await self._reply(
+                        message,
+                        f"暂未写入：{question}\n请 @机器人 补充，我会继续处理。",
+                    )
             else:
                 await self._reply(message, "暂不能保存，请补充商户名称或解决冲突。")
             return

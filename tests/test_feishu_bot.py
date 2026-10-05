@@ -169,6 +169,55 @@ class PronounContinuationApi(FakeApi):
         raise AssertionError(path)
 
 
+class ConflictThenConfirmationApi(FakeApi):
+    def post(self, path, payload):
+        self.calls.append((path, copy.deepcopy(payload)))
+        if path == "/v1/profile/analyze":
+            content = "\n".join(item["content"] for item in payload["messages"])
+            confirmed = "确认替换" in content
+            update = {
+                "field_path": "contacts.phone",
+                "value": "0451100323",
+                "source_ref": payload["messages"][0]["source_ref"],
+                "replace_confirmed": confirmed,
+                "state": "explicit",
+                "document_type": "business-contacts",
+            }
+            return {
+                "merchant": {"name": "汪汪咖啡店", "id": None},
+                "reply": "已确认替换。" if confirmed else "发现电话不同。",
+                "profile_updates": [update] if confirmed else [],
+                "conflicts": []
+                if confirmed
+                else [
+                    {
+                        "field_path": "contacts.phone",
+                        "current_value": "045123455555",
+                        "proposed_value": "0451100323",
+                    }
+                ],
+                "save_readiness": "ready" if confirmed else "needs_confirmation",
+                "next_question": None if confirmed else "是否替换旧电话？",
+                "summary_points": ["店长 Lily，电话 0451100323"],
+                "decisions": [],
+                "action_items": [],
+                "information_gaps": [],
+            }
+        if path == "/v1/profile/read":
+            return {
+                "profile": {
+                    "fields": {"contacts.phone": {"value": "045123455555"}},
+                    "event_count": 1,
+                }
+            }
+        if path == "/v1/profile/commit":
+            return {
+                "write_performed": True,
+                "result": {"store_status": "stored", "documents": []},
+            }
+        raise AssertionError(path)
+
+
 class FeishuBotTests(unittest.TestCase):
     def setUp(self) -> None:
         self.api = FakeApi()
@@ -420,10 +469,7 @@ class FeishuBotTests(unittest.TestCase):
                 )
             )
             self.assertEqual(len(self.channel.replies), replies_before_mention + 1)
-            self.assertIn("可写入知识库", self.channel.replies[-1][1]["text"])
-            await bot.on_message(
-                Message("保存吧", message_id="om_save_two", mentioned_bot=True, **base)
-            )
+            self.assertIn("已写入", self.channel.replies[-1][1]["text"])
 
         asyncio.run(scenario())
 
@@ -476,6 +522,56 @@ class FeishuBotTests(unittest.TestCase):
         reads = [payload for path, payload in api.calls if path == "/v1/profile/read"]
         self.assertGreaterEqual(len(reads), 2)
         self.assertEqual(reads[-1]["merchant_name"], "汪汪咖啡店")
+
+    def test_group_conflict_lists_values_and_confirmation_finishes_pending_save(self) -> None:
+        api = ConflictThenConfirmationApi()
+        bot = FeishuBotController(
+            api=api,  # type: ignore[arg-type]
+            channel=self.channel,
+            sessions=SessionStore(),
+            group_message_threshold=20,
+            group_idle_seconds=600,
+            group_idle_min_messages=5,
+        )
+
+        async def scenario() -> None:
+            base = {
+                "chat_id": "oc_conflict",
+                "chat_type": "group",
+                "sender_name": "测试成员",
+            }
+            await bot.on_message(Message("开始记录", mentioned_bot=True, **base))
+            await bot.on_message(
+                Message(
+                    "汪汪咖啡店店长 Lily，电话 0451100323",
+                    message_id="om_new_phone",
+                    **base,
+                )
+            )
+            await bot.on_message(
+                Message("保存吧", message_id="om_save", mentioned_bot=True, **base)
+            )
+            conflict_reply = self.channel.replies[-1][1]["text"]
+            self.assertIn("电话：045123455555 → 0451100323", conflict_reply)
+            self.assertIn("确认替换", conflict_reply)
+
+            replies_before_confirmation = len(self.channel.replies)
+            await bot.on_message(
+                Message(
+                    "确认替换",
+                    message_id="om_confirm",
+                    mentioned_bot=True,
+                    **base,
+                )
+            )
+            self.assertEqual(len(self.channel.replies), replies_before_confirmation + 1)
+            self.assertIn("已写入", self.channel.replies[-1][1]["text"])
+
+        asyncio.run(scenario())
+
+        commits = [payload for path, payload in api.calls if path == "/v1/profile/commit"]
+        self.assertEqual(len(commits), 1)
+        self.assertEqual(commits[0]["updates"][0]["value"], "0451100323")
 
     def test_group_mentioned_sentence_is_not_save_confirmation(self) -> None:
         self.run_group("开启自动总结", mentioned=True)
