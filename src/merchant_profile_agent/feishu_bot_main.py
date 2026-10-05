@@ -18,7 +18,7 @@ def _required(name: str) -> str:
     return value
 
 
-async def run() -> None:
+def build_channel():
     try:
         from lark_channel import FeishuChannel, PolicyConfig, SecurityConfig
     except ImportError as exc:
@@ -71,7 +71,7 @@ async def run() -> None:
     )
     channel.on("message", controller.on_message)
     channel.on("error", lambda error: logging.getLogger(__name__).error("channel error: %s", error))
-    await channel.connect()
+    return channel
 
 
 def main() -> int:
@@ -85,7 +85,11 @@ def main() -> int:
     try:
         if args.env_file:
             load_env_file(args.env_file)
-        asyncio.run(run())
+        # Construct the SDK before the event loop starts. The WebSocket client
+        # captures its loop during initialization and follows the official
+        # ``asyncio.run(channel.connect())`` startup pattern.
+        channel = build_channel()
+        asyncio.run(channel.connect())
     except ConfigurationError as exc:
         parser.error(str(exc))
     except KeyboardInterrupt:
