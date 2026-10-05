@@ -422,7 +422,7 @@ class FeishuBotController:
         sessions: SessionStore | None = None,
         group_message_threshold: int = 20,
         group_idle_seconds: int = 600,
-        group_idle_min_messages: int = 5,
+        group_idle_min_messages: int = 1,
     ) -> None:
         self.api = api
         self.channel = channel
@@ -558,7 +558,7 @@ class FeishuBotController:
             session.group_summary_enabled = True
             await self._reply(
                 message,
-                "自动总结已开启：20 条有效消息，或至少 5 条后安静 10 分钟。"
+                "自动总结已开启：20 条有效消息，或有新资料后安静 10 分钟。"
                 "群消息会发送给 AI 生成摘要；不会自动写知识库。",
             )
             return

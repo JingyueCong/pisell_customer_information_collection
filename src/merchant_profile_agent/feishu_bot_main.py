@@ -91,7 +91,7 @@ def build_channel():
             "FEISHU_GROUP_SUMMARY_IDLE_SECONDS", 600, 60, 3_600
         ),
         group_idle_min_messages=_integer(
-            "FEISHU_GROUP_SUMMARY_IDLE_MIN_MESSAGES", 5, 2, 50
+            "FEISHU_GROUP_SUMMARY_IDLE_MIN_MESSAGES", 1, 1, 50
         ),
     )
     channel.on("message", controller.on_message)

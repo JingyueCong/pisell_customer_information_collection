@@ -597,7 +597,7 @@ class FeishuBotTests(unittest.TestCase):
         self.run_group("这条消息不应进入模型", message_id="om_after")
         self.assertEqual(len(self.api.calls), call_count)
 
-    def test_group_idle_summary_after_minimum_messages(self) -> None:
+    def test_group_idle_summary_after_one_effective_message(self) -> None:
         async def scenario() -> None:
             bot = FeishuBotController(
                 api=self.api,  # type: ignore[arg-type]
@@ -605,7 +605,7 @@ class FeishuBotTests(unittest.TestCase):
                 sessions=SessionStore(),
                 group_message_threshold=20,
                 group_idle_seconds=0.01,  # type: ignore[arg-type]
-                group_idle_min_messages=2,
+                group_idle_min_messages=1,
             )
             base = {
                 "chat_id": "oc_idle",
@@ -616,7 +616,6 @@ class FeishuBotTests(unittest.TestCase):
                 Message("开启自动总结", mentioned_bot=True, **base)
             )
             await bot.on_message(Message("青禾便当联系人是林经理", **base))
-            await bot.on_message(Message("电话稍后补充", **base))
             await asyncio.sleep(0.03)
 
         asyncio.run(scenario())
