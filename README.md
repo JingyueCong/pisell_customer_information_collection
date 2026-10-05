@@ -194,7 +194,8 @@ MERCHANT_AGENT_PYTHON=/absolute/path/to/python3.12 ./scripts/install_feishu_bot_
 对话命令：
 
 - 普通消息：分析资料并返回待保存预览，零写入；
-- `结束并保存` 或 `/save`：确认提交到 Events、Artifact 和商户 Wiki；
+- `结束并保存`、`/save` 或“没问题，保存吧”等明确自然语言：确认提交到 Events、Artifact 和商户 Wiki；
+- 保存成功后直接返回更新页面链接，也支持追问“刚才写入的页面链接”；
 - `/discard`：放弃内存草稿，零写入；
 - `/help`：显示使用帮助。
 

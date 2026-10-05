@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -14,6 +15,58 @@ LOGGER = logging.getLogger("merchant_profile_agent.feishu_bot")
 SAVE_COMMANDS = {"结束并保存", "/save"}
 DISCARD_COMMANDS = {"放弃本次对话", "/discard"}
 HELP_COMMANDS = {"/help", "帮助"}
+NATURAL_SAVE_CONFIRMATIONS = {
+    "结束并保存",
+    "保存",
+    "保存吧",
+    "请保存",
+    "帮我保存",
+    "麻烦保存",
+    "确认保存",
+    "可以保存",
+    "保存一下",
+    "好的保存",
+    "好的保存吧",
+    "好的请保存",
+    "没问题保存",
+    "没问题保存吧",
+    "没问题请保存",
+    "写入",
+    "写入吧",
+    "请写入",
+    "确认写入",
+    "可以写入",
+    "写入知识库",
+    "保存到知识库",
+    "提交",
+    "提交吧",
+    "请提交",
+    "确认提交",
+    "可以提交",
+    "就这样保存",
+    "以上内容保存",
+    "把这些保存",
+    "把这些写入",
+    "存一下",
+    "存进去",
+    "存进去吧",
+    "寫入",
+    "寫入吧",
+    "請寫入",
+    "確認寫入",
+    "可以寫入",
+    "寫入知識庫",
+}
+DOCUMENT_LABELS = {
+    "merchant-overview": "商户概况",
+    "business-contacts": "业务与联系人",
+    "product-menu": "产品与菜单",
+    "system-configuration": "系统配置",
+    "hardware-installation": "硬件与安装",
+    "risk-compliance": "风险与合规",
+    "commercial": "商务信息",
+    "store-profile": "门店资料",
+}
 
 
 class ReplyChannel(Protocol):
@@ -27,7 +80,16 @@ class Session:
     current_profile: dict[str, Any] = field(default_factory=dict)
     merchant: dict[str, Any] | None = None
     preview: dict[str, Any] | None = None
+    last_documents: list[dict[str, str]] = field(default_factory=list)
     touched_at: float = field(default_factory=time.monotonic)
+
+    def reset_draft(self) -> None:
+        self.conversation_id = str(uuid.uuid4())
+        self.messages.clear()
+        self.current_profile.clear()
+        self.merchant = None
+        self.preview = None
+        self.touched_at = time.monotonic()
 
 
 class SessionStore:
@@ -76,6 +138,62 @@ def _source_ref(message: Any) -> str:
     return (
         f"feishu://chat/{getattr(message, 'chat_id', 'unknown')}"
         f"/message/{getattr(message, 'message_id', 'unknown')}"
+    )
+
+
+def _normalize_intent_text(text: str) -> str:
+    return re.sub(r"[\s，,。.!！?？、:：;；\"'“”‘’]+", "", text).lower()
+
+
+def _is_save_confirmation(text: str) -> bool:
+    if text in SAVE_COMMANDS:
+        return True
+    return _normalize_intent_text(text) in NATURAL_SAVE_CONFIRMATIONS
+
+
+def _is_link_request(text: str) -> bool:
+    normalized = _normalize_intent_text(text)
+    is_unambiguous_link = any(
+        term in normalized for term in ("链接", "連結", "网址", "網址")
+    )
+    is_ambiguous_connection = any(term in normalized for term in ("连接", "連接"))
+    if not is_unambiguous_link and not is_ambiguous_connection:
+        return False
+    has_request_context = any(
+        cue in normalized
+        for cue in ("给我", "給我", "发我", "發我", "刚才", "剛才", "刚刚", "剛剛", "页面", "頁面", "写入", "寫入", "保存", "知识库", "知識庫")
+    )
+    if is_ambiguous_connection and not is_unambiguous_link:
+        return has_request_context
+    return len(normalized) <= 12 or has_request_context
+
+
+def _document_links(store_result: dict[str, Any]) -> list[dict[str, str]]:
+    documents = store_result.get("documents")
+    if not isinstance(documents, list):
+        return []
+    links: list[dict[str, str]] = []
+    for item in documents:
+        if not isinstance(item, dict):
+            continue
+        url = item.get("url")
+        if not isinstance(url, str) or not url.startswith("https://"):
+            continue
+        document_type = str(item.get("document_type") or "")
+        links.append(
+            {
+                "label": DOCUMENT_LABELS.get(document_type, document_type or "知识库页面"),
+                "url": url,
+            }
+        )
+    return links
+
+
+def _links_text(documents: list[dict[str, str]]) -> str:
+    if not documents:
+        return "暂无最近一次写入的页面链接。"
+    return "最近写入：\n" + "\n".join(
+        f"- {item['label']}：{item['url']}" for item in documents
     )
 
 
@@ -133,7 +251,7 @@ class FeishuBotController:
             await self._reply(
                 message,
                 "发送商户名称和要记录的资料。"
-                "\n- 结束并保存：确认写入"
+                "\n- 可说“没问题，保存吧”或“结束并保存”"
                 "\n- /discard：放弃草稿",
             )
             return
@@ -143,8 +261,11 @@ class FeishuBotController:
             return
 
         session = self.sessions.get(key)
-        if text in SAVE_COMMANDS:
-            await self._save(message, key, session, text)
+        if _is_link_request(text):
+            await self._reply(message, _links_text(session.last_documents))
+            return
+        if _is_save_confirmation(text):
+            await self._save(message, session, "结束并保存")
             return
 
         session.messages.append(
@@ -203,9 +324,7 @@ class FeishuBotController:
             LOGGER.exception("merchant API request failed")
             await self._reply(message, "服务暂不可用，未写入知识库。")
 
-    async def _save(
-        self, message: Any, key: str, session: Session, confirmation: str
-    ) -> None:
+    async def _save(self, message: Any, session: Session, confirmation: str) -> None:
         preview = session.preview or {}
         merchant = session.merchant
         updates = preview.get("profile_updates")
@@ -236,10 +355,14 @@ class FeishuBotController:
         if result.get("write_performed") or store_result.get("duplicate"):
             document_count = int(store_result.get("wiki_documents_updated") or 0)
             duplicate = "（此前已保存，本次未重复写入）" if store_result.get("duplicate") else ""
+            documents = _document_links(store_result)
+            if documents:
+                session.last_documents = documents
+            link_suffix = "\n" + _links_text(documents) if documents else ""
             await self._reply(
                 message,
-                f"已写入知识库，更新 {document_count} 个页面。{duplicate}",
+                f"已写入知识库，更新 {document_count} 个页面。{duplicate}{link_suffix}",
             )
-            self.sessions.discard(key)
+            session.reset_draft()
             return
         await self._reply(message, "提交未完成，草稿已保留。")

@@ -58,7 +58,20 @@ class FakeApi:
         if path == "/v1/profile/commit":
             return {
                 "write_performed": True,
-                "result": {"store_status": "stored", "wiki_documents_updated": 2},
+                "result": {
+                    "store_status": "stored",
+                    "wiki_documents_updated": 2,
+                    "documents": [
+                        {
+                            "document_type": "merchant-overview",
+                            "url": "https://example.feishu.cn/wiki/overview",
+                        },
+                        {
+                            "document_type": "business-contacts",
+                            "url": "https://example.feishu.cn/wiki/contacts",
+                        },
+                    ],
+                },
             }
         raise AssertionError(path)
 
@@ -95,6 +108,33 @@ class FeishuBotTests(unittest.TestCase):
         self.assertEqual(payload["confirmation"], "结束并保存")
         self.assertEqual(payload["merchant"]["name"], "青禾便当")
         self.assertIn("已写入知识库", self.channel.replies[-1][1]["text"])
+        self.assertIn("https://example.feishu.cn/wiki/contacts", self.channel.replies[-1][1]["text"])
+
+    def test_natural_save_confirmation_and_follow_up_links(self) -> None:
+        self.run_message("青禾便当的联系人是林经理")
+        self.run_message("没问题，保存吧")
+
+        path, payload = self.api.calls[-1]
+        self.assertEqual(path, "/v1/profile/commit")
+        self.assertEqual(payload["confirmation"], "结束并保存")
+
+        call_count = len(self.api.calls)
+        self.run_message("刚才写入的两个页面链接")
+        self.assertEqual(len(self.api.calls), call_count)
+        reply = self.channel.replies[-1][1]["text"]
+        self.assertIn("商户概况", reply)
+        self.assertIn("https://example.feishu.cn/wiki/overview", reply)
+
+    def test_merchant_sentence_containing_save_is_not_confirmation(self) -> None:
+        self.run_message("青禾便当的资料保存周期是每周一次")
+
+        self.assertEqual(self.api.calls[0][0], "/v1/profile/analyze")
+        self.assertNotIn("/v1/profile/commit", [path for path, _ in self.api.calls])
+
+    def test_device_connection_sentence_is_not_link_request(self) -> None:
+        self.run_message("青禾便当的设备连接方式为 USB")
+
+        self.assertEqual(self.api.calls[0][0], "/v1/profile/analyze")
 
     def test_discard_never_commits(self) -> None:
         self.run_message("青禾便当的联系人是林经理")
