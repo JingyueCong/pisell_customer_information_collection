@@ -38,11 +38,6 @@ def extraction(**overrides):
         "summary_points": ["联系人已确认"],
         "decisions": [],
         "action_items": [],
-        "support_escalation": {
-            "required": False,
-            "reason": None,
-            "summary": None,
-        },
     }
     value.update(overrides)
     return value

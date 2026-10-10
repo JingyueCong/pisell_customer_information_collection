@@ -16,7 +16,6 @@
 - 不保存会话，调用方负责传入需要保留的消息和当前档案；
 - 标准库实现，无运行时第三方 Python 依赖。
 - 可选飞书机器人使用官方 `lark-channel-sdk` WebSocket 长连接，无需给 Mac mini 开放公网回调；
-- 可选复用同一台 Mac mini 上的 Ticket Collector Agent：明确的客服问题若无法从当前商户资料可靠回答，会自动交给工单 Agent；入口强制只创建客服主单，不创建 T1/T2/T3/T5 或其他配套工作项；
 - Codex 与飞书机器人均通过 `/v1/profile/commit` 写入同一个 Events → Artifact → Wiki 投影链路。
 
 OpenAI API 的结构化输出格式参考[官方 Structured Outputs 文档](https://developers.openai.com/api/docs/guides/structured-outputs)，默认模型能力参考[GPT-6 Luna 文档](https://developers.openai.com/api/docs/models/gpt-6-luna)。
@@ -220,11 +219,6 @@ MERCHANT_AGENT_PYTHON=/absolute/path/to/python3.12 ./scripts/install_feishu_bot_
 不会阻止重新创建与写入；只有知识库页面仍存在时才比较旧值并请求替换确认。
 群聊成功保存后会保留最近商户作为上下文，因此后续“他们”“这家店”“该商户”等表达
 会继续归入该商户；切换到另一家商户前请先 `@机器人 /discard`。
-
-### 无法回答时创建客服工单
-
-同时配置 `TICKET_AGENT_API_URL` 和 `TICKET_AGENT_API_TOKEN` 后，私聊中明确的客服问题若无法从商户档案可靠回答，机器人会自动交给现有 Ticket Collector Agent。群聊需要先开启群总结，且只在用户明确 `@机器人` 提问时触发；静默总结不会自动建单。
-工单 Agent 会继续执行客服类型内查重、必填项补问、创建和回读；该入口的可信路由固定为 `customer_only`，即使问题被归类为 T1/T2/T3/T5，也只作为客服单字段，不会生成第二张工单。
 
 群普通消息会在该群明确开启后发送给配置的 OpenAI 模型。飞书应用需额外开通
 `im:message.group_msg`；外部群仍应保持关闭。

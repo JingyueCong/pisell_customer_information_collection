@@ -6,7 +6,6 @@ import unittest
 from dataclasses import dataclass, field
 
 from merchant_profile_agent.feishu_bot import FeishuBotController, SessionStore
-from merchant_profile_agent.ticket_client import TicketAgentError
 
 
 @dataclass
@@ -32,28 +31,6 @@ class FakeChannel:
 
     async def reply(self, message, content, opts=None):
         self.replies.append((message, content, opts))
-
-
-class FakeTicketApi:
-    def __init__(self, results=None) -> None:
-        self.calls = []
-        self.results = list(
-            results
-            or [
-                {
-                    "ok": True,
-                    "reply": "已创建客服工单：https://example.feishu.cn/customer/123",
-                    "draft_open": False,
-                    "work_item_ids": ["123"],
-                }
-            ]
-        )
-
-    def create_customer_service_ticket(self, payload):
-        self.calls.append(copy.deepcopy(payload))
-        if not self.results:
-            raise TicketAgentError("no fake result")
-        return self.results.pop(0)
 
 
 class FakeApi:
@@ -104,32 +81,6 @@ class FakeApi:
                     ],
                 },
             }
-        raise AssertionError(path)
-
-
-class SupportEscalationApi(FakeApi):
-    def post(self, path, payload):
-        self.calls.append((path, copy.deepcopy(payload)))
-        if path == "/v1/profile/analyze":
-            return {
-                "merchant": {"name": "青禾便当", "id": None},
-                "reply": "无法从商户资料确认处理方法。",
-                "profile_updates": [],
-                "conflicts": [],
-                "save_readiness": "nothing_to_save",
-                "next_question": None,
-                "summary_points": [],
-                "decisions": [],
-                "action_items": [],
-                "information_gaps": [],
-                "support_escalation": {
-                    "required": True,
-                    "reason": "商户资料没有故障处理答案",
-                    "summary": "青禾便当的收银机无法打印小票，请客服跟进。",
-                },
-            }
-        if path == "/v1/profile/read":
-            return {"profile": {"fields": {}, "event_count": 0}}
         raise AssertionError(path)
 
 
@@ -281,8 +232,8 @@ class FeishuBotTests(unittest.TestCase):
             group_idle_min_messages=2,
         )
 
-    def run_message(self, text: str, *, message_id: str = "om_test") -> None:
-        asyncio.run(self.bot.on_message(Message(text, message_id=message_id)))
+    def run_message(self, text: str) -> None:
+        asyncio.run(self.bot.on_message(Message(text)))
 
     def run_group(
         self,
@@ -362,51 +313,6 @@ class FeishuBotTests(unittest.TestCase):
 
         self.assertNotIn("/v1/profile/commit", [path for path, _ in self.api.calls])
         self.assertIn("未写入知识库", self.channel.replies[-1][1]["text"])
-
-    def test_unanswered_support_question_uses_customer_only_ticket_agent(self) -> None:
-        api = SupportEscalationApi()
-        ticket_api = FakeTicketApi(
-            [
-                {
-                    "ok": True,
-                    "reply": "请补充问题来源。",
-                    "draft_open": True,
-                    "work_item_ids": [],
-                },
-                {
-                    "ok": True,
-                    "reply": "已创建客服工单：https://example.feishu.cn/customer/123",
-                    "draft_open": False,
-                    "work_item_ids": ["123"],
-                },
-            ]
-        )
-        self.bot = FeishuBotController(
-            api=api,  # type: ignore[arg-type]
-            ticket_api=ticket_api,
-            channel=self.channel,
-            sessions=self.sessions,
-        )
-
-        self.run_message("青禾便当的收银机无法打印小票，怎么处理？")
-        self.assertEqual(len(ticket_api.calls), 1)
-        self.assertEqual(
-            ticket_api.calls[0]["content"],
-            "青禾便当的收银机无法打印小票，请客服跟进。",
-        )
-        self.assertIn("补充问题来源", self.channel.replies[-1][1]["text"])
-
-        analyze_count = len(
-            [path for path, _ in api.calls if path == "/v1/profile/analyze"]
-        )
-        self.run_message("来自飞书商家群", message_id="om_support_followup")
-        self.assertEqual(len(ticket_api.calls), 2)
-        self.assertEqual(
-            len([path for path, _ in api.calls if path == "/v1/profile/analyze"]),
-            analyze_count,
-        )
-        self.assertIn("已创建客服工单", self.channel.replies[-1][1]["text"])
-        self.assertNotIn("/v1/profile/commit", [path for path, _ in api.calls])
 
     def test_group_messages_are_ignored_until_explicit_enable(self) -> None:
         self.run_group("青禾便当的联系人是林经理")
@@ -527,34 +433,6 @@ class FeishuBotTests(unittest.TestCase):
         self.run_group("保存吧", mentioned=True, message_id="om_four")
         self.assertEqual(self.api.calls[-1][0], "/v1/profile/commit")
         self.assertIn("已写入", self.channel.replies[-1][1]["text"])
-
-    def test_group_support_handoff_requires_an_explicit_question_mention(self) -> None:
-        api = SupportEscalationApi()
-        ticket_api = FakeTicketApi()
-        self.bot = FeishuBotController(
-            api=api,  # type: ignore[arg-type]
-            ticket_api=ticket_api,
-            channel=self.channel,
-            sessions=self.sessions,
-            group_message_threshold=1,
-            group_idle_seconds=600,
-            group_idle_min_messages=1,
-        )
-        self.run_group("开始记录", mentioned=True, message_id="om_start")
-        self.run_group(
-            "青禾便当的收银机无法打印小票",
-            mentioned=False,
-            message_id="om_passive",
-        )
-        self.assertEqual(ticket_api.calls, [])
-
-        self.run_group(
-            "青禾便当的收银机无法打印小票，怎么处理？",
-            mentioned=True,
-            message_id="om_explicit_support",
-        )
-        self.assertEqual(len(ticket_api.calls), 1)
-        self.assertIn("已创建客服工单", self.channel.replies[-1][1]["text"])
 
     def test_group_missing_merchant_followup_is_reanalyzed_immediately(self) -> None:
         api = MissingMerchantThenCorrectionApi()
