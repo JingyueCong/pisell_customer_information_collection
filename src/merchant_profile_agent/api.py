@@ -5,6 +5,7 @@ import json
 import logging
 import re
 import uuid
+from copy import deepcopy
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Mapping
@@ -12,6 +13,13 @@ from urllib.parse import urlsplit
 
 from . import __version__
 from .agent import MerchantProfileAgent
+from .crm import (
+    CrmResolutionRequired,
+    CrmResolver,
+    CrmResolverError,
+    CrmResolverUnavailable,
+    DisabledCrmResolver,
+)
 from .knowledge_store import (
     DisabledKnowledgeStore,
     KnowledgeStore,
@@ -70,6 +78,17 @@ def openapi_document() -> dict[str, Any]:
                     },
                 }
             },
+            "/v1/profile/crm/resolve": {
+                "post": {
+                    "security": [{"bearerAuth": []}],
+                    "responses": {
+                        "200": {"description": "Read-only CRM customer resolution"},
+                        "400": {"description": "Invalid request"},
+                        "401": {"description": "Unauthorized"},
+                        "503": {"description": "CRM lookup unavailable"},
+                    },
+                }
+            },
             "/v1/profile/commit": {
                 "post": {
                     "security": [{"bearerAuth": []}],
@@ -90,8 +109,48 @@ def create_server(
     settings: Settings,
     agent: MerchantProfileAgent,
     knowledge_store: KnowledgeStore | None = None,
+    crm_resolver: CrmResolver | None = None,
 ) -> ThreadingHTTPServer:
     store = knowledge_store or DisabledKnowledgeStore()
+    crm = crm_resolver or DisabledCrmResolver()
+
+    def resolve_crm(request: Mapping[str, Any]) -> dict[str, Any]:
+        return crm.resolve(request)
+
+    def read_with_crm(request: Mapping[str, Any]) -> dict[str, Any]:
+        resolution = resolve_crm(request)
+        effective_request = {
+            "merchant_name": request.get("merchant_name"),
+            "merchant_id": request.get("merchant_id"),
+        }
+        candidates = resolution.get("candidates")
+        if resolution.get("status") == "unique" and isinstance(candidates, list):
+            candidate = candidates[0] if candidates else None
+            if isinstance(candidate, Mapping) and candidate.get("work_item_id"):
+                effective_request["merchant_id"] = str(candidate["work_item_id"])
+        result = store.read_profile(effective_request)
+        return {**result, "crm": resolution}
+
+    def commit_with_crm(request: Mapping[str, Any]) -> dict[str, Any]:
+        merchant = request.get("merchant")
+        if not isinstance(merchant, Mapping):
+            raise ProfileValidationError("merchant is required")
+        name = merchant.get("name")
+        identifier = merchant.get("id")
+        resolution = resolve_crm(
+            {"merchant_name": name, "merchant_id": identifier}
+        )
+        if resolution.get("status") not in {"unique", "disabled"}:
+            raise CrmResolutionRequired(resolution)
+        effective_request = deepcopy(dict(request))
+        if resolution.get("status") == "unique":
+            candidates = resolution.get("candidates")
+            candidate = candidates[0] if isinstance(candidates, list) and candidates else None
+            if not isinstance(candidate, Mapping) or not candidate.get("work_item_id"):
+                raise CrmResolverError("CRM lookup returned an invalid unique match")
+            effective_request["merchant"]["id"] = str(candidate["work_item_id"])
+        result = store.commit_profile(effective_request)
+        return {**result, "crm": resolution}
 
     class Handler(BaseHTTPRequestHandler):
         server_version = "PiSellMerchantProfileAgent/" + __version__
@@ -155,6 +214,7 @@ def create_server(
                         "version": __version__,
                         "model": settings.model,
                         "knowledge_store": store.name,
+                        "crm_resolver": crm.name,
                     },
                 )
                 return
@@ -194,9 +254,11 @@ def create_server(
                         request.get("current_profile", {}),
                     )
                 elif path == "/v1/profile/read":
-                    result = store.read_profile(request)
+                    result = read_with_crm(request)
+                elif path == "/v1/profile/crm/resolve":
+                    result = {"crm": resolve_crm(request), "write_performed": False}
                 elif path == "/v1/profile/commit":
-                    result = store.commit_profile(request)
+                    result = commit_with_crm(request)
                 else:
                     self._send_json(
                         HTTPStatus.NOT_FOUND,
@@ -219,6 +281,37 @@ def create_server(
                         "message": str(exc),
                         "request_id": request_id,
                     },
+                    request_id=request_id,
+                )
+                return
+            except CrmResolutionRequired as exc:
+                self._send_json(
+                    HTTPStatus.CONFLICT,
+                    {
+                        "error": "crm_resolution_required",
+                        "message": str(exc),
+                        "crm": exc.resolution,
+                        "request_id": request_id,
+                    },
+                    request_id=request_id,
+                )
+                return
+            except CrmResolverUnavailable as exc:
+                self._send_json(
+                    HTTPStatus.SERVICE_UNAVAILABLE,
+                    {
+                        "error": "crm_unavailable",
+                        "message": str(exc),
+                        "request_id": request_id,
+                    },
+                    request_id=request_id,
+                )
+                return
+            except CrmResolverError:
+                LOGGER.exception("CRM lookup failed request_id=%s", request_id)
+                self._send_json(
+                    HTTPStatus.BAD_GATEWAY,
+                    {"error": "crm_failure", "request_id": request_id},
                     request_id=request_id,
                 )
                 return

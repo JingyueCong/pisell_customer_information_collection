@@ -6,6 +6,7 @@ from pathlib import Path
 
 from .agent import MerchantProfileAgent
 from .api import create_server
+from .crm import create_crm_resolver
 from .knowledge_store import KnowledgeStoreUnavailable, create_knowledge_store
 from .openai_client import OpenAIResponsesClient
 from .settings import ConfigurationError, Settings, load_env_file
@@ -35,13 +36,17 @@ def main() -> int:
         knowledge_store = create_knowledge_store(settings)
     except KnowledgeStoreUnavailable as exc:
         parser.error(str(exc))
-    server = create_server(settings, MerchantProfileAgent(client), knowledge_store)
+    crm_resolver = create_crm_resolver(settings)
+    server = create_server(
+        settings, MerchantProfileAgent(client), knowledge_store, crm_resolver
+    )
     logging.getLogger("merchant_profile_agent").info(
-        "listening on http://%s:%d model=%s knowledge_store=%s",
+        "listening on http://%s:%d model=%s knowledge_store=%s crm_resolver=%s",
         settings.host,
         settings.port,
         settings.model,
         knowledge_store.name,
+        crm_resolver.name,
     )
     try:
         server.serve_forever()

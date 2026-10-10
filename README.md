@@ -17,6 +17,7 @@
 - 标准库实现，无运行时第三方 Python 依赖。
 - 可选飞书机器人使用官方 `lark-channel-sdk` WebSocket 长连接，无需给 Mac mini 开放公网回调；
 - Codex 与飞书机器人均通过 `/v1/profile/commit` 写入同一个 Events → Artifact → Wiki 投影链路。
+- 可选只读查询“客户管理 CRM”；唯一匹配后把 CRM 工作项 ID 绑定到商户档案，零个或多个候选时停止保存并要求消歧，不会自动创建或更新 CRM。
 
 OpenAI API 的结构化输出格式参考[官方 Structured Outputs 文档](https://developers.openai.com/api/docs/guides/structured-outputs)，默认模型能力参考[GPT-6 Luna 文档](https://developers.openai.com/api/docs/models/gpt-6-luna)。
 
@@ -157,6 +158,32 @@ Content-Type: application/json
 
 API 会在写入前重新读取飞书中的最新 Event 链并再次检查冲突。相同会话和快照重复提交会沿用 P1 的
 幂等键，不会制造重复档案。
+
+## 连接客户管理 CRM（只读）
+
+CRM 使用飞书项目 `v2qint` 中的“客户管理 CRM”工作项。启用后，读取和提交都会通过 Meegle CLI
+重新查询；只有唯一匹配才能写知识库。匹配不到时提示补充准确客户名称或店铺 ID，多个候选时列出
+候选供消歧。此链路不会执行任何 CRM 创建或更新命令。
+
+```dotenv
+MERCHANT_AGENT_CRM_RESOLVER=meegle
+MERCHANT_AGENT_CRM_TIMEOUT=20
+MEEGLE_BIN=/absolute/path/to/meegle
+# 可选：为机器人使用一个已登录且只有所需权限的固定 profile
+MEEGLE_PROFILE=merchant-profile-bot
+MEEGLE_PROJECT_KEY=v2qint
+MEEGLE_CRM_WORK_ITEM_TYPE=crm
+MEEGLE_CRM_URL_TEMPLATE=https://project.feishu.cn/v2qint/crm/detail/{work_item_id}
+```
+
+启用前先用同一运行账户检查 profile：
+
+```bash
+meegle --profile merchant-profile-bot auth status --format json
+```
+
+API 也提供只读诊断端点 `POST /v1/profile/crm/resolve`，请求体为
+`{"merchant_name":"青禾便当","lookup_hint":"可选店铺 ID"}`。
 
 ## 飞书 App / 智能体
 

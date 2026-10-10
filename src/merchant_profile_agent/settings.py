@@ -52,6 +52,13 @@ class Settings:
     p1_root: str = ""
     feishu_data_layer_config: str = ""
     lark_cli: str = "lark-cli"
+    crm_resolver: str = "disabled"
+    crm_timeout: int = 20
+    meegle_bin: str = "meegle"
+    meegle_profile: str = ""
+    meegle_project_key: str = "v2qint"
+    meegle_crm_work_item_type: str = "crm"
+    meegle_crm_url_template: str = ""
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -84,6 +91,18 @@ class Settings:
             raise ConfigurationError(
                 "PISELL_FEISHU_DATA_LAYER_CONFIG is required for the p1 knowledge store"
             )
+        crm_resolver = os.environ.get("MERCHANT_AGENT_CRM_RESOLVER", "disabled").strip().lower()
+        if crm_resolver not in {"disabled", "meegle"}:
+            raise ConfigurationError("MERCHANT_AGENT_CRM_RESOLVER must be disabled or meegle")
+        meegle_bin = os.environ.get("MEEGLE_BIN", "meegle").strip()
+        meegle_project_key = os.environ.get("MEEGLE_PROJECT_KEY", "v2qint").strip()
+        meegle_crm_work_item_type = os.environ.get(
+            "MEEGLE_CRM_WORK_ITEM_TYPE", "crm"
+        ).strip()
+        if crm_resolver == "meegle" and not all(
+            (meegle_bin, meegle_project_key, meegle_crm_work_item_type)
+        ):
+            raise ConfigurationError("Meegle CRM resolver settings cannot be empty")
         return cls(
             api_key=api_key,
             openai_api_key=openai_api_key,
@@ -98,4 +117,13 @@ class Settings:
             p1_root=p1_root,
             feishu_data_layer_config=feishu_data_layer_config,
             lark_cli=os.environ.get("LARK_CLI", "lark-cli").strip() or "lark-cli",
+            crm_resolver=crm_resolver,
+            crm_timeout=_integer("MERCHANT_AGENT_CRM_TIMEOUT", 20, 3, 120),
+            meegle_bin=meegle_bin,
+            meegle_profile=os.environ.get("MEEGLE_PROFILE", "").strip(),
+            meegle_project_key=meegle_project_key,
+            meegle_crm_work_item_type=meegle_crm_work_item_type,
+            meegle_crm_url_template=os.environ.get(
+                "MEEGLE_CRM_URL_TEMPLATE", ""
+            ).strip(),
         )

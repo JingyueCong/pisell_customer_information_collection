@@ -123,6 +123,7 @@ class Session:
     current_profile: dict[str, Any] = field(default_factory=dict)
     current_profile_loaded: bool = False
     merchant: dict[str, Any] | None = None
+    crm_resolution: dict[str, Any] | None = None
     preview: dict[str, Any] | None = None
     last_documents: list[dict[str, str]] = field(default_factory=list)
     group_summary_enabled: bool = False
@@ -142,6 +143,7 @@ class Session:
         self.current_profile.clear()
         self.current_profile_loaded = False
         self.merchant = merchant
+        self.crm_resolution = None
         self.preview = None
         self.group_followup_pending = False
         self.group_save_pending = False
@@ -357,6 +359,30 @@ def _preview_text(result: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _crm_question(resolution: dict[str, Any], merchant_name: str) -> str | None:
+    status = resolution.get("status")
+    if status == "not_found":
+        return (
+            f"CRM 中未找到“{merchant_name}”。请补充准确客户名称或店铺 ID；"
+            "我不会自动新建 CRM。"
+        )
+    if status != "ambiguous":
+        return None
+    candidates = resolution.get("candidates")
+    labels: list[str] = []
+    if isinstance(candidates, list):
+        for item in candidates[:5]:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name") or "未命名")
+            identifier = str(item.get("work_item_id") or "")
+            labels.append(f"{name}（CRM {identifier}）" if identifier else name)
+    suffix = "、".join(labels)
+    if suffix:
+        return f"CRM 中有多个候选：{suffix}。请补充店铺 ID 或更准确的客户名称。"
+    return "CRM 中有多个候选，请补充店铺 ID 或更准确的客户名称。"
+
+
 def _group_summary_text(result: dict[str, Any]) -> str:
     sections: list[str] = []
 
@@ -511,6 +537,7 @@ class FeishuBotController:
             )
             profile = read.get("profile")
             session.current_profile = profile if isinstance(profile, dict) else {}
+            self._apply_crm_resolution(session, read.get("crm"))
             session.current_profile_loaded = True
         preview = await self._post(
             "/v1/profile/analyze",
@@ -520,8 +547,11 @@ class FeishuBotController:
         if isinstance(merchant, dict) and merchant.get("name"):
             if session.merchant and session.merchant.get("name") != merchant.get("name"):
                 raise MerchantSwitchError
-            changed = not session.merchant or session.merchant.get("name") != merchant.get("name")
-            session.merchant = {"name": merchant.get("name"), "id": merchant.get("id")}
+            previous_name = session.merchant.get("name") if session.merchant else None
+            previous_id = session.merchant.get("id") if session.merchant else None
+            proposed_id = merchant.get("id") or previous_id
+            changed = previous_name != merchant.get("name") or previous_id != proposed_id
+            session.merchant = {"name": merchant.get("name"), "id": proposed_id}
             if changed:
                 read = await self._post(
                     "/v1/profile/read",
@@ -532,6 +562,7 @@ class FeishuBotController:
                 )
                 profile = read.get("profile")
                 session.current_profile = profile if isinstance(profile, dict) else {}
+                self._apply_crm_resolution(session, read.get("crm"))
                 session.current_profile_loaded = True
                 if session.current_profile.get("fields"):
                     preview = await self._post(
@@ -541,13 +572,46 @@ class FeishuBotController:
                             "current_profile": session.current_profile,
                         },
                     )
-        if session.merchant and not (
-            isinstance(preview.get("merchant"), dict)
-            and preview["merchant"].get("name")
-        ):
+        if session.merchant:
             preview["merchant"] = dict(session.merchant)
+        self._apply_crm_gate(session, preview)
         session.preview = preview
         return preview
+
+    @staticmethod
+    def _apply_crm_resolution(session: Session, raw: Any) -> None:
+        if not isinstance(raw, dict):
+            return
+        session.crm_resolution = raw
+        candidates = raw.get("candidates")
+        if raw.get("status") != "unique" or not isinstance(candidates, list) or not candidates:
+            return
+        candidate = candidates[0]
+        if not isinstance(candidate, dict) or not candidate.get("work_item_id"):
+            return
+        if session.merchant:
+            session.merchant["id"] = str(candidate["work_item_id"])
+
+    @staticmethod
+    def _apply_crm_gate(session: Session, preview: dict[str, Any]) -> None:
+        resolution = session.crm_resolution
+        merchant = session.merchant
+        if not isinstance(resolution, dict) or not merchant:
+            return
+        preview["crm"] = resolution
+        if resolution.get("status") == "unique":
+            preview["merchant"] = dict(merchant)
+            return
+        question = _crm_question(resolution, str(merchant.get("name") or "该商户"))
+        if question:
+            preview["save_readiness"] = "missing_info"
+            preview["next_question"] = question
+            gaps = preview.get("information_gaps")
+            if not isinstance(gaps, list):
+                gaps = []
+            if "CRM 客户唯一匹配" not in gaps:
+                gaps.append("CRM 客户唯一匹配")
+            preview["information_gaps"] = gaps
 
     async def _on_group_message(self, message: Any, text: str) -> None:
         key = _session_key(message)
@@ -796,7 +860,10 @@ class FeishuBotController:
                         f"暂未写入：{question}\n请 @机器人 补充，我会继续处理。",
                     )
             else:
-                await self._reply(message, "暂不能保存，请补充商户名称或解决冲突。")
+                question = str(
+                    preview.get("next_question") or "请补充商户名称或解决冲突。"
+                )
+                await self._reply(message, f"暂不能保存：{question}")
             return
         try:
             result = await self._post(

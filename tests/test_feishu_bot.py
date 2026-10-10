@@ -218,6 +218,39 @@ class ConflictThenConfirmationApi(FakeApi):
         raise AssertionError(path)
 
 
+class CrmAwareApi(FakeApi):
+    def __init__(self, status: str) -> None:
+        super().__init__()
+        self.status = status
+
+    def post(self, path, payload):
+        if path != "/v1/profile/read":
+            return super().post(path, payload)
+        self.calls.append((path, copy.deepcopy(payload)))
+        candidates = []
+        if self.status == "unique":
+            candidates = [
+                {
+                    "work_item_id": "987654321",
+                    "name": "青禾便当",
+                    "url": "https://project.feishu.cn/v2qint/crm/detail/987654321",
+                }
+            ]
+        elif self.status == "ambiguous":
+            candidates = [
+                {"work_item_id": "101", "name": "1001 青禾便当"},
+                {"work_item_id": "102", "name": "1002 青禾便当"},
+            ]
+        return {
+            "profile": {"fields": {}, "event_count": 0},
+            "crm": {
+                "status": self.status,
+                "candidates": candidates,
+                "read_only": True,
+            },
+        }
+
+
 class FeishuBotTests(unittest.TestCase):
     def setUp(self) -> None:
         self.api = FakeApi()
@@ -313,6 +346,44 @@ class FeishuBotTests(unittest.TestCase):
 
         self.assertNotIn("/v1/profile/commit", [path for path, _ in self.api.calls])
         self.assertIn("未写入知识库", self.channel.replies[-1][1]["text"])
+
+    def test_unique_crm_match_is_bound_to_commit(self) -> None:
+        api = CrmAwareApi("unique")
+        bot = FeishuBotController(api=api, channel=self.channel, sessions=SessionStore())
+
+        async def scenario() -> None:
+            await bot.on_message(Message("青禾便当的联系人是林经理"))
+            await bot.on_message(Message("保存吧", message_id="om_save"))
+
+        asyncio.run(scenario())
+
+        commit = next(payload for path, payload in api.calls if path == "/v1/profile/commit")
+        self.assertEqual(commit["merchant"]["id"], "987654321")
+
+    def test_missing_crm_match_blocks_save_and_prompts_for_identifier(self) -> None:
+        api = CrmAwareApi("not_found")
+        bot = FeishuBotController(api=api, channel=self.channel, sessions=SessionStore())
+
+        async def scenario() -> None:
+            await bot.on_message(Message("青禾便当的联系人是林经理"))
+            self.assertIn("CRM 中未找到", self.channel.replies[-1][1]["text"])
+            await bot.on_message(Message("保存吧", message_id="om_save"))
+
+        asyncio.run(scenario())
+
+        self.assertNotIn("/v1/profile/commit", [path for path, _ in api.calls])
+        self.assertIn("不会自动新建 CRM", self.channel.replies[-1][1]["text"])
+
+    def test_ambiguous_crm_match_lists_candidates(self) -> None:
+        api = CrmAwareApi("ambiguous")
+        bot = FeishuBotController(api=api, channel=self.channel, sessions=SessionStore())
+
+        asyncio.run(bot.on_message(Message("青禾便当的联系人是林经理")))
+
+        reply = self.channel.replies[-1][1]["text"]
+        self.assertIn("多个候选", reply)
+        self.assertIn("CRM 101", reply)
+        self.assertIn("CRM 102", reply)
 
     def test_group_messages_are_ignored_until_explicit_enable(self) -> None:
         self.run_group("青禾便当的联系人是林经理")
