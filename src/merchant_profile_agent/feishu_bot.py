@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 from .api_client import MerchantApiClient, MerchantApiError
+from .ticket_client import TicketAgentError
 
 
 LOGGER = logging.getLogger("merchant_profile_agent.feishu_bot")
@@ -116,6 +117,12 @@ class ReplyChannel(Protocol):
     async def reply(self, message: Any, content: Any, opts: Any = None) -> Any: ...
 
 
+class TicketApi(Protocol):
+    def create_customer_service_ticket(
+        self, payload: dict[str, Any]
+    ) -> dict[str, Any]: ...
+
+
 @dataclass
 class Session:
     conversation_id: str = field(default_factory=lambda: str(uuid.uuid4()))
@@ -132,6 +139,7 @@ class Session:
     group_last_message: Any = None
     group_followup_pending: bool = False
     group_save_pending: bool = False
+    support_ticket_pending: bool = False
     group_idle_task: asyncio.Task[Any] | None = field(default=None, repr=False)
     touched_at: float = field(default_factory=time.monotonic)
 
@@ -145,6 +153,7 @@ class Session:
         self.preview = None
         self.group_followup_pending = False
         self.group_save_pending = False
+        self.support_ticket_pending = False
         self.touched_at = time.monotonic()
 
     def clear_group_buffer(self) -> None:
@@ -418,6 +427,7 @@ class FeishuBotController:
         self,
         *,
         api: MerchantApiClient,
+        ticket_api: TicketApi | None = None,
         channel: ReplyChannel,
         sessions: SessionStore | None = None,
         group_message_threshold: int = 20,
@@ -425,6 +435,7 @@ class FeishuBotController:
         group_idle_min_messages: int = 1,
     ) -> None:
         self.api = api
+        self.ticket_api = ticket_api
         self.channel = channel
         self.sessions = sessions or SessionStore()
         self.group_message_threshold = group_message_threshold
@@ -471,6 +482,17 @@ class FeishuBotController:
             await self._save(message, session, "结束并保存")
             return
 
+        if session.support_ticket_pending:
+            session.messages.append(
+                {
+                    "role": "user",
+                    "content": text,
+                    "source_ref": _source_ref(message),
+                }
+            )
+            await self._handoff_to_support(message, session, text)
+            return
+
         session.messages.append(
             {
                 "role": "user",
@@ -480,6 +502,15 @@ class FeishuBotController:
         )
         try:
             preview = await self._analyze_session(session)
+            escalation = preview.get("support_escalation")
+            if isinstance(escalation, dict) and escalation.get("required") is True:
+                summary = escalation.get("summary")
+                await self._handoff_to_support(
+                    message,
+                    session,
+                    str(summary).strip() if summary else text,
+                )
+                return
             reply_text = _preview_text(preview)
             session.messages.append(
                 {
@@ -600,6 +631,16 @@ class FeishuBotController:
             session.clear_group_buffer()
             await self._reply(message, "已放弃当前摘要草稿，自动总结仍开启。")
             return
+        if mentioned and session.support_ticket_pending:
+            session.messages.append(
+                {
+                    "role": "user",
+                    "content": text,
+                    "source_ref": _source_ref(message),
+                }
+            )
+            await self._handoff_to_support(message, session, text)
+            return
         if mentioned and _is_link_request(text):
             await self._reply(message, _links_text(session.last_documents))
             return
@@ -648,7 +689,11 @@ class FeishuBotController:
                 if analyzed and save_pending and not session.group_followup_pending:
                     await self._save(message, session, "结束并保存")
             else:
-                await self._summarize_group(session, message)
+                await self._summarize_group(
+                    session,
+                    message,
+                    allow_support_handoff=True,
+                )
             return
         if session.group_followup_pending:
             # Keep nearby, unmentioned corrections so the next explicit @bot
@@ -688,6 +733,7 @@ class FeishuBotController:
         message: Any,
         *,
         reply_on_success: bool = True,
+        allow_support_handoff: bool = False,
     ) -> bool:
         if not session.group_buffer:
             await self._reply(message, "暂无新的群消息可总结。")
@@ -708,9 +754,77 @@ class FeishuBotController:
             await self._reply(message, "本段总结失败，消息仍保留，将稍后重试。")
             return False
         session.clear_group_buffer()
+        escalation = preview.get("support_escalation")
+        if (
+            isinstance(escalation, dict)
+            and escalation.get("required") is True
+            and allow_support_handoff
+        ):
+            summary = escalation.get("summary")
+            await self._handoff_to_support(
+                message,
+                session,
+                str(summary).strip() if summary else str(getattr(message, "body_text", "")),
+            )
+            return True
         if reply_on_success or session.group_followup_pending:
             await self._reply(message, _group_summary_text(preview))
         return True
+
+    async def _handoff_to_support(
+        self,
+        message: Any,
+        session: Session,
+        content: str,
+    ) -> None:
+        if self.ticket_api is None:
+            await self._reply(
+                message,
+                "这个问题暂时无法从商户资料中确认，客服工单自动创建尚未配置。",
+            )
+            return
+        payload: dict[str, Any] = {
+            "request_id": str(getattr(message, "message_id", "unknown")),
+            "conversation_id": _session_key(message),
+            "source_chat_id": str(getattr(message, "chat_id", "unknown")),
+            "source_message_id": str(getattr(message, "message_id", "unknown")),
+            "content": content,
+            "context": [
+                {"role": item["role"], "content": item["content"]}
+                for item in session.messages[-12:]
+                if item.get("role") in {"user", "assistant"} and item.get("content")
+            ],
+        }
+        sender_name = str(getattr(message, "sender_name", "") or "").strip()
+        if sender_name:
+            payload["sender_name"] = sender_name
+        if session.merchant and session.merchant.get("name"):
+            payload["merchant_name"] = str(session.merchant["name"])
+        try:
+            result = await asyncio.to_thread(
+                self.ticket_api.create_customer_service_ticket,
+                payload,
+            )
+        except TicketAgentError:
+            session.support_ticket_pending = True
+            LOGGER.exception("ticket agent handoff failed")
+            await self._reply(
+                message,
+                "这个问题暂时无法回答，客服工单创建服务也暂时不可用；尚未确认创建成功。",
+            )
+            return
+        reply = str(result.get("reply") or "客服工单已处理。").strip()
+        session.support_ticket_pending = bool(result.get("draft_open"))
+        session.messages.append(
+            {
+                "role": "assistant",
+                "content": reply,
+                "source_ref": f"ticket-agent://reply/{getattr(message, 'message_id', 'unknown')}",
+            }
+        )
+        if not session.support_ticket_pending:
+            session.reset_draft(preserve_merchant=True)
+        await self._reply(message, reply)
 
     async def _summarize_group_followup(
         self,

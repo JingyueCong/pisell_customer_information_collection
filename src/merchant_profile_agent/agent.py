@@ -28,6 +28,18 @@ Keep the knowledge base minimal:
   action_items. These are conversational summaries only; do not turn them into profile updates
   unless they are durable merchant facts explicitly stated by a user.
 
+Support escalation:
+- Set support_escalation.required=true only when the user is explicitly asking for customer support,
+  reporting a product/operational problem, or making a complaint that cannot be answered reliably
+  from current_profile and the explicit conversation.
+- Keep it false for merchant fact collection, missing profile facts, greetings, acknowledgements,
+  bot usage questions, save/link commands, vague statements, or questions already answered by the
+  available profile. Never escalate merely because there is no profile update.
+- When escalation is required, summary must be a short factual customer-service ticket description
+  containing only details explicitly provided. Do not infer a cause, severity, T-level, or solution.
+- Escalation creates only a customer-service main ticket. It must never request or imply creation of
+  a paired T1/T2/T3/T5, blocking, content, demand, hardware, or risk work item.
+
 Use only these field prefixes:
 - business.*, contacts.*
 - menu.*, content.*
@@ -97,6 +109,16 @@ OUTPUT_SCHEMA: dict[str, Any] = {
             "items": {"type": "string"},
             "maxItems": 5,
         },
+        "support_escalation": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "required": {"type": "boolean"},
+                "reason": {"type": ["string", "null"]},
+                "summary": {"type": ["string", "null"]},
+            },
+            "required": ["required", "reason", "summary"],
+        },
     },
     "required": [
         "merchant_name",
@@ -110,6 +132,7 @@ OUTPUT_SCHEMA: dict[str, Any] = {
         "summary_points",
         "decisions",
         "action_items",
+        "support_escalation",
     ],
 }
 
@@ -211,6 +234,41 @@ class MerchantProfileAgent:
             not isinstance(next_question, str) or not next_question.strip()
         ):
             next_question = None
+        raw_escalation = extracted.get("support_escalation")
+        if not isinstance(raw_escalation, Mapping) or not isinstance(
+            raw_escalation.get("required"), bool
+        ):
+            raise ProfileValidationError("model returned an invalid support_escalation")
+        escalation_required = raw_escalation["required"]
+        escalation_reason = raw_escalation.get("reason")
+        escalation_summary = raw_escalation.get("summary")
+        for field_name, value in (
+            ("reason", escalation_reason),
+            ("summary", escalation_summary),
+        ):
+            if value is not None and not isinstance(value, str):
+                raise ProfileValidationError(
+                    f"model returned an invalid support_escalation.{field_name}"
+                )
+        if escalation_required and not (
+            isinstance(escalation_summary, str) and escalation_summary.strip()
+        ):
+            raise ProfileValidationError(
+                "support escalation requires a factual summary"
+            )
+        support_escalation = {
+            "required": escalation_required,
+            "reason": (
+                escalation_reason.strip()
+                if isinstance(escalation_reason, str) and escalation_reason.strip()
+                else None
+            ),
+            "summary": (
+                escalation_summary.strip()
+                if isinstance(escalation_summary, str) and escalation_summary.strip()
+                else None
+            ),
+        }
         result = {
             "merchant": {
                 "name": validated.pop("merchant_name"),
@@ -225,6 +283,7 @@ class MerchantProfileAgent:
             "summary_points": extracted.get("summary_points", []),
             "decisions": extracted.get("decisions", []),
             "action_items": extracted.get("action_items", []),
+            "support_escalation": support_escalation,
             "model": self.client.model,
         }
         if result["save_readiness"] == "needs_confirmation" and not result["next_question"]:

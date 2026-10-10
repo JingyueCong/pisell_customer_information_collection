@@ -9,6 +9,7 @@ from pathlib import Path
 from .api_client import MerchantApiClient
 from .feishu_bot import FeishuBotController, SessionStore
 from .settings import ConfigurationError, load_env_file
+from .ticket_client import TicketAgentClient
 
 
 def _required(name: str) -> str:
@@ -78,8 +79,26 @@ def build_channel():
         base_url=os.environ.get("MERCHANT_AGENT_API_URL", "http://127.0.0.1:8090"),
         api_key=api_key,
     )
+    ticket_api_url = os.environ.get("TICKET_AGENT_API_URL", "").strip()
+    ticket_api_token = os.environ.get("TICKET_AGENT_API_TOKEN", "").strip()
+    if bool(ticket_api_url) != bool(ticket_api_token):
+        raise ConfigurationError(
+            "TICKET_AGENT_API_URL and TICKET_AGENT_API_TOKEN must be configured together"
+        )
+    if ticket_api_token and len(ticket_api_token) < 24:
+        raise ConfigurationError("TICKET_AGENT_API_TOKEN must be at least 24 characters")
+    ticket_api = (
+        TicketAgentClient(
+            base_url=ticket_api_url,
+            token=ticket_api_token,
+            timeout=_integer("TICKET_AGENT_API_TIMEOUT", 660, 30, 900),
+        )
+        if ticket_api_url
+        else None
+    )
     controller = FeishuBotController(
         api=api,
+        ticket_api=ticket_api,
         channel=channel,
         sessions=SessionStore(
             ttl_seconds=int(os.environ.get("FEISHU_BOT_SESSION_TTL", "14400"))
