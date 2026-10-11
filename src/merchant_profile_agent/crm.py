@@ -197,9 +197,9 @@ class MeegleCrmResolver:
 
     def _mql(self, where: str) -> str:
         return (
-            "SELECT `work_item_id`, `name`, `work_item_status` "
+            "SELECT `work_item_id`, `name` "
             f"FROM `{self.project_key}`.`{self.work_item_type}` "
-            f"WHERE `archiving_date` IS NULL AND {where} LIMIT 10"
+            f"WHERE {where} LIMIT 10"
         )
 
     def resolve(self, request: Mapping[str, Any]) -> dict[str, Any]:
