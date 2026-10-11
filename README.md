@@ -161,15 +161,24 @@ API 会在写入前重新读取飞书中的最新 Event 链并再次检查冲突
 
 ## 连接客户管理 CRM（只读）
 
-CRM 使用飞书项目 `v2qint` 中的“客户管理 CRM”工作项。启用后，读取和提交都会通过 Meegle CLI
-重新查询；只有唯一匹配才能写知识库。匹配不到时提示补充准确客户名称或店铺 ID，多个候选时列出
-候选供消歧。此链路不会执行任何 CRM 创建或更新命令。
+CRM 使用飞书项目 `v2qint` 中的“客户管理 CRM”工作项。推荐通过同一台 Mac mini 上的工单
+Agent Bridge 查询，从而复用工单 Agent 已验证的员工身份，不再维护独立的商户资料 OAuth。
+只有唯一匹配才能写知识库；匹配不到时提示补充准确客户名称或店铺 ID，多个候选时列出候选供消歧。
+此接口只执行 CRM 查询，不会创建、更新 CRM，也不会创建客服工单。
+
+```dotenv
+MERCHANT_AGENT_CRM_RESOLVER=ticket_bridge
+MERCHANT_AGENT_CRM_TIMEOUT=20
+TICKET_BRIDGE_URL=http://127.0.0.1:8787
+# 与工单 Bridge 的 INTERNAL_API_TOKEN 使用相同值，仅保存在 Mac mini .env
+TICKET_BRIDGE_TOKEN=replace-with-ticket-bridge-token
+```
+
+如需独立身份，也保留直接 Meegle 模式：
 
 ```dotenv
 MERCHANT_AGENT_CRM_RESOLVER=meegle
-MERCHANT_AGENT_CRM_TIMEOUT=20
 MEEGLE_BIN=/absolute/path/to/meegle
-# 可选：为机器人使用一个已登录且只有所需权限的固定 profile
 MEEGLE_PROFILE=merchant-profile-bot
 MEEGLE_PROJECT_KEY=v2qint
 MEEGLE_CRM_WORK_ITEM_TYPE=crm

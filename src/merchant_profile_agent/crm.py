@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import re
 import subprocess
+import urllib.error
+import urllib.request
 from dataclasses import dataclass
 from typing import Any, Mapping, Protocol
 
@@ -243,9 +245,62 @@ class MeegleCrmResolver:
         }
 
 
+class TicketBridgeCrmResolver:
+    name = "ticket_bridge"
+
+    def __init__(self, *, base_url: str, token: str, timeout: int = 20) -> None:
+        self.base_url = base_url.rstrip("/")
+        self.token = token
+        self.timeout = timeout
+
+    def resolve(self, request: Mapping[str, Any]) -> dict[str, Any]:
+        merchant_name, lookup_hint = _validated_request(request)
+        body = {"merchant_name": merchant_name}
+        if lookup_hint:
+            body["lookup_hint"] = lookup_hint
+        http_request = urllib.request.Request(
+            f"{self.base_url}/internal/customer-crm/resolve",
+            data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
+            headers={
+                "Authorization": f"Bearer {self.token}",
+                "Content-Type": "application/json; charset=utf-8",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(http_request, timeout=self.timeout) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            if exc.code == 409:
+                raise CrmResolverUnavailable(
+                    "ticket Agent CRM identity requires authorization"
+                ) from exc
+            raise CrmResolverUnavailable("CRM lookup service is unavailable") from exc
+        except (OSError, TimeoutError, json.JSONDecodeError, UnicodeDecodeError) as exc:
+            raise CrmResolverUnavailable("CRM lookup service is unavailable") from exc
+        if not isinstance(payload, Mapping) or payload.get("ok") is not True:
+            raise CrmResolverUnavailable("CRM lookup returned an invalid response")
+        crm = payload.get("crm")
+        if not isinstance(crm, Mapping):
+            raise CrmResolverUnavailable("CRM lookup returned an invalid response")
+        status = crm.get("status")
+        candidates = crm.get("candidates")
+        if status not in {"unique", "ambiguous", "not_found"} or not isinstance(
+            candidates, list
+        ):
+            raise CrmResolverUnavailable("CRM lookup returned an invalid response")
+        return dict(crm)
+
+
 def create_crm_resolver(settings: Settings) -> CrmResolver:
     if settings.crm_resolver == "disabled":
         return DisabledCrmResolver()
+    if settings.crm_resolver == "ticket_bridge":
+        return TicketBridgeCrmResolver(
+            base_url=settings.ticket_bridge_url,
+            token=settings.ticket_bridge_token,
+            timeout=settings.crm_timeout,
+        )
     return MeegleCrmResolver(
         executable=settings.meegle_bin,
         project_key=settings.meegle_project_key,

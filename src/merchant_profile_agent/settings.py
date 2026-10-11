@@ -54,6 +54,8 @@ class Settings:
     lark_cli: str = "lark-cli"
     crm_resolver: str = "disabled"
     crm_timeout: int = 20
+    ticket_bridge_url: str = "http://127.0.0.1:8787"
+    ticket_bridge_token: str = ""
     meegle_bin: str = "meegle"
     meegle_profile: str = ""
     meegle_project_key: str = "v2qint"
@@ -92,8 +94,10 @@ class Settings:
                 "PISELL_FEISHU_DATA_LAYER_CONFIG is required for the p1 knowledge store"
             )
         crm_resolver = os.environ.get("MERCHANT_AGENT_CRM_RESOLVER", "disabled").strip().lower()
-        if crm_resolver not in {"disabled", "meegle"}:
-            raise ConfigurationError("MERCHANT_AGENT_CRM_RESOLVER must be disabled or meegle")
+        if crm_resolver not in {"disabled", "meegle", "ticket_bridge"}:
+            raise ConfigurationError(
+                "MERCHANT_AGENT_CRM_RESOLVER must be disabled, meegle, or ticket_bridge"
+            )
         meegle_bin = os.environ.get("MEEGLE_BIN", "meegle").strip()
         meegle_project_key = os.environ.get("MEEGLE_PROJECT_KEY", "v2qint").strip()
         meegle_crm_work_item_type = os.environ.get(
@@ -103,6 +107,21 @@ class Settings:
             (meegle_bin, meegle_project_key, meegle_crm_work_item_type)
         ):
             raise ConfigurationError("Meegle CRM resolver settings cannot be empty")
+        ticket_bridge_url = os.environ.get(
+            "TICKET_BRIDGE_URL", "http://127.0.0.1:8787"
+        ).strip().rstrip("/")
+        ticket_bridge_token = os.environ.get("TICKET_BRIDGE_TOKEN", "").strip()
+        if crm_resolver == "ticket_bridge":
+            if ticket_bridge_url not in {
+                "http://127.0.0.1:8787",
+                "http://localhost:8787",
+                "http://[::1]:8787",
+            }:
+                raise ConfigurationError("TICKET_BRIDGE_URL must use the local ticket bridge")
+            if len(ticket_bridge_token) < 24:
+                raise ConfigurationError(
+                    "TICKET_BRIDGE_TOKEN must contain at least 24 characters"
+                )
         return cls(
             api_key=api_key,
             openai_api_key=openai_api_key,
@@ -119,6 +138,8 @@ class Settings:
             lark_cli=os.environ.get("LARK_CLI", "lark-cli").strip() or "lark-cli",
             crm_resolver=crm_resolver,
             crm_timeout=_integer("MERCHANT_AGENT_CRM_TIMEOUT", 20, 3, 120),
+            ticket_bridge_url=ticket_bridge_url,
+            ticket_bridge_token=ticket_bridge_token,
             meegle_bin=meegle_bin,
             meegle_profile=os.environ.get("MEEGLE_PROFILE", "").strip(),
             meegle_project_key=meegle_project_key,

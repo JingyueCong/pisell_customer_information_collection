@@ -3,11 +3,12 @@ from __future__ import annotations
 import json
 import subprocess
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from merchant_profile_agent.crm import (
     CrmResolverUnavailable,
     MeegleCrmResolver,
+    TicketBridgeCrmResolver,
 )
 
 
@@ -107,6 +108,52 @@ class CrmResolverTests(unittest.TestCase):
 
         with self.assertRaises(CrmResolverUnavailable):
             self.make_resolver().resolve({"merchant_name": "汪汪咖啡店"})
+
+    @patch("merchant_profile_agent.crm.urllib.request.urlopen")
+    def test_ticket_bridge_reuses_read_only_crm_response(self, urlopen) -> None:
+        response = MagicMock()
+        response.read.return_value = json.dumps(
+                {
+                    "ok": True,
+                    "crm": {
+                        "status": "unique",
+                        "query": {"merchant_name": "汪汪咖啡店"},
+                        "match_method": "exact_name",
+                        "candidates": [
+                            {
+                                "work_item_id": "123456789",
+                                "name": "汪汪咖啡店",
+                                "url": "https://project.feishu.cn/v2qint/crm/detail/123456789",
+                            }
+                        ],
+                        "read_only": True,
+                    },
+                },
+                ensure_ascii=False,
+            ).encode("utf-8")
+        response.__enter__.return_value = response
+        urlopen.return_value = response
+        resolver = TicketBridgeCrmResolver(
+            base_url="http://127.0.0.1:8787",
+            token="a" * 32,
+        )
+
+        result = resolver.resolve(
+            {"merchant_name": "汪汪咖啡店", "lookup_hint": "store-1002"}
+        )
+
+        self.assertEqual(result["status"], "unique")
+        self.assertTrue(result["read_only"])
+        request = urlopen.call_args.args[0]
+        self.assertEqual(
+            request.full_url,
+            "http://127.0.0.1:8787/internal/customer-crm/resolve",
+        )
+        self.assertEqual(request.get_header("Authorization"), "Bearer " + "a" * 32)
+        self.assertEqual(
+            json.loads(request.data),
+            {"merchant_name": "汪汪咖啡店", "lookup_hint": "store-1002"},
+        )
 
 
 if __name__ == "__main__":
