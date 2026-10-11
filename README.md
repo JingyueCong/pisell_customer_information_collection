@@ -181,7 +181,7 @@ MERCHANT_AGENT_CRM_RESOLVER=meegle
 MEEGLE_BIN=/absolute/path/to/meegle
 MEEGLE_PROFILE=merchant-profile-bot
 MEEGLE_PROJECT_KEY=v2qint
-MEEGLE_CRM_WORK_ITEM_TYPE=crm
+MEEGLE_CRM_WORK_ITEM_TYPE=67df84a32e42950cb0195cba
 MEEGLE_CRM_URL_TEMPLATE=https://project.feishu.cn/v2qint/crm/detail/{work_item_id}
 ```
 

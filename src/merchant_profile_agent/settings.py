@@ -59,7 +59,7 @@ class Settings:
     meegle_bin: str = "meegle"
     meegle_profile: str = ""
     meegle_project_key: str = "v2qint"
-    meegle_crm_work_item_type: str = "crm"
+    meegle_crm_work_item_type: str = "67df84a32e42950cb0195cba"
     meegle_crm_url_template: str = ""
 
     @classmethod
@@ -101,7 +101,7 @@ class Settings:
         meegle_bin = os.environ.get("MEEGLE_BIN", "meegle").strip()
         meegle_project_key = os.environ.get("MEEGLE_PROJECT_KEY", "v2qint").strip()
         meegle_crm_work_item_type = os.environ.get(
-            "MEEGLE_CRM_WORK_ITEM_TYPE", "crm"
+            "MEEGLE_CRM_WORK_ITEM_TYPE", "67df84a32e42950cb0195cba"
         ).strip()
         if crm_resolver == "meegle" and not all(
             (meegle_bin, meegle_project_key, meegle_crm_work_item_type)
