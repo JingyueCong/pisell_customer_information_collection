@@ -10,6 +10,7 @@ from .crm import create_crm_resolver
 from .knowledge_store import KnowledgeStoreUnavailable, create_knowledge_store
 from .openai_client import OpenAIResponsesClient
 from .settings import ConfigurationError, Settings, load_env_file
+from .url_reader import PublicUrlReader
 
 
 def main() -> int:
@@ -37,16 +38,28 @@ def main() -> int:
     except KnowledgeStoreUnavailable as exc:
         parser.error(str(exc))
     crm_resolver = create_crm_resolver(settings)
+    url_reader = None
+    if settings.url_reading_enabled:
+        url_reader = PublicUrlReader(
+            timeout=settings.url_read_timeout,
+            maximum_urls=settings.url_read_max_urls,
+            maximum_bytes=settings.url_read_max_bytes,
+            maximum_chars=settings.url_read_max_chars,
+        )
     server = create_server(
-        settings, MerchantProfileAgent(client), knowledge_store, crm_resolver
+        settings,
+        MerchantProfileAgent(client, url_reader=url_reader),
+        knowledge_store,
+        crm_resolver,
     )
     logging.getLogger("merchant_profile_agent").info(
-        "listening on http://%s:%d model=%s knowledge_store=%s crm_resolver=%s",
+        "listening on http://%s:%d model=%s knowledge_store=%s crm_resolver=%s url_reader=%s",
         settings.host,
         settings.port,
         settings.model,
         knowledge_store.name,
         crm_resolver.name,
+        "enabled" if settings.url_reading_enabled else "disabled",
     )
     try:
         server.serve_forever()

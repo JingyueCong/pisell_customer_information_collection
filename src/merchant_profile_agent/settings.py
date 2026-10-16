@@ -39,6 +39,15 @@ def _integer(name: str, default: int, minimum: int, maximum: int) -> int:
     return value
 
 
+def _boolean(name: str, default: bool) -> bool:
+    raw = os.environ.get(name, "true" if default else "false").strip().lower()
+    if raw in {"1", "true", "yes", "on"}:
+        return True
+    if raw in {"0", "false", "no", "off"}:
+        return False
+    raise ConfigurationError(f"{name} must be true or false")
+
+
 @dataclass(frozen=True)
 class Settings:
     api_key: str
@@ -61,6 +70,11 @@ class Settings:
     meegle_project_key: str = "v2qint"
     meegle_crm_work_item_type: str = "67df84a32e42950cb0195cba"
     meegle_crm_url_template: str = ""
+    url_reading_enabled: bool = True
+    url_read_timeout: int = 10
+    url_read_max_urls: int = 3
+    url_read_max_bytes: int = 1_048_576
+    url_read_max_chars: int = 8_000
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -147,4 +161,13 @@ class Settings:
             meegle_crm_url_template=os.environ.get(
                 "MEEGLE_CRM_URL_TEMPLATE", ""
             ).strip(),
+            url_reading_enabled=_boolean("MERCHANT_AGENT_URL_READING_ENABLED", True),
+            url_read_timeout=_integer("MERCHANT_AGENT_URL_READ_TIMEOUT", 10, 3, 30),
+            url_read_max_urls=_integer("MERCHANT_AGENT_URL_READ_MAX_URLS", 3, 1, 5),
+            url_read_max_bytes=_integer(
+                "MERCHANT_AGENT_URL_READ_MAX_BYTES", 1_048_576, 65_536, 2_097_152
+            ),
+            url_read_max_chars=_integer(
+                "MERCHANT_AGENT_URL_READ_MAX_CHARS", 8_000, 1_000, 16_000
+            ),
         )

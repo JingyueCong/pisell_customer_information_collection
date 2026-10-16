@@ -711,6 +711,27 @@ def _field_label(field_path: Any) -> str:
     return FIELD_SUFFIX_LABELS.get(suffix, suffix.replace("_", " ") or "资料")
 
 
+def _url_evidence_lines(result: dict[str, Any]) -> list[str]:
+    raw = result.get("url_evidence")
+    if not isinstance(raw, list):
+        return []
+    lines: list[str] = []
+    for item in raw[:3]:
+        if not isinstance(item, dict):
+            continue
+        status = str(item.get("status") or "")
+        title = str(item.get("title") or "").strip()
+        final_url = str(item.get("final_url") or item.get("original_url") or "").strip()
+        if status == "read":
+            lines.append(f"已读取链接：{title or final_url}")
+        elif status == "login_required":
+            lines.append(f"链接需要登录，仅读取到公开登录页：{title or final_url}")
+        elif status == "unavailable":
+            reason = str(item.get("reason") or "无法读取").strip()
+            lines.append(f"链接未读取：{final_url}（{reason}）")
+    return lines
+
+
 def _preview_text(result: dict[str, Any]) -> str:
     lines: list[str] = []
     updates = result.get("profile_updates")
@@ -724,6 +745,11 @@ def _preview_text(result: dict[str, Any]) -> str:
         if lines:
             lines.append("")
         lines.append("有旧值冲突，请确认是否替换。")
+    url_lines = _url_evidence_lines(result)
+    if url_lines:
+        if lines:
+            lines.append("")
+        lines.extend(url_lines)
     readiness = result.get("save_readiness")
     if readiness == "ready" and updates:
         lines.extend(["", "回复“保存吧”写入。"])
@@ -853,6 +879,10 @@ def _group_summary_text(result: dict[str, Any]) -> str:
 
     add_section("已确认决定", result.get("decisions"))
     add_section("后续事项", result.get("action_items"))
+
+    url_lines = _url_evidence_lines(result)
+    if url_lines:
+        sections.append("链接读取：\n" + "\n".join(f"- {line}" for line in url_lines))
 
     conflicts = result.get("conflicts")
     if isinstance(conflicts, list) and conflicts:

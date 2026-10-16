@@ -19,6 +19,24 @@ class FakeClient:
         return self.result
 
 
+class FakeUrlReader:
+    def read_messages(self, messages):
+        return [
+            {
+                "source_message_index": 0,
+                "original_url": "https://tracker.example/click",
+                "final_url": "https://merchant.example/profile",
+                "status": "read",
+                "content_type": "text/html",
+                "title": "Merchant profile",
+                "text": "套餐为 Pro。",
+                "links": [],
+                "redirect_chain": ["https://merchant.example/profile"],
+                "truncated": False,
+            }
+        ]
+
+
 def extraction(**overrides):
     value = {
         "merchant_name": "青禾便当",
@@ -140,6 +158,29 @@ class AgentTests(unittest.TestCase):
                     ]
                 }
             )
+
+    def test_public_url_evidence_is_passed_to_model_as_untrusted_context(self) -> None:
+        client = FakeClient(extraction())
+        agent = MerchantProfileAgent(client, url_reader=FakeUrlReader())  # type: ignore[arg-type]
+
+        result = agent.analyze(
+            {
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": "商户资料：https://tracker.example/click",
+                        "source_ref": "feishu://message/url",
+                    }
+                ]
+            }
+        )
+
+        self.assertIn("url_evidence", client.calls[0]["user_input"])
+        self.assertIn("Fetched URL pages", client.calls[0]["system_prompt"])
+        self.assertEqual(
+            result["url_evidence"][0]["final_url"],
+            "https://merchant.example/profile",
+        )
 
 
 if __name__ == "__main__":
