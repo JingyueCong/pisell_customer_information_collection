@@ -53,6 +53,28 @@ class ValidationTests(unittest.TestCase):
         self.assertEqual(result["profile_updates"][0]["state"], "explicit")
         self.assertFalse(result["write_performed"])
 
+    def test_fixed_merchant_page_categories_are_supported(self) -> None:
+        cases = {
+            "project.feishu_link": "project-progress",
+            "collection.merchant_form_url": "business-contacts",
+            "package.type": "commercial-information",
+            "hardware.devices": "hardware-installation",
+            "card_terminal.surcharge": "card-terminal",
+            "special.communication_focus": "risk-compliance",
+            "menu.url": "menu-content",
+            "archive.folder_url": "document-archive",
+            "communication.preferences": "communication-profile",
+            "content.setup_notes": "system-configuration",
+        }
+        for field_path, document_type in cases.items():
+            with self.subTest(field_path=field_path):
+                result = validate_update_set(
+                    "青禾便当",
+                    [update(field_path=field_path, value="测试值")],
+                    {},
+                )
+                self.assertEqual(result["affected_modules"], [document_type])
+
     def test_same_value_is_unchanged(self) -> None:
         result = validate_update_set(
             "青禾便当", [update()], {"contacts.primary.name": "林经理"}
