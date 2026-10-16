@@ -474,6 +474,12 @@ class FeishuBotTests(unittest.TestCase):
         self.assertFalse(
             _is_group_profile_candidate("C260M 能设置没有打印纸后出声音提醒吗？")
         )
+        self.assertFalse(
+            _is_group_profile_candidate(
+                "C260M 有三种设置方式：方式1使用拨码开关；方式2下载调试工具，"
+                "点击设置后重启打印机。补充说明：缺纸时会蜂鸣。"
+            )
+        )
         self.assertTrue(
             _is_group_profile_candidate("C260M 缺纸时没有声音提醒，客户已反馈")
         )

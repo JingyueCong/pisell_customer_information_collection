@@ -452,6 +452,38 @@ def _is_group_profile_candidate(text: str, *, has_media: bool = False) -> bool:
         )
     ):
         return False
+    support_guide_terms = (
+        "设置方式",
+        "方式1",
+        "方式2",
+        "方式3",
+        "操作步骤",
+        "控制面板",
+        "设备和打印机",
+        "右键",
+        "点击设置",
+        "调试工具",
+        "下载驱动",
+        "重启打印机",
+        "补充说明",
+    )
+    merchant_anchor_terms = (
+        "商户",
+        "客户",
+        "门店",
+        "店铺",
+        "该店",
+        "此店",
+        "这家",
+        "他们",
+        "联系人",
+        "店长",
+        "地址",
+    )
+    if sum(term in compact for term in support_guide_terms) >= 2 and not any(
+        term in compact for term in merchant_anchor_terms
+    ):
+        return False
     casual_phone_terms = (
         "有空吗",
         "电话聊",
