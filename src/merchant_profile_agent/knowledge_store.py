@@ -95,6 +95,21 @@ class P1KnowledgeStore:
             raise ProfileValidationError("merchant_id is invalid")
         return name.strip(), merchant_id.strip() if isinstance(merchant_id, str) else None
 
+    @staticmethod
+    def _merchant_aliases(value: Any) -> list[str]:
+        if value is None:
+            return []
+        if not isinstance(value, list):
+            raise ProfileValidationError("merchant aliases must be an array")
+        aliases: list[str] = []
+        for item in value:
+            if not isinstance(item, str) or not item.strip() or len(item.strip()) > 120:
+                raise ProfileValidationError("merchant alias is invalid")
+            alias = item.strip()
+            if alias.casefold() not in {existing.casefold() for existing in aliases}:
+                aliases.append(alias)
+        return aliases[:10]
+
     def read_profile(self, request: Mapping[str, Any]) -> dict[str, Any]:
         merchant_name, merchant_id = self._merchant(request)
         try:
@@ -128,6 +143,7 @@ class P1KnowledgeStore:
         merchant_name, merchant_id = self._merchant(
             {"merchant_name": merchant.get("name"), "merchant_id": merchant.get("id")}
         )
+        merchant_aliases = self._merchant_aliases(merchant.get("aliases"))
         # Validate the submitted conversation, but do not persist it verbatim.
         # Only the accepted facts below belong in the durable P1 event; the
         # source_ref on each fact preserves traceability without storing chat
@@ -174,6 +190,13 @@ class P1KnowledgeStore:
             )
         except Exception as exc:
             raise KnowledgeStoreError("could not read the merchant profile before save") from exc
+        current_merchant = current_profile.get("merchant")
+        if isinstance(current_merchant, Mapping):
+            for alias in self._merchant_aliases(current_merchant.get("aliases")):
+                if alias.casefold() not in {
+                    existing.casefold() for existing in merchant_aliases
+                }:
+                    merchant_aliases.append(alias)
         validated = validate_update_set(merchant_name, cleaned_updates, current_profile)
         if validated["save_readiness"] != "ready" or not validated["profile_updates"]:
             raise ProfileValidationError(
@@ -202,7 +225,11 @@ class P1KnowledgeStore:
                 "next_actions": ["由经手人员按需复核知识库投影"],
             },
             "business_objects": {
-                "merchant": {"name": merchant_name, "id": merchant_id}
+                "merchant": {
+                    "name": merchant_name,
+                    "id": merchant_id,
+                    "aliases": merchant_aliases,
+                }
             },
             "documents": [
                 {

@@ -156,6 +156,23 @@ class UniqueCrm:
         }
 
 
+class CanonicalCrm:
+    name = "meegle"
+
+    def resolve(self, request):
+        return {
+            "status": "unique",
+            "query": {"merchant_name": request["merchant_name"]},
+            "candidates": [
+                {
+                    "work_item_id": "6856334446",
+                    "name": "9262 U Bowl Melbourne Central （海底捞）",
+                }
+            ],
+            "read_only": True,
+        }
+
+
 class NotFoundCrm:
     name = "meegle"
 
@@ -227,6 +244,75 @@ class ApiCrmTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(result["crm"]["status"], "unique")
         self.assertEqual(self.store.last_commit["merchant"]["id"], "987654321")
+
+    def test_read_uses_crm_name_as_the_canonical_knowledge_name(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=2)
+        settings = Settings(api_key="a" * 24, openai_api_key="test", port=0)
+        self.server = create_server(
+            settings,
+            FakeAgent(),  # type: ignore[arg-type]
+            self.store,  # type: ignore[arg-type]
+            CanonicalCrm(),  # type: ignore[arg-type]
+        )
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        self.base_url = f"http://127.0.0.1:{self.server.server_address[1]}"
+
+        _, result = self.request(
+            "/v1/profile/read",
+            {"merchant_name": "U Bowl Malatang", "merchant_id": "6856334446"},
+            token="a" * 24,
+        )
+
+        self.assertEqual(
+            self.store.last_read["merchant_name"],
+            "9262 U Bowl Melbourne Central （海底捞）",
+        )
+        self.assertEqual(result["merchant_identity"]["aliases"], ["U Bowl Malatang"])
+        self.assertEqual(
+            result["profile"]["merchant"],
+            {
+                "name": "9262 U Bowl Melbourne Central （海底捞）",
+                "id": "6856334446",
+                "aliases": ["U Bowl Malatang"],
+            },
+        )
+
+    def test_commit_uses_crm_name_and_preserves_submitted_name_as_alias(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=2)
+        settings = Settings(api_key="a" * 24, openai_api_key="test", port=0)
+        self.server = create_server(
+            settings,
+            FakeAgent(),  # type: ignore[arg-type]
+            self.store,  # type: ignore[arg-type]
+            CanonicalCrm(),  # type: ignore[arg-type]
+        )
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        self.base_url = f"http://127.0.0.1:{self.server.server_address[1]}"
+
+        _, result = self.request(
+            "/v1/profile/commit",
+            {
+                "confirmation": "结束并保存",
+                "merchant": {"name": "U Bowl Malatang", "id": "6856334446"},
+            },
+            token="a" * 24,
+        )
+
+        self.assertEqual(
+            self.store.last_commit["merchant"],
+            {
+                "name": "9262 U Bowl Melbourne Central （海底捞）",
+                "id": "6856334446",
+                "aliases": ["U Bowl Malatang"],
+            },
+        )
+        self.assertEqual(result["merchant_identity"]["name"], self.store.last_commit["merchant"]["name"])
 
     def test_commit_is_blocked_when_crm_has_no_match(self) -> None:
         self.server.shutdown()

@@ -117,19 +117,79 @@ def create_server(
     def resolve_crm(request: Mapping[str, Any]) -> dict[str, Any]:
         return crm.resolve(request)
 
+    def canonical_crm_merchant(
+        resolution: Mapping[str, Any], *, submitted_name: Any, submitted_id: Any
+    ) -> dict[str, Any]:
+        if resolution.get("status") != "unique":
+            return {"name": submitted_name, "id": submitted_id, "aliases": []}
+        candidates = resolution.get("candidates")
+        candidate = (
+            candidates[0]
+            if isinstance(candidates, list) and len(candidates) == 1
+            else None
+        )
+        if not isinstance(candidate, Mapping):
+            raise CrmResolverError("CRM lookup returned an invalid unique match")
+        candidate_id = candidate.get("work_item_id")
+        candidate_name = candidate.get("name")
+        if not isinstance(candidate_id, (str, int)) or not str(candidate_id).strip():
+            raise CrmResolverError("CRM lookup returned an invalid unique match")
+        if not isinstance(candidate_name, str) or not candidate_name.strip():
+            raise CrmResolverError("CRM lookup returned an invalid unique match")
+        canonical_name = candidate_name.strip()
+        aliases: list[str] = []
+        if isinstance(submitted_name, str):
+            submitted_name = submitted_name.strip()
+            if submitted_name and submitted_name.casefold() != canonical_name.casefold():
+                aliases.append(submitted_name)
+        return {
+            "name": canonical_name,
+            "id": str(candidate_id).strip(),
+            "aliases": aliases,
+        }
+
     def read_with_crm(request: Mapping[str, Any]) -> dict[str, Any]:
         resolution = resolve_crm(request)
+        identity = canonical_crm_merchant(
+            resolution,
+            submitted_name=request.get("merchant_name"),
+            submitted_id=request.get("merchant_id"),
+        )
         effective_request = {
             "merchant_name": request.get("merchant_name"),
             "merchant_id": request.get("merchant_id"),
         }
         candidates = resolution.get("candidates")
         if resolution.get("status") == "unique" and isinstance(candidates, list):
-            candidate = candidates[0] if candidates else None
-            if isinstance(candidate, Mapping) and candidate.get("work_item_id"):
-                effective_request["merchant_id"] = str(candidate["work_item_id"])
-        result = store.read_profile(effective_request)
-        return {**result, "crm": resolution}
+            effective_request["merchant_name"] = identity["name"]
+            effective_request["merchant_id"] = identity["id"]
+        result = deepcopy(store.read_profile(effective_request))
+        profile = result.get("profile")
+        if resolution.get("status") == "unique" and isinstance(profile, Mapping):
+            profile = dict(profile)
+            existing_merchant = profile.get("merchant")
+            existing_aliases = (
+                existing_merchant.get("aliases")
+                if isinstance(existing_merchant, Mapping)
+                else None
+            )
+            aliases = list(identity["aliases"])
+            if isinstance(existing_aliases, list):
+                for alias in existing_aliases:
+                    if (
+                        isinstance(alias, str)
+                        and alias.strip()
+                        and alias.casefold()
+                        not in {existing.casefold() for existing in aliases}
+                    ):
+                        aliases.append(alias.strip())
+            profile["merchant"] = {**identity, "aliases": aliases[:10]}
+            result["profile"] = profile
+        return {
+            **result,
+            "crm": resolution,
+            "merchant_identity": identity,
+        }
 
     def commit_with_crm(request: Mapping[str, Any]) -> dict[str, Any]:
         merchant = request.get("merchant")
@@ -144,13 +204,18 @@ def create_server(
             raise CrmResolutionRequired(resolution)
         effective_request = deepcopy(dict(request))
         if resolution.get("status") == "unique":
-            candidates = resolution.get("candidates")
-            candidate = candidates[0] if isinstance(candidates, list) and candidates else None
-            if not isinstance(candidate, Mapping) or not candidate.get("work_item_id"):
-                raise CrmResolverError("CRM lookup returned an invalid unique match")
-            effective_request["merchant"]["id"] = str(candidate["work_item_id"])
+            identity = canonical_crm_merchant(
+                resolution, submitted_name=name, submitted_id=identifier
+            )
+            effective_request["merchant"] = identity
         result = store.commit_profile(effective_request)
-        return {**result, "crm": resolution}
+        return {
+            **result,
+            "crm": resolution,
+            "merchant_identity": canonical_crm_merchant(
+                resolution, submitted_name=name, submitted_id=identifier
+            ),
+        }
 
     class Handler(BaseHTTPRequestHandler):
         server_version = "PiSellMerchantProfileAgent/" + __version__

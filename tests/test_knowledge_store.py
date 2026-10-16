@@ -78,6 +78,27 @@ class KnowledgeStoreTests(unittest.TestCase):
         self.assertTrue(result["write_performed"])
         close = store.committer.committed["close_result"]
         self.assertEqual(close["business_objects"]["merchant"]["name"], "青禾便当")
+
+    def test_commit_preserves_crm_name_aliases_in_merchant_identity(self) -> None:
+        store = make_store()
+        request = valid_request()
+        request["merchant"] = {
+            "name": "9262 U Bowl Melbourne Central （海底捞）",
+            "id": "6856334446",
+            "aliases": ["U Bowl Malatang"],
+        }
+
+        store.commit_profile(request)
+
+        close = store.committer.committed["close_result"]
+        self.assertEqual(
+            close["business_objects"]["merchant"],
+            {
+                "name": "9262 U Bowl Melbourne Central （海底捞）",
+                "id": "6856334446",
+                "aliases": ["U Bowl Malatang"],
+            },
+        )
         self.assertEqual(close["specific"]["operation_type"], "create")
         self.assertEqual(
             close["specific"]["profile_updates"][0]["state"], "explicit"
