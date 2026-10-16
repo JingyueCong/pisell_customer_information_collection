@@ -52,7 +52,25 @@ class OpenAIClientTests(unittest.TestCase):
         self.assertTrue(payload["text"]["format"]["strict"])
         self.assertEqual(urlopen.call_args.kwargs["timeout"], 12)
 
+    @patch("urllib.request.urlopen")
+    def test_sends_screenshot_as_high_detail_image_input(self, urlopen) -> None:
+        urlopen.return_value = FakeResponse({"output_text": '{"answer":"ok"}'})
+        client = OpenAIResponsesClient("test-key", "gpt-6-luna")
+
+        client.create_structured(
+            system_prompt="system",
+            user_input='{"image_evidence":[{"image_ordinal":0,"source_message_index":0}]}',
+            image_data_urls=["data:image/png;base64,iVBORw0KGgo="],
+            schema={"type": "object"},
+        )
+
+        payload = json.loads(urlopen.call_args.args[0].data)
+        content = payload["input"][1]["content"]
+        self.assertEqual(content[0]["type"], "input_text")
+        self.assertEqual(content[1]["type"], "input_image")
+        self.assertEqual(content[1]["detail"], "high")
+        self.assertTrue(content[1]["image_url"].startswith("data:image/png;base64,"))
+
 
 if __name__ == "__main__":
     unittest.main()
-

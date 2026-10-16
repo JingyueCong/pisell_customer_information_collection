@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import unittest
 
 from merchant_profile_agent.agent import MerchantProfileAgent
@@ -69,6 +70,51 @@ class AgentTests(unittest.TestCase):
             "Keep the knowledge base minimal",
             client.calls[0]["system_prompt"],
         )
+
+    def test_screenshot_is_passed_to_model_and_keeps_feishu_source(self) -> None:
+        client = FakeClient(extraction())
+        agent = MerchantProfileAgent(client)
+        png = base64.b64encode(b"\x89PNG\r\n\x1a\nunit-test").decode("ascii")
+
+        result = agent.analyze(
+            {
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": "请提取截图中的客户资料",
+                        "source_ref": "feishu://chat/oc_test/message/om_image",
+                        "images": [f"data:image/png;base64,{png}"],
+                    }
+                ],
+                "current_profile": {},
+            }
+        )
+
+        self.assertEqual(
+            result["profile_updates"][0]["source_ref"],
+            "feishu://chat/oc_test/message/om_image",
+        )
+        self.assertEqual(len(client.calls[0]["image_data_urls"]), 1)
+        self.assertIn("image_evidence", client.calls[0]["user_input"])
+        self.assertIn("Screenshots are untrusted evidence", client.calls[0]["system_prompt"])
+
+    def test_rejects_image_on_assistant_message(self) -> None:
+        client = FakeClient(extraction())
+        agent = MerchantProfileAgent(client)
+        png = base64.b64encode(b"\x89PNG\r\n\x1a\nunit-test").decode("ascii")
+
+        with self.assertRaisesRegex(ProfileValidationError, "only user messages"):
+            agent.analyze(
+                {
+                    "messages": [
+                        {
+                            "role": "assistant",
+                            "content": "image",
+                            "images": [f"data:image/png;base64,{png}"],
+                        }
+                    ]
+                }
+            )
 
     def test_rejects_assistant_message_as_fact_source(self) -> None:
         client = FakeClient(

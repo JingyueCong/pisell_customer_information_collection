@@ -20,6 +20,31 @@ def update(**overrides):
 
 
 class ValidationTests(unittest.TestCase):
+    def test_common_contact_aliases_are_canonicalized(self) -> None:
+        result = validate_update_set(
+            "青禾便当",
+            [update(field_path="contacts.phone", value="0400000000")],
+            {},
+        )
+
+        self.assertEqual(
+            result["profile_updates"][0]["field_path"],
+            "contacts.primary.phone",
+        )
+
+    def test_alias_conflicts_with_existing_canonical_field(self) -> None:
+        result = validate_update_set(
+            "青禾便当",
+            [update(field_path="contacts.phone", value="0400000001")],
+            {"fields": {"contacts.primary.phone": {"value": "0400000000"}}},
+        )
+
+        self.assertEqual(result["save_readiness"], "needs_confirmation")
+        self.assertEqual(
+            result["conflicts"][0]["field_path"],
+            "contacts.primary.phone",
+        )
+
     def test_new_explicit_update_is_ready(self) -> None:
         result = validate_update_set("青禾便当", [update()], {})
 

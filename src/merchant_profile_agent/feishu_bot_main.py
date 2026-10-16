@@ -78,11 +78,20 @@ def build_channel():
         base_url=os.environ.get("MERCHANT_AGENT_API_URL", "http://127.0.0.1:8090"),
         api_key=api_key,
     )
+    default_session_store = (
+        Path.home()
+        / "Library"
+        / "Application Support"
+        / "PiSell"
+        / "merchant-profile-feishu-sessions.json"
+    )
+    configured_session_store = os.environ.get("FEISHU_BOT_SESSION_STORE", "").strip()
     controller = FeishuBotController(
         api=api,
         channel=channel,
         sessions=SessionStore(
-            ttl_seconds=int(os.environ.get("FEISHU_BOT_SESSION_TTL", "14400"))
+            ttl_seconds=int(os.environ.get("FEISHU_BOT_SESSION_TTL", "604800")),
+            state_path=Path(configured_session_store or default_session_store),
         ),
         group_message_threshold=_integer(
             "FEISHU_GROUP_SUMMARY_MESSAGE_THRESHOLD", 20, 5, 100
@@ -96,6 +105,23 @@ def build_channel():
     )
     channel.on("message", controller.on_message)
     channel.on("error", lambda error: logging.getLogger(__name__).error("channel error: %s", error))
+    channel.on(
+        "reconnecting",
+        lambda event=None: logging.getLogger(__name__).warning("Feishu channel reconnecting"),
+    )
+    channel.on(
+        "reconnected",
+        lambda event=None: logging.getLogger(__name__).info("Feishu channel reconnected"),
+    )
+    channel.on(
+        "reject",
+        lambda event: logging.getLogger(__name__).warning(
+            "Feishu message rejected message=%s chat=%s reason=%s",
+            getattr(event, "message_id", "unknown"),
+            getattr(event, "chat_id", "unknown"),
+            getattr(event, "reason", "unknown"),
+        ),
+    )
     return channel
 
 

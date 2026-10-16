@@ -1,12 +1,13 @@
 .env
+.env.backup-*
 .venv/
 __pycache__/
 *.py[cod]
 .pytest_cache/
 .coverage
 htmlcov/
+state/
 dist/
 build/
 *.egg-info/
 .DS_Store
-

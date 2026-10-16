@@ -47,7 +47,7 @@ class Settings:
     port: int = 8090
     model: str = "gpt-6-luna"
     openai_timeout: int = 60
-    max_body_bytes: int = 65_536
+    max_body_bytes: int = 10_485_760
     knowledge_store: str = "disabled"
     p1_root: str = ""
     feishu_data_layer_config: str = ""
@@ -130,7 +130,7 @@ class Settings:
             model=model,
             openai_timeout=_integer("MERCHANT_AGENT_OPENAI_TIMEOUT", 60, 5, 300),
             max_body_bytes=_integer(
-                "MERCHANT_AGENT_MAX_BODY_BYTES", 65_536, 1_024, 1_048_576
+                "MERCHANT_AGENT_MAX_BODY_BYTES", 10_485_760, 1_024, 16_777_216
             ),
             knowledge_store=knowledge_store,
             p1_root=p1_root,

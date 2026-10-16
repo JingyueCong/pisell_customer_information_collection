@@ -1,17 +1,23 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import json
 import logging
 import re
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, Protocol
+from pathlib import Path
+from typing import Any, Mapping, Protocol
 
 from .api_client import MerchantApiClient, MerchantApiError
 
 
 LOGGER = logging.getLogger("merchant_profile_agent.feishu_bot")
+MAX_IMAGES_PER_MESSAGE = 4
+MAX_IMAGE_BYTES = 4 * 1024 * 1024
+MAX_TOTAL_IMAGE_BYTES = 6 * 1024 * 1024
 SAVE_COMMANDS = {"结束并保存", "/save"}
 DISCARD_COMMANDS = {"放弃本次对话", "/discard"}
 HELP_COMMANDS = {"/help", "帮助"}
@@ -115,11 +121,18 @@ FIELD_SUFFIX_LABELS = {
 class ReplyChannel(Protocol):
     async def reply(self, message: Any, content: Any, opts: Any = None) -> Any: ...
 
+    async def download_resource(
+        self,
+        file_key: str,
+        resource_type: str = "image",
+        message_id: str | None = None,
+    ) -> bytes | None: ...
+
 
 @dataclass
 class Session:
     conversation_id: str = field(default_factory=lambda: str(uuid.uuid4()))
-    messages: list[dict[str, str]] = field(default_factory=list)
+    messages: list[dict[str, Any]] = field(default_factory=list)
     current_profile: dict[str, Any] = field(default_factory=dict)
     current_profile_loaded: bool = False
     merchant: dict[str, Any] | None = None
@@ -127,14 +140,14 @@ class Session:
     preview: dict[str, Any] | None = None
     last_documents: list[dict[str, str]] = field(default_factory=list)
     group_summary_enabled: bool = False
-    group_buffer: list[dict[str, str]] = field(default_factory=list)
+    group_buffer: list[dict[str, Any]] = field(default_factory=list)
     group_pending_count: int = 0
     group_generation: int = 0
     group_last_message: Any = None
     group_followup_pending: bool = False
     group_save_pending: bool = False
     group_idle_task: asyncio.Task[Any] | None = field(default=None, repr=False)
-    touched_at: float = field(default_factory=time.monotonic)
+    touched_at: float = field(default_factory=time.time)
 
     def reset_draft(self, *, preserve_merchant: bool = False) -> None:
         merchant = self.merchant if preserve_merchant else None
@@ -147,7 +160,7 @@ class Session:
         self.preview = None
         self.group_followup_pending = False
         self.group_save_pending = False
-        self.touched_at = time.monotonic()
+        self.touched_at = time.time()
 
     def clear_group_buffer(self) -> None:
         self.group_buffer.clear()
@@ -164,24 +177,51 @@ class Session:
 
 
 class SessionStore:
-    def __init__(self, *, ttl_seconds: int = 14_400, maximum: int = 2_000) -> None:
+    _SERIALIZED_FIELDS = (
+        "conversation_id",
+        "messages",
+        "current_profile",
+        "current_profile_loaded",
+        "merchant",
+        "crm_resolution",
+        "preview",
+        "last_documents",
+        "group_summary_enabled",
+        "group_buffer",
+        "group_pending_count",
+        "group_generation",
+        "group_followup_pending",
+        "group_save_pending",
+        "touched_at",
+    )
+
+    def __init__(
+        self,
+        *,
+        ttl_seconds: int = 14_400,
+        maximum: int = 2_000,
+        state_path: Path | None = None,
+    ) -> None:
         self.ttl_seconds = ttl_seconds
         self.maximum = maximum
+        self.state_path = state_path
         self._sessions: dict[str, Session] = {}
+        self._load()
 
     def get(self, key: str) -> Session:
         self.prune()
         session = self._sessions.setdefault(key, Session())
-        session.touched_at = time.monotonic()
+        session.touched_at = time.time()
         return session
 
     def discard(self, key: str) -> None:
         session = self._sessions.pop(key, None)
         if session is not None:
             session.cancel_idle_task()
+            self.persist()
 
     def prune(self) -> None:
-        now = time.monotonic()
+        now = time.time()
         expired = [
             key
             for key, value in self._sessions.items()
@@ -192,7 +232,53 @@ class SessionStore:
         if len(self._sessions) > self.maximum:
             oldest = sorted(self._sessions, key=lambda key: self._sessions[key].touched_at)
             for key in oldest[: len(self._sessions) - self.maximum]:
-                self.discard(key)
+                session = self._sessions.pop(key, None)
+                if session is not None:
+                    session.cancel_idle_task()
+
+    def persist(self) -> None:
+        if self.state_path is None:
+            return
+        payload = {
+            "version": 1,
+            "sessions": {
+                key: {
+                    name: getattr(session, name)
+                    for name in self._SERIALIZED_FIELDS
+                }
+                for key, session in self._sessions.items()
+            },
+        }
+        self.state_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = self.state_path.with_suffix(self.state_path.suffix + ".tmp")
+        temporary.write_text(
+            json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+            encoding="utf-8",
+        )
+        temporary.chmod(0o600)
+        temporary.replace(self.state_path)
+
+    def _load(self) -> None:
+        if self.state_path is None or not self.state_path.exists():
+            return
+        try:
+            payload = json.loads(self.state_path.read_text(encoding="utf-8"))
+            raw_sessions = payload.get("sessions", {})
+            if not isinstance(raw_sessions, Mapping):
+                raise ValueError("sessions must be an object")
+            for key, raw in raw_sessions.items():
+                if not isinstance(key, str) or not isinstance(raw, Mapping):
+                    continue
+                values = {
+                    name: raw[name]
+                    for name in self._SERIALIZED_FIELDS
+                    if name in raw
+                }
+                self._sessions[key] = Session(**values)
+            self.prune()
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            LOGGER.exception("could not restore Feishu session state; starting empty")
+            self._sessions.clear()
 
 
 def _session_key(message: Any) -> str:
@@ -435,6 +521,71 @@ def _group_summary_text(result: dict[str, Any]) -> str:
     return "\n\n".join(sections)
 
 
+class ImageInputError(RuntimeError):
+    pass
+
+
+def _resource_value(resource: Any, name: str) -> Any:
+    if isinstance(resource, Mapping):
+        return resource.get(name)
+    return getattr(resource, name, None)
+
+
+def _image_resource_keys(message: Any) -> list[str]:
+    content = getattr(message, "content", None)
+    content_kind = _resource_value(content, "kind")
+    content_key = _resource_value(content, "image_key")
+    if content_kind == "image" and isinstance(content_key, str) and content_key:
+        return [content_key]
+
+    raw_keys: list[str] = []
+
+    def collect(value: Any) -> None:
+        if isinstance(value, Mapping):
+            image_key = value.get("image_key")
+            if isinstance(image_key, str) and image_key and image_key not in raw_keys:
+                raw_keys.append(image_key)
+            for nested in value.values():
+                collect(nested)
+        elif isinstance(value, list):
+            for nested in value:
+                collect(nested)
+        elif isinstance(value, str) and "image_key" in value:
+            try:
+                collect(json.loads(value))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                return
+
+    collect(getattr(message, "raw", None))
+    if raw_keys:
+        return raw_keys
+
+    keys: list[str] = []
+    for resource in getattr(message, "resources", []) or []:
+        if _resource_value(resource, "type") != "image":
+            continue
+        file_key = _resource_value(resource, "file_key")
+        if isinstance(file_key, str) and file_key and file_key not in keys:
+            keys.append(file_key)
+    return keys
+
+
+def _without_image_placeholders(text: str) -> str:
+    text = re.sub(r"!\[image\]\([^)]+\)", " ", text)
+    text = re.sub(r"<image\b[^>]*?/?>", " ", text, flags=re.IGNORECASE)
+    return re.sub(r"[ \t]+", " ", text).strip()
+
+
+def _image_mime_type(data: bytes) -> str | None:
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if data.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if len(data) >= 12 and data.startswith(b"RIFF") and data[8:12] == b"WEBP":
+        return "image/webp"
+    return None
+
+
 class MerchantSwitchError(RuntimeError):
     pass
 
@@ -465,21 +616,82 @@ class FeishuBotController:
         # links, or mentions when a preview is echoed into a group chat.
         await self.channel.reply(message, {"text": text})
 
-    async def on_message(self, message: Any) -> None:
-        text = str(getattr(message, "body_text", "") or "").strip()
-        if not text:
-            return
-        if _is_group_message(message):
-            await self._on_group_message(message, text)
-            return
-        await self._on_direct_message(message, text)
+    async def _download_images(self, message: Any) -> list[str]:
+        file_keys = _image_resource_keys(message)
+        if not file_keys:
+            return []
+        if len(file_keys) > MAX_IMAGES_PER_MESSAGE:
+            raise ImageInputError(f"每条消息最多支持 {MAX_IMAGES_PER_MESSAGE} 张图片。")
+        image_data_urls: list[str] = []
+        total_bytes = 0
+        for file_key in file_keys:
+            try:
+                data = await self.channel.download_resource(
+                    file_key,
+                    resource_type="image",
+                    message_id=str(getattr(message, "message_id", "") or "") or None,
+                )
+            except Exception as exc:
+                LOGGER.warning(
+                    "image resource download raised for message=%s key=%s: %s",
+                    str(getattr(message, "message_id", "") or "unknown"),
+                    file_key,
+                    exc,
+                )
+                raise ImageInputError("图片下载失败，请重新发送截图。") from exc
+            if not isinstance(data, bytes) or not data:
+                LOGGER.warning(
+                    "image resource download returned no bytes for message=%s key=%s",
+                    str(getattr(message, "message_id", "") or "unknown"),
+                    file_key,
+                )
+                raise ImageInputError("图片下载失败，请重新发送截图。")
+            if len(data) > MAX_IMAGE_BYTES:
+                raise ImageInputError("单张图片不能超过 4 MB。")
+            total_bytes += len(data)
+            if total_bytes > MAX_TOTAL_IMAGE_BYTES:
+                raise ImageInputError("本条消息中的图片总大小不能超过 6 MB。")
+            mime_type = _image_mime_type(data)
+            if mime_type is None:
+                raise ImageInputError("仅支持 PNG、JPEG 或 WEBP 图片。")
+            encoded = base64.b64encode(data).decode("ascii")
+            image_data_urls.append(f"data:{mime_type};base64,{encoded}")
+        return image_data_urls
 
-    async def _on_direct_message(self, message: Any, text: str) -> None:
+    async def on_message(self, message: Any) -> None:
+        raw_text = str(getattr(message, "body_text", "") or "").strip()
+        if not raw_text and not _image_resource_keys(message):
+            return
+        try:
+            try:
+                images = await self._download_images(message)
+            except ImageInputError as exc:
+                await self._reply(message, str(exc))
+                return
+            text = _without_image_placeholders(raw_text)
+            if images and not text:
+                text = "用户上传了截图，请提取其中明确可见且适合客户档案的有用信息。"
+            if not text:
+                return
+            if _is_group_message(message):
+                await self._on_group_message(message, text, images)
+                return
+            await self._on_direct_message(message, text, images)
+        finally:
+            try:
+                self.sessions.persist()
+            except OSError:
+                LOGGER.exception("could not persist Feishu session state")
+
+    async def _on_direct_message(
+        self, message: Any, text: str, images: list[str]
+    ) -> None:
         key = _session_key(message)
         if text in HELP_COMMANDS:
             await self._reply(
                 message,
                 "发送商户名称和要记录的资料。"
+                "\n- 可直接发送截图，我会提取其中明确可见的有用信息"
                 "\n- 可说“没问题，保存吧”或“结束并保存”"
                 "\n- /discard：放弃草稿",
             )
@@ -497,23 +709,22 @@ class FeishuBotController:
             await self._save(message, session, "结束并保存")
             return
 
-        session.messages.append(
-            {
-                "role": "user",
-                "content": text,
-                "source_ref": _source_ref(message),
-            }
-        )
+        user_message: dict[str, Any] = {
+            "role": "user",
+            "content": text,
+            "source_ref": _source_ref(message),
+        }
+        if images:
+            user_message["images"] = images
+        session.messages.append(user_message)
+        # Assistant previews are not needed by the extractor. Keeping only user
+        # turns doubles useful conversation capacity and avoids the API's
+        # 40-message limit during longer staff tests.
+        if len(session.messages) > 40:
+            session.messages = session.messages[-40:]
         try:
             preview = await self._analyze_session(session)
             reply_text = _preview_text(preview)
-            session.messages.append(
-                {
-                    "role": "assistant",
-                    "content": reply_text,
-                    "source_ref": f"feishu-bot://reply/{getattr(message, 'message_id', 'unknown')}",
-                }
-            )
             await self._reply(message, reply_text)
         except MerchantSwitchError:
             session.messages.pop()
@@ -613,7 +824,9 @@ class FeishuBotController:
                 gaps.append("CRM 客户唯一匹配")
             preview["information_gaps"] = gaps
 
-    async def _on_group_message(self, message: Any, text: str) -> None:
+    async def _on_group_message(
+        self, message: Any, text: str, images: list[str]
+    ) -> None:
         key = _session_key(message)
         session = self.sessions.get(key)
         mentioned = bool(getattr(message, "mentioned_bot", False))
@@ -693,10 +906,19 @@ class FeishuBotController:
             return
 
         sender_name = str(getattr(message, "sender_name", "") or "").strip()
+        if not sender_name:
+            sender_id = str(getattr(message, "sender_id", "") or "").strip()
+            if sender_id:
+                sender_name = f"成员[{sender_id[-8:]}]"
         content = f"{sender_name}：{text}" if sender_name else text
-        session.group_buffer.append(
-            {"role": "user", "content": content, "source_ref": _source_ref(message)}
-        )
+        user_message: dict[str, Any] = {
+            "role": "user",
+            "content": content,
+            "source_ref": _source_ref(message),
+        }
+        if images:
+            user_message["images"] = images
+        session.group_buffer.append(user_message)
         session.group_pending_count += 1
         session.group_generation += 1
         session.group_last_message = message
@@ -745,6 +967,11 @@ class FeishuBotController:
             return
         except Exception:
             LOGGER.exception("automatic group summary failed")
+        finally:
+            try:
+                self.sessions.persist()
+            except OSError:
+                LOGGER.exception("could not persist Feishu session state after idle summary")
 
     async def _summarize_group(
         self,
@@ -872,7 +1099,17 @@ class FeishuBotController:
                     "confirmation": confirmation,
                     "conversation_id": f"feishu:{session.conversation_id}",
                     "merchant": merchant,
-                    "messages": session.messages,
+                    # Image bytes are used only for the preview analysis. The
+                    # durable event keeps the Feishu source reference, not a
+                    # base64 copy of the screenshot.
+                    "messages": [
+                        {
+                            key: item[key]
+                            for key in ("role", "content", "source_ref")
+                            if key in item
+                        }
+                        for item in session.messages
+                    ],
                     "updates": updates,
                 },
             )

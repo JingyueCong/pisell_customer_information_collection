@@ -10,6 +10,8 @@
 - Bearer Token 鉴权，请求体大小限制，默认只监听 `127.0.0.1`；
 - 使用 OpenAI Responses API + Strict Structured Outputs；
 - 默认模型为 `gpt-6-luna`，可通过环境变量替换；
+- 飞书私聊和已开启记录的群聊支持 PNG、JPEG、WEBP 截图，读取可见文字并提取有用客户资料；
+- 截图仅用于当次预览分析，保存时只保留飞书消息来源引用，不把 Base64 图片写入知识库；
 - 只保留用户明确提供的事实，推断不会进入 `profile_updates`；
 - 默认采用简短记录：忽略寒暄、重复、主观评价和无关背景，只保留后续经营、配置、支持或合规真正需要的稳定事实；
 - 自动拒绝密码、验证码、Token、API Key、CVV 等敏感字段；
@@ -201,7 +203,7 @@ API 也提供只读诊断端点 `POST /v1/profile/crm/resolve`，请求体为
 1. 开启机器人能力；
 2. 事件订阅选择“使用长连接接收事件”；
 3. 订阅 `im.message.receive_v1`；
-4. 申请收取消息以及 `im:message:send_as_bot` 权限；
+4. 申请收取消息、`im:message:send_as_bot` 以及图片资源下载所需权限，并在权限变更后重新发布/安装应用；
 5. 发布应用并将其加入需要使用的群聊。
 
 官方 Channel SDK 的[快速开始](https://github.com/larksuite/channel-sdk-python/blob/main/docs/quickstart.md)
@@ -231,12 +233,14 @@ MERCHANT_AGENT_PYTHON=/absolute/path/to/python3.12 ./scripts/install_feishu_bot_
 对话命令：
 
 - 普通消息：分析资料并返回待保存预览，零写入；
+- 图片消息：下载最多 4 张、单张不超过 4 MB 且总计不超过 6 MB 的截图，以高细节视觉输入提取明确可见的客户资料；
 - `结束并保存`、`/save` 或“没问题，保存吧”等明确自然语言：确认提交到 Events、Artifact 和商户 Wiki；
 - 保存成功后直接返回更新页面链接，也支持追问“刚才写入的页面链接”；
 - `/discard`：放弃内存草稿，零写入；
 - `/help`：显示使用帮助。
 
 机器人草稿只保存在内存中，并按 TTL 自动清理。服务重启后未保存草稿会消失，不会自动补写。
+截图中的指令会被视为不可信内容；密码、验证码、Token、API Key、CVV 和完整银行卡号不会进入档案。
 
 ### 群聊自动总结
 

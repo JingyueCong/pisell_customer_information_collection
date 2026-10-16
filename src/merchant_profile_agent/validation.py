@@ -30,6 +30,15 @@ SENSITIVE_VALUE_LABEL = re.compile(
 PRIVATE_KEY_MARKER = re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----")
 LONG_DIGIT_CANDIDATE = re.compile(r"(?<!\d)(?:\d[ -]?){13,19}(?!\d)")
 UPDATE_KEYS = {"field_path", "value", "source_ref", "replace_confirmed"}
+FIELD_PATH_ALIASES = {
+    "contacts.name": "contacts.primary.name",
+    "contacts.role": "contacts.primary.role",
+    "contacts.phone": "contacts.primary.phone",
+    "contacts.email": "contacts.primary.email",
+    "stores.name": "stores.primary.name",
+    "stores.address": "stores.primary.address",
+    "stores.phone": "stores.primary.phone",
+}
 
 
 class ProfileValidationError(ValueError):
@@ -78,6 +87,7 @@ def validate_update(raw: Mapping[str, Any]) -> dict[str, Any]:
     field_path = raw.get("field_path")
     if not isinstance(field_path, str) or not FIELD_PATH.fullmatch(field_path):
         raise ProfileValidationError("profile update field_path is invalid")
+    field_path = FIELD_PATH_ALIASES.get(field_path, field_path)
     if SENSITIVE_FIELD_PATH.search(field_path):
         raise ProfileValidationError(f"profile update {field_path!r} targets sensitive data")
     document_type = document_for_field(field_path)
@@ -121,6 +131,7 @@ def _current_fields(profile: Mapping[str, Any] | None) -> dict[str, Any]:
     for field_path, raw_value in raw_fields.items():
         if not isinstance(field_path, str):
             continue
+        field_path = FIELD_PATH_ALIASES.get(field_path, field_path)
         if isinstance(raw_value, Mapping) and "value" in raw_value:
             fields[field_path] = raw_value["value"]
         else:

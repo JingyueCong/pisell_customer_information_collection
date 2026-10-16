@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import urllib.error
 import urllib.request
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 
 class OpenAIClientError(RuntimeError):
@@ -24,14 +24,26 @@ class OpenAIResponsesClient:
         system_prompt: str,
         user_input: str,
         schema: Mapping[str, Any],
+        image_data_urls: Sequence[str] = (),
     ) -> dict[str, Any]:
+        user_content: str | list[dict[str, str]] = user_input
+        if image_data_urls:
+            user_content = [{"type": "input_text", "text": user_input}]
+            user_content.extend(
+                {
+                    "type": "input_image",
+                    "image_url": image_data_url,
+                    "detail": "high",
+                }
+                for image_data_url in image_data_urls
+            )
         payload = {
             "model": self.model,
             "store": False,
             "reasoning": {"effort": "low"},
             "input": [
                 {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_input},
+                {"role": "user", "content": user_content},
             ],
             "text": {
                 "format": {
@@ -85,4 +97,3 @@ class OpenAIResponsesClient:
                 ):
                     return str(content["text"])
         raise ValueError("response contains no output text")
-

@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import copy
+import json
+import tempfile
 import unittest
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from merchant_profile_agent.feishu_bot import FeishuBotController, SessionStore
 
@@ -22,15 +26,25 @@ class Message:
     sender_name: str = ""
     chat_type: str = "p2p"
     mentioned_bot: bool = False
+    resources: list = field(default_factory=list)
+    content: object | None = None
+    raw: dict = field(default_factory=dict)
     conversation: Conversation = field(default_factory=Conversation)
 
 
 class FakeChannel:
     def __init__(self) -> None:
         self.replies = []
+        self.downloads = []
 
     async def reply(self, message, content, opts=None):
         self.replies.append((message, content, opts))
+
+    async def download_resource(self, file_key, resource_type="image", message_id=None):
+        self.downloads.append((file_key, resource_type, message_id))
+        return base64.b64decode(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+        )
 
 
 class FakeApi:
@@ -302,6 +316,86 @@ class FeishuBotTests(unittest.TestCase):
         self.assertNotIn("contacts.primary.name", reply)
         self.assertIn("保存吧", reply)
         self.assertNotIn("已识别联系人", reply)
+
+    def test_image_message_is_downloaded_analyzed_and_not_persisted_as_base64(self) -> None:
+        message = Message(
+            "<image key=wrong_resource_key />",
+            message_id="om_image",
+            content={"kind": "image", "image_key": "img_real_body_key"},
+            resources=[{"type": "image", "file_key": "wrong_resource_key"}],
+        )
+
+        asyncio.run(self.bot.on_message(message))
+
+        self.assertEqual(
+            self.channel.downloads,
+            [("img_real_body_key", "image", "om_image")],
+        )
+        analyze = next(payload for path, payload in self.api.calls if path == "/v1/profile/analyze")
+        image_message = copy.deepcopy(analyze["messages"][0])
+        self.assertIn("截图", image_message["content"])
+        self.assertTrue(image_message["images"][0].startswith("data:image/png;base64,"))
+
+        asyncio.run(self.bot.on_message(Message("结束并保存", message_id="om_save")))
+        commit = next(payload for path, payload in self.api.calls if path == "/v1/profile/commit")
+        self.assertNotIn("images", commit["messages"][0])
+        self.assertIn("feishu://chat/oc_test/message/om_image", commit["messages"][0]["source_ref"])
+
+    def test_image_key_can_be_recovered_from_raw_feishu_body(self) -> None:
+        message = Message(
+            "<image key=wrong_resource_key />",
+            message_id="om_raw_image",
+            raw={
+                "event": {
+                    "message": {
+                        "content": json.dumps({"image_key": "img_real_raw_key"})
+                    }
+                }
+            },
+            resources=[{"type": "image", "file_key": "wrong_resource_key"}],
+        )
+
+        asyncio.run(self.bot.on_message(message))
+
+        self.assertEqual(
+            self.channel.downloads,
+            [("img_real_raw_key", "image", "om_raw_image")],
+        )
+
+    def test_session_store_restores_group_recording_and_buffer(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = Path(directory) / "sessions.json"
+            store = SessionStore(state_path=state_path)
+            session = store.get("oc_group:group:root")
+            session.group_summary_enabled = True
+            session.group_buffer.append(
+                {
+                    "role": "user",
+                    "content": "测试成员：青禾便当联系人是林经理",
+                    "source_ref": "feishu://chat/oc_group/message/om_one",
+                }
+            )
+            session.group_pending_count = 1
+            store.persist()
+
+            restored = SessionStore(state_path=state_path).get("oc_group:group:root")
+
+            self.assertTrue(restored.group_summary_enabled)
+            self.assertEqual(restored.group_pending_count, 1)
+            self.assertEqual(len(restored.group_buffer), 1)
+
+    def test_long_direct_chat_keeps_api_request_within_message_limit(self) -> None:
+        for index in range(45):
+            self.run_message(f"青禾便当补充资料 {index}")
+
+        analyze_payloads = [
+            payload for path, payload in self.api.calls if path == "/v1/profile/analyze"
+        ]
+        self.assertTrue(analyze_payloads)
+        self.assertLessEqual(len(analyze_payloads[-1]["messages"]), 40)
+        self.assertTrue(
+            all(item["role"] == "user" for item in analyze_payloads[-1]["messages"])
+        )
 
     def test_exact_save_command_commits_latest_preview(self) -> None:
         self.run_message("青禾便当的联系人是林经理")
