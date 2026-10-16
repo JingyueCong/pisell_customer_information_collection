@@ -652,6 +652,60 @@ def _image_mime_type(data: bytes) -> str | None:
     return None
 
 
+def _image_data_url_bytes(value: Any) -> int:
+    if not isinstance(value, str) or ";base64," not in value:
+        return 0
+    try:
+        return len(base64.b64decode(value.split(",", 1)[1], validate=True))
+    except (ValueError, TypeError):
+        return 0
+
+
+def _messages_for_analysis(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Copy messages while enforcing the API's conversation-wide image budget.
+
+    Group buffers can contain several screenshot or video messages. Allocate the
+    four available image slots round-robin from newest to oldest so one older
+    media message cannot make the whole segment fail validation.
+    """
+    copied = [
+        {key: value for key, value in message.items() if key != "images"}
+        for message in messages
+    ]
+    selected: dict[int, list[str]] = {}
+    image_count = 0
+    image_bytes = 0
+    maximum_ordinal = max(
+        (
+            len(message.get("images", []))
+            for message in messages
+            if isinstance(message.get("images"), list)
+        ),
+        default=0,
+    )
+    for ordinal in range(maximum_ordinal):
+        for index in range(len(messages) - 1, -1, -1):
+            raw_images = messages[index].get("images", [])
+            if not isinstance(raw_images, list) or ordinal >= len(raw_images):
+                continue
+            image = raw_images[ordinal]
+            size = _image_data_url_bytes(image)
+            if size <= 0 or size > MAX_IMAGE_BYTES:
+                continue
+            if image_bytes + size > MAX_TOTAL_IMAGE_BYTES:
+                continue
+            selected.setdefault(index, []).append(image)
+            image_count += 1
+            image_bytes += size
+            if image_count >= MAX_IMAGES_PER_MESSAGE:
+                break
+        if image_count >= MAX_IMAGES_PER_MESSAGE:
+            break
+    for index, images in selected.items():
+        copied[index]["images"] = images
+    return copied
+
+
 class MerchantSwitchError(RuntimeError):
     pass
 
@@ -912,7 +966,10 @@ class FeishuBotController:
             session.current_profile_loaded = True
         preview = await self._post(
             "/v1/profile/analyze",
-            {"messages": session.messages, "current_profile": session.current_profile},
+            {
+                "messages": _messages_for_analysis(session.messages),
+                "current_profile": session.current_profile,
+            },
         )
         merchant = preview.get("merchant")
         if isinstance(merchant, dict) and merchant.get("name"):
@@ -939,7 +996,7 @@ class FeishuBotController:
                     preview = await self._post(
                         "/v1/profile/analyze",
                         {
-                            "messages": session.messages,
+                            "messages": _messages_for_analysis(session.messages),
                             "current_profile": session.current_profile,
                         },
                     )

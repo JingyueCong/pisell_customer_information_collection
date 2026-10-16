@@ -9,7 +9,11 @@ import unittest
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from merchant_profile_agent.feishu_bot import FeishuBotController, SessionStore
+from merchant_profile_agent.feishu_bot import (
+    FeishuBotController,
+    SessionStore,
+    _messages_for_analysis,
+)
 from merchant_profile_agent.video import VideoEvidence
 
 
@@ -333,6 +337,29 @@ class FeishuBotTests(unittest.TestCase):
         self.assertNotIn("contacts.primary.name", reply)
         self.assertIn("保存吧", reply)
         self.assertNotIn("已识别联系人", reply)
+
+    def test_analysis_image_budget_is_shared_across_group_messages(self) -> None:
+        png = (
+            "data:image/png;base64,"
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+        )
+        messages = [
+            {
+                "role": "user",
+                "content": f"视频 {index}",
+                "source_ref": f"feishu://message/{index}",
+                "images": [png, png, png, png],
+            }
+            for index in range(3)
+        ]
+
+        bounded = _messages_for_analysis(messages)
+
+        self.assertEqual(sum(len(item.get("images", [])) for item in bounded), 4)
+        self.assertEqual(len(bounded[2]["images"]), 2)
+        self.assertEqual(len(bounded[1]["images"]), 1)
+        self.assertEqual(len(bounded[0]["images"]), 1)
+        self.assertEqual(len(messages[0]["images"]), 4)
 
     def test_image_message_is_downloaded_analyzed_and_not_persisted_as_base64(self) -> None:
         message = Message(
