@@ -975,6 +975,17 @@ class FeishuBotTests(unittest.TestCase):
                 )
             )
         )
+        asyncio.run(
+            bot.on_message(
+                Message(
+                    "总结吧",
+                    message_id="om_refresh_summary",
+                    chat_id="oc_refresh",
+                    chat_type="group",
+                    mentioned_bot=True,
+                )
+            )
+        )
 
         self.assertEqual(api.calls[0][0], "/v1/profile/read")
         self.assertEqual(session.merchant["id"], "987654321")
@@ -1082,7 +1093,7 @@ class FeishuBotTests(unittest.TestCase):
                         )
                     )
                 )
-                self.assertIn("长期记录", channel.replies[-1][1]["text"])
+                self.assertIn("静默记录", channel.replies[-1][1]["text"])
 
     def test_group_negative_recording_language_pauses_collection(self) -> None:
         examples = ["不要开始记录", "请停止记录"]
@@ -1129,10 +1140,11 @@ class FeishuBotTests(unittest.TestCase):
 
         self.assertTrue(session.group_summary_enabled)
         self.assertEqual(session.group_pending_count, 1)
-        self.assertIn("长期记录", self.channel.replies[-1][1]["text"])
+        self.assertIn("静默记录", self.channel.replies[-1][1]["text"])
 
-    def test_group_summarizes_shared_chat_after_threshold(self) -> None:
+    def test_group_threshold_stays_silent_until_manual_summary(self) -> None:
         self.run_group("开启自动总结", mentioned=True)
+        replies_before_messages = len(self.channel.replies)
         self.run_group(
             "青禾便当的联系人是林经理",
             sender_id="ou_one",
@@ -1143,6 +1155,11 @@ class FeishuBotTests(unittest.TestCase):
             sender_id="ou_two",
             message_id="om_two",
         )
+
+        self.assertEqual(len(self.channel.replies), replies_before_messages)
+        self.assertEqual(self.api.calls, [])
+
+        self.run_group("总结吧", mentioned=True, message_id="om_summary")
 
         reply = self.channel.replies[-1][1]["text"]
         self.assertIn("业务与联系人", reply)
@@ -1240,10 +1257,11 @@ class FeishuBotTests(unittest.TestCase):
             await bot.on_message(
                 Message("保存吧", message_id="om_save_first", mentioned_bot=True, **base)
             )
+            replies_before_pronoun = len(self.channel.replies)
             await bot.on_message(
                 Message("他们有 POS 机业务员，规模不小", message_id="om_pronoun", **base)
             )
-            self.assertIn("商户：汪汪咖啡店", self.channel.replies[-1][1]["text"])
+            self.assertEqual(len(self.channel.replies), replies_before_pronoun)
             await bot.on_message(
                 Message("保存吧", message_id="om_save_second", mentioned_bot=True, **base)
             )
@@ -1331,7 +1349,7 @@ class FeishuBotTests(unittest.TestCase):
         self.run_group("这条消息不应进入模型", message_id="om_after")
         self.assertEqual(len(self.api.calls), call_count)
 
-    def test_group_idle_summary_after_one_effective_message(self) -> None:
+    def test_group_idle_time_stays_silent_until_manual_summary(self) -> None:
         async def scenario() -> None:
             bot = FeishuBotController(
                 api=self.api,  # type: ignore[arg-type]
@@ -1349,8 +1367,14 @@ class FeishuBotTests(unittest.TestCase):
             await bot.on_message(
                 Message("开启自动总结", mentioned_bot=True, **base)
             )
+            replies_before_message = len(self.channel.replies)
             await bot.on_message(Message("青禾便当联系人是林经理", **base))
             await asyncio.sleep(0.03)
+            self.assertEqual(len(self.channel.replies), replies_before_message)
+            self.assertEqual(self.api.calls, [])
+            await bot.on_message(
+                Message("总结吧", mentioned_bot=True, message_id="om_summary", **base)
+            )
 
         asyncio.run(scenario())
 

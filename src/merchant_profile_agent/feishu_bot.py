@@ -1405,13 +1405,14 @@ class FeishuBotController:
         if mentioned and _is_group_pause_intent(text):
             session.group_summary_enabled = False
             session.clear_group_buffer()
-            await self._reply(message, "自动总结已暂停；恢复时请 @机器人 回复“继续记录”。")
+            await self._reply(message, "静默记录已暂停；恢复时请 @机器人 回复“继续记录”。")
             return
         if mentioned and _is_group_enable_intent(text):
             session.group_summary_enabled = True
             await self._reply(
                 message,
-                "本群已长期记录：20 条有效消息，或有新资料后安静 10 分钟自动总结。"
+                "本群已开启静默记录：普通消息只进入草稿，不会自动发言。"
+                "需要查看时请 @机器人 回复“总结吧”；"
                 "只有明确 @机器人 回复“保存吧”才会写入知识库。",
             )
             return
@@ -1440,14 +1441,15 @@ class FeishuBotController:
         if mentioned and _matches_command(text, HELP_COMMANDS):
             await self._reply(
                 message,
-                "本群默认长期记录。普通消息只进入草稿；可用：立即总结、"
-                "暂停自动总结、保存吧、/discard。只有 @机器人 保存吧才会写知识库。",
+                "本群默认静默记录，普通消息只进入草稿且不会自动发言。可用："
+                "@机器人 总结吧、@机器人 暂停记录、@机器人 保存吧、"
+                "@机器人 /discard。只有保存吧才会写知识库。",
             )
             return
         if mentioned and _matches_command(text, DISCARD_COMMANDS):
             session.reset_draft()
             session.clear_group_buffer()
-            await self._reply(message, "已放弃当前摘要草稿，自动总结仍开启。")
+            await self._reply(message, "已放弃当前摘要草稿，静默记录仍开启。")
             return
         if mentioned and _is_link_request(text):
             await self._reply(message, _links_text(session.last_documents))
@@ -1509,45 +1511,15 @@ class FeishuBotController:
                 )
                 if analyzed and save_pending and not session.group_followup_pending:
                     await self._save(message, session, "结束并保存")
-            else:
-                await self._summarize_group(session, message)
             return
         if session.group_followup_pending:
             # Keep nearby, unmentioned corrections so the next explicit @bot
             # follow-up can reconcile them with the existing unsaved summary.
             return
-        if session.group_pending_count >= self.group_message_threshold:
-            session.cancel_idle_task()
-            await self._summarize_group(session, message)
-            return
-        self._schedule_idle_summary(session)
-
-    def _schedule_idle_summary(self, session: Session) -> None:
-        session.cancel_idle_task()
-        generation = session.group_generation
-        session.group_idle_task = asyncio.create_task(
-            self._summarize_after_idle(session, generation)
-        )
-
-    async def _summarize_after_idle(self, session: Session, generation: int) -> None:
-        try:
-            await asyncio.sleep(self.group_idle_seconds)
-            if (
-                session.group_summary_enabled
-                and session.group_generation == generation
-                and session.group_pending_count >= self.group_idle_min_messages
-                and session.group_last_message is not None
-            ):
-                await self._summarize_group(session, session.group_last_message)
-        except asyncio.CancelledError:
-            return
-        except Exception:
-            LOGGER.exception("automatic group summary failed")
-        finally:
-            try:
-                self.sessions.persist()
-            except OSError:
-                LOGGER.exception("could not persist Feishu session state after idle summary")
+        # Group collection is intentionally silent. Threshold and idle settings
+        # remain accepted for deployment compatibility but never trigger a
+        # summary; only an explicit @bot summary/save command does.
+        return
 
     async def _summarize_group(
         self,
