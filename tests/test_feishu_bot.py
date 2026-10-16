@@ -55,6 +55,12 @@ class FakeChannel:
         )
 
 
+class MissingImageChannel(FakeChannel):
+    async def download_resource(self, file_key, resource_type="image", message_id=None):
+        self.downloads.append((file_key, resource_type, message_id))
+        return None
+
+
 class FakeVideoProcessor:
     def __init__(self) -> None:
         self.calls = []
@@ -464,6 +470,14 @@ class FeishuBotTests(unittest.TestCase):
         self.assertNotIn("&lt;video", cleaned)
         self.assertIn("图片缺失", cleaned)
 
+    def test_product_capability_question_is_not_profile_evidence(self) -> None:
+        self.assertFalse(
+            _is_group_profile_candidate("C260M 能设置没有打印纸后出声音提醒吗？")
+        )
+        self.assertTrue(
+            _is_group_profile_candidate("C260M 缺纸时没有声音提醒，客户已反馈")
+        )
+
     def test_group_summary_explains_crm_result_and_specific_next_step(self) -> None:
         text = _group_summary_text(
             {
@@ -552,6 +566,67 @@ class FeishuBotTests(unittest.TestCase):
             self.channel.downloads,
             [("img_real_raw_key", "image", "om_raw_image")],
         )
+
+    def test_unavailable_link_preview_image_does_not_block_text(self) -> None:
+        channel = MissingImageChannel()
+        bot = FeishuBotController(
+            api=self.api,  # type: ignore[arg-type]
+            channel=channel,
+            sessions=SessionStore(),
+        )
+        message = Message(
+            "青禾便当的联系人是林经理\n![image](img_link_preview)",
+            message_id="om_link_preview",
+            content={"kind": "post"},
+            resources=[{"type": "image", "file_key": "img_link_preview"}],
+        )
+
+        asyncio.run(bot.on_message(message))
+
+        analyze = next(payload for path, payload in self.api.calls if path == "/v1/profile/analyze")
+        self.assertIn("青禾便当的联系人是林经理", analyze["messages"][0]["content"])
+        self.assertNotIn("images", analyze["messages"][0])
+        self.assertNotIn("图片下载失败", channel.replies[-1][1]["text"])
+
+    def test_unavailable_image_only_message_still_reports_failure(self) -> None:
+        channel = MissingImageChannel()
+        bot = FeishuBotController(
+            api=self.api,  # type: ignore[arg-type]
+            channel=channel,
+            sessions=SessionStore(),
+        )
+        message = Message(
+            "![image](img_missing)",
+            message_id="om_missing_image",
+            content={"kind": "image", "image_key": "img_missing"},
+        )
+
+        asyncio.run(bot.on_message(message))
+
+        self.assertEqual(self.api.calls, [])
+        self.assertIn("图片下载失败", channel.replies[-1][1]["text"])
+
+    def test_group_support_question_with_broken_preview_is_silent(self) -> None:
+        channel = MissingImageChannel()
+        sessions = SessionStore()
+        bot = FeishuBotController(
+            api=self.api,  # type: ignore[arg-type]
+            channel=channel,
+            sessions=sessions,
+        )
+        message = Message(
+            "C260M 能设置没有打印纸后出声音提醒吗？\n![image](img_link_preview)",
+            message_id="om_support_question",
+            chat_id="oc_support",
+            chat_type="group",
+            resources=[{"type": "image", "file_key": "img_link_preview"}],
+        )
+
+        asyncio.run(bot.on_message(message))
+
+        self.assertEqual(self.api.calls, [])
+        self.assertEqual(channel.replies, [])
+        self.assertEqual(sessions.get("oc_support:group:root").group_buffer, [])
 
     def test_video_is_transcribed_and_key_frames_are_analyzed_but_not_committed(self) -> None:
         processor = FakeVideoProcessor()

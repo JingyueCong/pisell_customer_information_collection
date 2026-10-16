@@ -439,6 +439,19 @@ def _is_group_profile_candidate(text: str, *, has_media: bool = False) -> bool:
     )
     if any(term in compact for term in meta_terms):
         return False
+    # Questions about product capabilities or troubleshooting belong to the
+    # support flow, not the merchant profile. Rich link previews can carry an
+    # image resource and make these questions look like profile data.
+    if (
+        "?" in compact
+        or "？" in compact
+        or re.search(r"(?:吗|么|呢)$", compact)
+        or re.match(
+            r"^(?:请问)?(?:怎么|如何|为什么|哪里|什么|是否|能否|可否|可不可以|有没有)",
+            compact,
+        )
+    ):
+        return False
     casual_phone_terms = (
         "有空吗",
         "电话聊",
@@ -1088,6 +1101,7 @@ class FeishuBotController:
 
     async def on_message(self, message: Any) -> None:
         raw_text = str(getattr(message, "body_text", "") or "").strip()
+        text = _without_video_placeholders(_without_image_placeholders(raw_text))
         has_video = _video_resource(message) is not None
         image_keys = _image_resource_keys(message)
         if not raw_text and not image_keys and not has_video:
@@ -1104,19 +1118,30 @@ class FeishuBotController:
                     return
             try:
                 images = await self._download_images(message)
-                video = await self._download_video(message) if has_video else None
             except ImageInputError as exc:
-                await self._reply(message, str(exc))
-                return
-            except VideoProcessingError as exc:
+                # Link previews and quoted rich posts may expose an image_key
+                # that Feishu refuses with "File not in msg". Keep valid text
+                # or video instead of failing the entire message.
+                if not text and not has_video:
+                    await self._reply(message, str(exc))
+                    return
                 LOGGER.warning(
-                    "video processing rejected message=%s: %s",
+                    "ignoring unavailable optional image for text message=%s",
                     str(getattr(message, "message_id", "") or "unknown"),
-                    exc,
                 )
-                await self._reply(message, f"视频处理失败：{exc}")
-                return
-            text = _without_video_placeholders(_without_image_placeholders(raw_text))
+                images = []
+            video = None
+            if has_video:
+                try:
+                    video = await self._download_video(message)
+                except VideoProcessingError as exc:
+                    LOGGER.warning(
+                        "video processing rejected message=%s: %s",
+                        str(getattr(message, "message_id", "") or "unknown"),
+                        exc,
+                    )
+                    await self._reply(message, f"视频处理失败：{exc}")
+                    return
             if video is not None:
                 if video.transcript:
                     text = "\n".join(
