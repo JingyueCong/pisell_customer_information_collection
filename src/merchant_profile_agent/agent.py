@@ -43,28 +43,35 @@ Keep the knowledge base minimal:
   "looks ugly" are not. Do not save an uncertain question as a fact.
 
 Use only these field prefixes:
-- project.*, progress.*
-- business.*, contacts.*, stores.*, collection.*
-- commercial.*, package.*, billing.*, payments.*
+- business.*, contacts.*
+- menu.*, content.*
+- system.*, configuration.*, workarounds.*
 - hardware.*, installation.*
+- risk.*, compliance.*
+- commercial.*
+- stores.*
+- project.*, progress.*
+- collection.*
+- package.*, billing.*, payments.*
+- hardware_record.*
 - card_terminal.*, eftpos.*
-- risk.*, compliance.*, special.*
-- menu.*
+- special.*
+- menu_collection.*
 - archive.*, documents.*
 - communication.*
-- content.*, system.*, configuration.*, workarounds.*
+- content_setup.*
 
 Prefer these paths for the new fixed pages when they apply:
 - project.feishu_link, project.status, project.notes
 - collection.merchant_form_url, collection.archive_url, collection.basic_profile
 - package.type, billing.payment_method, billing.deduction_status
-- hardware.devices, hardware.commercial_terms, hardware.configuration_record_url
+- hardware_record.devices, hardware_record.commercial_terms, hardware_record.configuration_record_url
 - card_terminal.requested_count, card_terminal.surcharge, card_terminal.applicant_company
 - risk.materials, special.communication_focus
-- menu.url, menu.collection_status
+- menu_collection.url, menu_collection.status
 - archive.folder_url, archive.document_links
 - communication.preferences, communication.notes
-- content.setup_notes
+- content_setup.notes
 
 Use these canonical paths whenever they apply; do not invent shorter aliases:
 - contacts.primary.name, contacts.primary.role, contacts.primary.phone,

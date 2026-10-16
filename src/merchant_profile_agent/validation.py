@@ -7,16 +7,23 @@ from typing import Any, Mapping, Sequence
 
 MODULES: "OrderedDict[str, tuple[str, ...]]" = OrderedDict(
     [
-        ("project-progress", ("project.", "progress.")),
-        ("business-contacts", ("business.", "contacts.", "stores.", "collection.")),
-        ("commercial-information", ("commercial.", "package.", "billing.", "payments.")),
+        ("business-contacts", ("business.", "contacts.")),
+        ("menu-content", ("menu.", "content.")),
+        ("system-configuration", ("system.", "configuration.", "workarounds.")),
         ("hardware-installation", ("hardware.", "installation.")),
+        ("risk-compliance", ("risk.", "compliance.")),
+        ("commercial-information", ("commercial.",)),
+        ("store-profile", ("stores.",)),
+        ("project-progress", ("project.", "progress.")),
+        ("data-collection", ("collection.",)),
+        ("package-commercial", ("package.", "billing.", "payments.")),
+        ("hardware-records", ("hardware_record.",)),
         ("card-terminal", ("card_terminal.", "eftpos.")),
-        ("risk-compliance", ("risk.", "compliance.", "special.")),
-        ("menu-content", ("menu.",)),
+        ("special-matters", ("special.",)),
+        ("menu-collection", ("menu_collection.",)),
         ("document-archive", ("archive.", "documents.")),
         ("communication-profile", ("communication.",)),
-        ("system-configuration", ("content.", "system.", "configuration.", "workarounds.")),
+        ("content-settings", ("content_setup.",)),
     ]
 )
 

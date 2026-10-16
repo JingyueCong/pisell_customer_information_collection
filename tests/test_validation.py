@@ -53,18 +53,25 @@ class ValidationTests(unittest.TestCase):
         self.assertEqual(result["profile_updates"][0]["state"], "explicit")
         self.assertFalse(result["write_performed"])
 
-    def test_fixed_merchant_page_categories_are_supported(self) -> None:
+    def test_foundational_and_supplemental_page_categories_are_supported(self) -> None:
         cases = {
-            "project.feishu_link": "project-progress",
-            "collection.merchant_form_url": "business-contacts",
-            "package.type": "commercial-information",
-            "hardware.devices": "hardware-installation",
-            "card_terminal.surcharge": "card-terminal",
-            "special.communication_focus": "risk-compliance",
+            "contacts.primary.name": "business-contacts",
             "menu.url": "menu-content",
+            "system.customer_flow.start_screen": "system-configuration",
+            "hardware.devices": "hardware-installation",
+            "risk.materials": "risk-compliance",
+            "commercial.notes": "commercial-information",
+            "stores.primary.address": "store-profile",
+            "project.feishu_link": "project-progress",
+            "collection.merchant_form_url": "data-collection",
+            "package.type": "package-commercial",
+            "hardware_record.devices": "hardware-records",
+            "card_terminal.surcharge": "card-terminal",
+            "special.communication_focus": "special-matters",
+            "menu_collection.url": "menu-collection",
             "archive.folder_url": "document-archive",
             "communication.preferences": "communication-profile",
-            "content.setup_notes": "system-configuration",
+            "content_setup.notes": "content-settings",
         }
         for field_path, document_type in cases.items():
             with self.subTest(field_path=field_path):
