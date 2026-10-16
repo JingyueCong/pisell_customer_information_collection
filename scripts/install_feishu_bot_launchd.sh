@@ -10,6 +10,7 @@ LOG_DIR="$HOME/Library/Logs/Pisell"
 LAUNCH_DIR="$HOME/Library/LaunchAgents"
 PLIST_PATH="$LAUNCH_DIR/com.pisell.merchant-profile-feishu-bot.plist"
 TEMPLATE="$PROJECT_DIR/deploy/com.pisell.merchant-profile-feishu-bot.plist.template"
+LAUNCH_DOMAIN="user/$(id -u)"
 
 if [ ! -f "$ENV_FILE" ]; then
   echo "Missing $ENV_FILE. Copy .env.example to .env and add real secrets." >&2
@@ -36,9 +37,13 @@ sed \
   "$TEMPLATE" > "$PLIST_PATH"
 
 plutil -lint "$PLIST_PATH"
-launchctl bootout "gui/$(id -u)/com.pisell.merchant-profile-feishu-bot" 2>/dev/null || true
-launchctl bootstrap "gui/$(id -u)" "$PLIST_PATH"
-launchctl kickstart -k "gui/$(id -u)/com.pisell.merchant-profile-feishu-bot"
+launchctl bootout "$LAUNCH_DOMAIN/com.pisell.merchant-profile-feishu-bot" 2>/dev/null || true
+if ! launchctl bootstrap "$LAUNCH_DOMAIN" "$PLIST_PATH"; then
+  # launchd can briefly retain a just-booted-out label in the Background domain.
+  sleep 2
+  launchctl bootstrap "$LAUNCH_DOMAIN" "$PLIST_PATH"
+fi
+launchctl kickstart -k "$LAUNCH_DOMAIN/com.pisell.merchant-profile-feishu-bot"
 
 echo "Installed com.pisell.merchant-profile-feishu-bot"
 echo "Logs: $LOG_DIR/merchant-profile-feishu-bot.log"

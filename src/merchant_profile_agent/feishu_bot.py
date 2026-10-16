@@ -41,7 +41,7 @@ GROUP_PAUSE_COMMANDS = {
     "不要记录",
     "不要开始记录",
 }
-GROUP_SUMMARIZE_COMMANDS = {"立即总结", "现在总结", "总结本段"}
+GROUP_SUMMARIZE_COMMANDS = {"立即总结", "现在总结", "总结本段", "总结吧", "帮我总结"}
 NATURAL_SAVE_CONFIRMATIONS = {
     "结束并保存",
     "保存",
@@ -417,6 +417,117 @@ def _is_group_save_confirmation(text: str) -> bool:
 def _is_effective_group_message(text: str) -> bool:
     compact = _normalize_intent_text(text)
     return len(compact) >= 2 and bool(re.search(r"[0-9A-Za-z\u3400-\u9fff]{2}", compact))
+
+
+def _is_group_profile_candidate(text: str, *, has_media: bool = False) -> bool:
+    """Keep durable merchant evidence while dropping discussion about the bot itself."""
+    compact = _normalize_intent_text(text)
+    if not compact:
+        return has_media
+    meta_terms = (
+        "机器人",
+        "自动监听",
+        "客户信息录入",
+        "客户资料录入",
+        "怎么使用",
+        "如何使用",
+        "使用说明",
+        "拉进群",
+        "切换商户前",
+        "/discard",
+        "/save",
+    )
+    if any(term in compact for term in meta_terms):
+        return False
+    if has_media:
+        return True
+    profile_terms = (
+        "商户",
+        "客户",
+        "门店",
+        "店铺",
+        "地址",
+        "street",
+        "联系人",
+        "店长",
+        "经理",
+        "负责人",
+        "电话",
+        "手机",
+        "邮箱",
+        "email",
+        "业务",
+        "规模",
+        "员工",
+        "pos",
+        "产品",
+        "菜单",
+        "菜品",
+        "价格",
+        "营业",
+        "系统",
+        "配置",
+        "设备",
+        "硬件",
+        "打印",
+        "收银",
+        "点餐",
+        "支付",
+        "配送",
+        "安装",
+        "网络",
+        "wifi",
+        "故障",
+        "问题",
+        "缺失",
+        "报错",
+        "无法",
+        "不能",
+        "异常",
+        "风险",
+        "合规",
+        "合同",
+        "费用",
+        "佣金",
+        "折扣",
+        "优惠",
+        "会员",
+        "库存",
+        "订单",
+        "发票",
+        "gst",
+        "abn",
+        "咖啡",
+        "餐厅",
+        "饭店",
+        "餐馆",
+        "便当",
+        "火锅",
+        "麻辣烫",
+        "奶茶",
+        "restaurant",
+        "cafe",
+    )
+    return any(term in compact for term in profile_terms)
+
+
+def _explicitly_mentions_merchant(
+    messages: list[dict[str, Any]], merchant_name: str
+) -> bool:
+    merchant_key = _normalize_intent_text(merchant_name)
+    if not merchant_key:
+        return False
+    for message in messages:
+        if merchant_key in _normalize_intent_text(str(message.get("content") or "")):
+            return True
+        images = message.get("images")
+        if isinstance(images, list) and images:
+            return True
+    return False
+
+
+def _merchant_name_key(value: Any) -> str:
+    return _normalize_intent_text(str(value or ""))
 
 
 def _is_link_request(text: str) -> bool:
@@ -1081,20 +1192,55 @@ class FeishuBotController:
             session.current_profile = profile if isinstance(profile, dict) else {}
             self._apply_crm_resolution(session, read.get("crm"))
             session.current_profile_loaded = True
+        analysis_profile = dict(session.current_profile)
+        if session.merchant:
+            existing_identity = analysis_profile.get("merchant")
+            identity = dict(existing_identity) if isinstance(existing_identity, dict) else {}
+            identity.update(session.merchant)
+            analysis_profile["merchant"] = identity
         preview = await self._post(
             "/v1/profile/analyze",
             {
                 "messages": _messages_for_analysis(session.messages),
-                "current_profile": session.current_profile,
+                "current_profile": analysis_profile,
             },
         )
         merchant = preview.get("merchant")
         if isinstance(merchant, dict) and merchant.get("name"):
-            if session.merchant and session.merchant.get("name") != merchant.get("name"):
-                raise MerchantSwitchError
             previous_name = session.merchant.get("name") if session.merchant else None
             previous_id = session.merchant.get("id") if session.merchant else None
-            proposed_id = merchant.get("id") or previous_id
+            proposed_name = str(merchant.get("name"))
+            is_switch = bool(
+                previous_name
+                and _merchant_name_key(previous_name) != _merchant_name_key(proposed_name)
+            )
+            if is_switch:
+                explicit_switch = _explicitly_mentions_merchant(
+                    session.messages, proposed_name
+                )
+                has_unsaved_draft = bool(
+                    session.preview
+                    and (
+                        session.preview.get("profile_updates")
+                        or session.preview.get("conflicts")
+                    )
+                )
+                if not explicit_switch:
+                    # Pronouns such as “他的地址” belong to the active merchant.
+                    merchant = {**merchant, "name": previous_name, "id": previous_id}
+                    preview["merchant"] = merchant
+                    proposed_name = str(previous_name)
+                    is_switch = False
+                elif has_unsaved_draft or session.group_followup_pending:
+                    raise MerchantSwitchError
+                else:
+                    # A clearly named merchant after a completed save starts a
+                    # new draft automatically; no manual /discard is needed.
+                    previous_id = None
+                    session.current_profile = {}
+                    session.current_profile_loaded = False
+                    session.crm_resolution = None
+            proposed_id = merchant.get("id") or (None if is_switch else previous_id)
             changed = previous_name != merchant.get("name") or previous_id != proposed_id
             session.merchant = {"name": merchant.get("name"), "id": proposed_id}
             if changed:
@@ -1114,7 +1260,10 @@ class FeishuBotController:
                         "/v1/profile/analyze",
                         {
                             "messages": _messages_for_analysis(session.messages),
-                            "current_profile": session.current_profile,
+                            "current_profile": {
+                                **session.current_profile,
+                                "merchant": dict(session.merchant),
+                            },
                         },
                     )
         if session.merchant:
@@ -1239,6 +1388,10 @@ class FeishuBotController:
             return
         if not _is_effective_group_message(text):
             return
+        if not (session.group_followup_pending and mentioned) and not _is_group_profile_candidate(
+            text, has_media=bool(images)
+        ):
+            return
 
         sender_name = str(getattr(message, "sender_name", "") or "").strip()
         if not sender_name:
@@ -1318,7 +1471,21 @@ class FeishuBotController:
         if not session.group_buffer:
             await self._reply(message, "暂无新的群消息可总结。")
             return False
-        segment = list(session.group_buffer)
+        segment = [
+            item
+            for item in session.group_buffer
+            if _is_group_profile_candidate(
+                str(item.get("content") or ""),
+                has_media=bool(item.get("images")),
+            )
+        ]
+        if not segment:
+            session.clear_group_buffer()
+            await self._reply(message, "这段没有识别到可记录的商户资料，未写入知识库。")
+            return False
+        if len(segment) != len(session.group_buffer):
+            session.group_buffer = segment
+            session.group_pending_count = len(segment)
         session.messages = segment
         try:
             preview = await self._analyze_session(session)

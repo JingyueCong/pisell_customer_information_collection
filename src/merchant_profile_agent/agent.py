@@ -16,6 +16,9 @@ statements only. Never turn an inference into a profile update. Put possible inf
 Extract everything already provided before asking a question. If a blocking detail is missing, ask
 exactly one short, highest-value question. Do not ask the user to complete the whole profile.
 Set merchant_id only when the user explicitly supplied a customer/store identifier; never invent it.
+When current_profile.merchant is present, treat it as the active merchant for pronouns such as “他/他们/这家店”.
+Do not infer a different merchant name from operational discussion about the bot or recording workflow.
+Change the merchant only when a user message or attached evidence explicitly names another merchant.
 
 Keep the knowledge base minimal:
 - Record only concrete, durable merchant facts useful for future operations, support, configuration,

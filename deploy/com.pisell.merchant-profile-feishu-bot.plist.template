@@ -28,6 +28,8 @@
   </dict>
   <key>ProcessType</key>
   <string>Background</string>
+  <key>LimitLoadToSessionType</key>
+  <string>Background</string>
   <key>StandardOutPath</key>
   <string>__LOG_DIR__/merchant-profile-feishu-bot.log</string>
   <key>StandardErrorPath</key>

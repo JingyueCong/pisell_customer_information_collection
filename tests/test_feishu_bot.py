@@ -13,6 +13,7 @@ from merchant_profile_agent.feishu_bot import (
     FeishuBotController,
     SessionStore,
     _group_summary_text,
+    _is_group_profile_candidate,
     _messages_for_analysis,
     _without_video_placeholders,
 )
@@ -340,6 +341,36 @@ class EmptyThenUpdateApi(FakeApi):
             "save_readiness": "needs_input",
             "next_question": None,
             "summary_points": ["发现点餐屏图片缺失"],
+            "decisions": [],
+            "action_items": [],
+            "information_gaps": [],
+        }
+
+
+class NamedMerchantApi(FakeApi):
+    def post(self, path, payload):
+        if path != "/v1/profile/analyze":
+            return super().post(path, payload)
+        self.calls.append((path, copy.deepcopy(payload)))
+        content = "\n".join(item["content"] for item in payload["messages"])
+        name = "Dandong咖啡厅" if "Dandong" in content else "青禾便当"
+        return {
+            "merchant": {"name": name, "id": None},
+            "reply": "已识别。",
+            "profile_updates": [
+                {
+                    "field_path": "stores.primary.address",
+                    "value": "123 Collins Street" if "Dandong" in content else "1 青禾路",
+                    "source_ref": payload["messages"][0]["source_ref"],
+                    "replace_confirmed": False,
+                    "state": "explicit",
+                    "document_type": "merchant-overview",
+                }
+            ],
+            "conflicts": [],
+            "save_readiness": "ready",
+            "next_question": None,
+            "summary_points": ["已识别地址"],
             "decisions": [],
             "action_items": [],
             "information_gaps": [],
@@ -800,6 +831,74 @@ class FeishuBotTests(unittest.TestCase):
         session = self.sessions.get("oc_group:group:root")
         self.assertTrue(session.group_summary_enabled)
         self.assertEqual(session.group_pending_count, 1)
+
+    def test_group_meta_discussion_is_not_collected(self) -> None:
+        examples = [
+            "机器人加入群聊后默认长期记录",
+            "特别注意切换商户前要执行 /discard",
+            "@Josie 这个改成拉进群就开始自动监听",
+            "我们明确一下客户信息录入的边界",
+        ]
+        for index, text in enumerate(examples):
+            with self.subTest(text=text):
+                self.run_group(text, message_id=f"om_meta_{index}")
+
+        session = self.sessions.get("oc_group:group:root")
+        self.assertEqual(session.group_pending_count, 0)
+        self.assertEqual(session.group_buffer, [])
+        self.assertEqual(self.api.calls, [])
+
+    def test_group_profile_candidate_accepts_pronoun_address(self) -> None:
+        self.assertTrue(_is_group_profile_candidate("他的地址是 123 Collins Street"))
+
+    def test_group_save_prunes_old_meta_discussion_from_buffer(self) -> None:
+        session = self.sessions.get("oc_group:group:root")
+        session.group_buffer = [
+            {
+                "role": "user",
+                "content": "成员：机器人加入群后默认自动监听，切换商户前 /discard",
+                "source_ref": "feishu://chat/oc_group/message/om_meta",
+            },
+            {
+                "role": "user",
+                "content": "成员：青禾便当地址是 1 青禾路",
+                "source_ref": "feishu://chat/oc_group/message/om_address",
+            },
+        ]
+        session.group_pending_count = 2
+
+        self.run_group("保存吧", mentioned=True, message_id="om_save")
+
+        analyze = next(payload for path, payload in self.api.calls if path == "/v1/profile/analyze")
+        self.assertEqual(len(analyze["messages"]), 1)
+        self.assertIn("1 青禾路", analyze["messages"][0]["content"])
+        self.assertNotIn("自动监听", analyze["messages"][0]["content"])
+        self.assertEqual(self.api.calls[-1][0], "/v1/profile/commit")
+
+    def test_group_explicit_new_merchant_after_save_switches_automatically(self) -> None:
+        api = NamedMerchantApi()
+        bot = FeishuBotController(
+            api=api,  # type: ignore[arg-type]
+            channel=self.channel,
+            sessions=SessionStore(),
+            group_message_threshold=20,
+            group_idle_seconds=600,
+            group_idle_min_messages=5,
+        )
+
+        async def scenario() -> None:
+            base = {"chat_id": "oc_switch", "chat_type": "group", "sender_name": "测试成员"}
+            await bot.on_message(Message("青禾便当地址是 1 青禾路", message_id="om_one", **base))
+            await bot.on_message(Message("保存吧", message_id="om_save_one", mentioned_bot=True, **base))
+            await bot.on_message(
+                Message("Dandong咖啡厅地址是 123 Collins Street", message_id="om_two", **base)
+            )
+            await bot.on_message(Message("保存吧", message_id="om_save_two", mentioned_bot=True, **base))
+
+        asyncio.run(scenario())
+
+        commits = [payload for path, payload in api.calls if path == "/v1/profile/commit"]
+        self.assertEqual([item["merchant"]["name"] for item in commits], ["青禾便当", "Dandong咖啡厅"])
 
     def test_group_mentioned_save_without_data_does_not_write(self) -> None:
         self.run_group("保存吧", mentioned=True)
