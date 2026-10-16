@@ -128,6 +128,28 @@ class CrmResolverTests(unittest.TestCase):
         self.assertIn("LIKE '%U Bowl%'", mql)
 
     @patch("merchant_profile_agent.crm.subprocess.run")
+    def test_bound_id_accepts_a_safe_shortened_business_name(self, run) -> None:
+        run.return_value = completed(
+            {
+                "rows": [
+                    {
+                        "work_item_id": "6856334446",
+                        "name": "9262 U Bowl Melbourne Central （海底捞）",
+                    }
+                ]
+            }
+        )
+
+        result = self.make_resolver().resolve(
+            {"merchant_name": "U Bowl Malatang", "merchant_id": "6856334446"}
+        )
+
+        self.assertEqual(result["status"], "unique")
+        self.assertEqual(result["match_method"], "work_item_id")
+        self.assertEqual(result["candidates"][0]["work_item_id"], "6856334446")
+        self.assertEqual(run.call_count, 1)
+
+    @patch("merchant_profile_agent.crm.subprocess.run")
     def test_cli_failure_is_fail_closed(self, run) -> None:
         run.return_value = completed({}, returncode=1)
 
@@ -231,6 +253,96 @@ class CrmResolverTests(unittest.TestCase):
         self.assertEqual(result["matched_query"], "U Bowl")
         second_request = urlopen.call_args_list[1].args[0]
         self.assertEqual(json.loads(second_request.data), {"merchant_name": "U Bowl"})
+
+    @patch("merchant_profile_agent.crm.urllib.request.urlopen")
+    def test_ticket_bridge_rechecks_the_same_bound_id_with_shortened_name(
+        self, urlopen
+    ) -> None:
+        def response(payload):
+            value = MagicMock()
+            value.read.return_value = json.dumps(payload).encode("utf-8")
+            value.__enter__.return_value = value
+            return value
+
+        urlopen.side_effect = [
+            response(
+                {
+                    "ok": True,
+                    "crm": {
+                        "status": "not_found",
+                        "candidates": [],
+                        "read_only": True,
+                    },
+                }
+            ),
+            response(
+                {
+                    "ok": True,
+                    "crm": {
+                        "status": "unique",
+                        "candidates": [
+                            {
+                                "work_item_id": "6856334446",
+                                "name": "9262 U Bowl Melbourne Central （海底捞）",
+                            }
+                        ],
+                        "read_only": True,
+                    },
+                }
+            ),
+        ]
+        resolver = TicketBridgeCrmResolver(
+            base_url="http://127.0.0.1:8787",
+            token="a" * 32,
+        )
+
+        result = resolver.resolve(
+            {"merchant_name": "U Bowl Malatang", "merchant_id": "6856334446"}
+        )
+
+        self.assertEqual(result["status"], "unique")
+        self.assertEqual(result["match_method"], "work_item_id_shortened_name")
+        self.assertEqual(result["matched_query"], "U Bowl")
+        second_request = urlopen.call_args_list[1].args[0]
+        self.assertEqual(
+            json.loads(second_request.data),
+            {"merchant_name": "U Bowl", "lookup_hint": "6856334446"},
+        )
+
+    @patch("merchant_profile_agent.crm.urllib.request.urlopen")
+    def test_ticket_bridge_does_not_accept_a_different_id_on_retry(self, urlopen) -> None:
+        def response(payload):
+            value = MagicMock()
+            value.read.return_value = json.dumps(payload).encode("utf-8")
+            value.__enter__.return_value = value
+            return value
+
+        urlopen.side_effect = [
+            response(
+                {"ok": True, "crm": {"status": "not_found", "candidates": []}}
+            ),
+            response(
+                {
+                    "ok": True,
+                    "crm": {
+                        "status": "unique",
+                        "candidates": [
+                            {"work_item_id": "9999999999", "name": "U Bowl Other"}
+                        ],
+                    },
+                }
+            ),
+        ]
+        resolver = TicketBridgeCrmResolver(
+            base_url="http://127.0.0.1:8787",
+            token="a" * 32,
+        )
+
+        result = resolver.resolve(
+            {"merchant_name": "U Bowl Malatang", "merchant_id": "6856334446"}
+        )
+
+        self.assertEqual(result["status"], "not_found")
 
 
 if __name__ == "__main__":

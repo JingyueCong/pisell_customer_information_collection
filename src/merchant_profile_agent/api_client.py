@@ -7,7 +7,9 @@ from typing import Any, Mapping
 
 
 class MerchantApiError(RuntimeError):
-    pass
+    def __init__(self, message: str, *, code: str | None = None) -> None:
+        super().__init__(message)
+        self.code = code
 
 
 class MerchantApiClient:
@@ -40,11 +42,10 @@ class MerchantApiClient:
             except (json.JSONDecodeError, UnicodeDecodeError):
                 code, message = "request_failed", None
             detail = f"{code}: {message}" if message else str(code)
-            raise MerchantApiError(detail) from exc
+            raise MerchantApiError(detail, code=str(code)) from exc
         except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
             raise MerchantApiError("merchant profile API is unavailable") from exc
         if not isinstance(result, dict):
             raise MerchantApiError("merchant profile API returned an invalid response")
         return result
-
 

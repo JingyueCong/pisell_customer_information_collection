@@ -117,6 +117,21 @@ def _shortened_name_variants(name: str) -> list[str]:
     return list(dict.fromkeys(variant for variant in variants if variant != name))
 
 
+def _normalized_name(name: str) -> str:
+    return re.sub(r"[\W_]+", "", name, flags=re.UNICODE).casefold()
+
+
+def _names_compatible(merchant_name: str, candidate_name: str) -> bool:
+    """Return true when the full or safely shortened merchant name agrees."""
+
+    candidate = _normalized_name(candidate_name)
+    for variant in [merchant_name, *_shortened_name_variants(merchant_name)]:
+        normalized = _normalized_name(variant)
+        if normalized and (normalized in candidate or candidate in normalized):
+            return True
+    return False
+
+
 def _scalar(value: Any) -> str | None:
     if isinstance(value, (str, int)) and str(value).strip():
         return str(value).strip()
@@ -237,20 +252,17 @@ class MeegleCrmResolver:
         merchant_name, lookup_hint = _validated_request(request)
         if lookup_hint and re.fullmatch(r"\d{6,30}", lookup_hint):
             by_id = self._query(self._mql(f"`work_item_id` = {lookup_hint}"))
-            if len(by_id) == 1:
-                normalized_name = re.sub(r"\s+", "", merchant_name).casefold()
-                normalized_candidate = re.sub(r"\s+", "", by_id[0].name).casefold()
-                if normalized_name in normalized_candidate or normalized_candidate in normalized_name:
-                    return {
-                        "status": "unique",
-                        "query": {
-                            "merchant_name": merchant_name,
-                            "lookup_hint": lookup_hint,
-                        },
-                        "match_method": "work_item_id",
-                        "candidates": [by_id[0].as_dict()],
-                        "read_only": True,
-                    }
+            if len(by_id) == 1 and _names_compatible(merchant_name, by_id[0].name):
+                return {
+                    "status": "unique",
+                    "query": {
+                        "merchant_name": merchant_name,
+                        "lookup_hint": lookup_hint,
+                    },
+                    "match_method": "work_item_id",
+                    "candidates": [by_id[0].as_dict()],
+                    "read_only": True,
+                }
         exact = self._query(self._mql(f"`name` = '{_mql_string(merchant_name)}'"))
         candidates = exact
         match_method = "exact_name"
@@ -334,9 +346,33 @@ class TicketBridgeCrmResolver:
     def resolve(self, request: Mapping[str, Any]) -> dict[str, Any]:
         merchant_name, lookup_hint = _validated_request(request)
         result = self._resolve_once(merchant_name, lookup_hint)
-        if result.get("status") != "not_found" or lookup_hint:
+        if result.get("status") != "not_found":
             return result
         original_result = result
+        if lookup_hint:
+            if not re.fullmatch(r"\d{6,30}", lookup_hint):
+                return original_result
+            for variant in _shortened_name_variants(merchant_name):
+                result = self._resolve_once(variant, lookup_hint)
+                candidates = result.get("candidates")
+                candidate = (
+                    candidates[0]
+                    if result.get("status") == "unique"
+                    and isinstance(candidates, list)
+                    and len(candidates) == 1
+                    and isinstance(candidates[0], Mapping)
+                    else None
+                )
+                if not candidate or str(candidate.get("work_item_id")) != lookup_hint:
+                    continue
+                result["query"] = {
+                    "merchant_name": merchant_name,
+                    "lookup_hint": lookup_hint,
+                }
+                result["matched_query"] = variant
+                result["match_method"] = "work_item_id_shortened_name"
+                return result
+            return original_result
         for variant in _shortened_name_variants(merchant_name):
             result = self._resolve_once(variant, None)
             if result.get("status") == "not_found":

@@ -1372,9 +1372,16 @@ class FeishuBotController:
                     "updates": updates,
                 },
             )
-        except MerchantApiError:
+        except MerchantApiError as exc:
             LOGGER.exception("merchant profile commit failed")
-            await self._reply(message, "保存失败，草稿已保留，请稍后重试。")
+            if exc.code == "crm_resolution_required":
+                await self._reply(
+                    message,
+                    "保存前 CRM 身份校验未通过，暂未写入；草稿已保留。"
+                    "请重新发送“保存”，我会再次核对同一客户。",
+                )
+            else:
+                await self._reply(message, "保存失败，草稿已保留，请稍后重试。")
             return
         store_result = result.get("result") if isinstance(result.get("result"), dict) else {}
         if result.get("write_performed") or store_result.get("duplicate"):
