@@ -99,6 +99,10 @@ FIELD_LABELS = {
     "menu.link": "菜单链接",
     "content.url": "内容链接",
     "content.link": "内容链接",
+    "system.customer_flow.member_login": "会员登录",
+    "system.customer_flow.start_screen": "点餐启动页",
+    "configuration.menu.item_images": "菜单图片",
+    "configuration.menu.options": "必选项配置",
     "stores.primary.name": "门店名称",
     "stores.primary.address": "门店地址",
     "stores.primary.phone": "门店电话",
@@ -502,19 +506,84 @@ def _group_summary_text(result: dict[str, Any]) -> str:
             return
         sections.append(title + "：\n" + "\n".join(f"- {item}" for item in items[:5]))
 
-    add_section("阶段总结", result.get("summary_points"))
-    add_section("已决定", result.get("decisions"))
-    add_section("待办", result.get("action_items"))
-
     updates = result.get("profile_updates")
     if isinstance(updates, list) and updates:
-        lines = [
-            f"- {_field_label(item.get('field_path'))}：{item.get('value')}"
-            for item in updates[:20]
-            if isinstance(item, dict)
+        definitions = [
+            (
+                "当前点餐流程",
+                lambda path: path.startswith("system.customer_flow."),
+            ),
+            (
+                "已发现的问题",
+                lambda path: path in {
+                    "configuration.menu.item_images",
+                    "configuration.menu.options",
+                }
+                or path.startswith("system.observed_issues."),
+            ),
+            (
+                "业务与联系人",
+                lambda path: path.startswith(("business.", "contacts.")),
+            ),
+            (
+                "门店资料",
+                lambda path: path.startswith("stores."),
+            ),
+            (
+                "菜单与内容",
+                lambda path: path.startswith(("menu.", "content.")),
+            ),
+            (
+                "系统配置与处理方案",
+                lambda path: path.startswith(
+                    ("system.", "configuration.", "workarounds.")
+                ),
+            ),
+            (
+                "硬件与安装",
+                lambda path: path.startswith(("hardware.", "installation.")),
+            ),
+            (
+                "风险与合规",
+                lambda path: path.startswith(("risk.", "compliance.")),
+            ),
+            (
+                "商务信息",
+                lambda path: path.startswith("commercial."),
+            ),
         ]
-        if lines:
-            sections.append("可写入知识库：\n" + "\n".join(lines))
+        remaining = [item for item in updates[:20] if isinstance(item, dict)]
+        for title, matches in definitions:
+            selected = [
+                item
+                for item in remaining
+                if matches(str(item.get("field_path") or ""))
+            ]
+            if not selected:
+                continue
+            sections.append(
+                title
+                + "：\n"
+                + "\n".join(
+                    f"- {_field_label(item.get('field_path'))}：{item.get('value')}"
+                    for item in selected
+                )
+            )
+            selected_ids = {id(item) for item in selected}
+            remaining = [item for item in remaining if id(item) not in selected_ids]
+        if remaining:
+            sections.append(
+                "其他商户资料：\n"
+                + "\n".join(
+                    f"- {_field_label(item.get('field_path'))}：{item.get('value')}"
+                    for item in remaining
+                )
+            )
+    else:
+        add_section("本段摘要", result.get("summary_points"))
+
+    add_section("已确认决定", result.get("decisions"))
+    add_section("后续事项", result.get("action_items"))
 
     conflicts = result.get("conflicts")
     if isinstance(conflicts, list) and conflicts:
@@ -546,7 +615,7 @@ def _group_summary_text(result: dict[str, Any]) -> str:
     if not sections:
         sections.append("本段没有需要记录的商户信息。")
     if result.get("save_readiness") == "ready" and updates:
-        sections.append("如需写入，请 @机器人 回复“保存吧”。")
+        sections.append("以上内容尚未写入。如需保存，请 @机器人 回复“保存吧”。")
     return "\n\n".join(sections)
 
 

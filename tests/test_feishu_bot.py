@@ -449,6 +449,34 @@ class FeishuBotTests(unittest.TestCase):
         self.assertIn("CRM 中未找到", text)
         self.assertIn("请补充店铺 ID", text)
 
+    def test_group_summary_uses_business_sections_and_chinese_labels(self) -> None:
+        text = _group_summary_text(
+            {
+                "merchant": {"name": "9262 U Bowl Melbourne Central （海底捞）"},
+                "summary_points": ["点餐系统测试完成"],
+                "profile_updates": [
+                    {
+                        "field_path": "system.customer_flow.member_login",
+                        "value": "使用手机号验证，也可跳过继续点餐。",
+                    },
+                    {
+                        "field_path": "configuration.menu.item_images",
+                        "value": "部分菜单项图片缺失。",
+                    },
+                ],
+                "conflicts": [],
+                "save_readiness": "ready",
+            }
+        )
+
+        self.assertIn("当前点餐流程", text)
+        self.assertIn("会员登录：使用手机号验证，也可跳过继续点餐。", text)
+        self.assertIn("已发现的问题", text)
+        self.assertIn("菜单图片：部分菜单项图片缺失。", text)
+        self.assertNotIn("阶段总结", text)
+        self.assertNotIn("可写入知识库", text)
+        self.assertNotIn("member login", text)
+
     def test_image_message_is_downloaded_analyzed_and_not_persisted_as_base64(self) -> None:
         message = Message(
             "<image key=wrong_resource_key />",
@@ -831,9 +859,9 @@ class FeishuBotTests(unittest.TestCase):
         )
 
         reply = self.channel.replies[-1][1]["text"]
-        self.assertIn("阶段总结", reply)
-        self.assertIn("已决定", reply)
-        self.assertIn("可写入知识库", reply)
+        self.assertIn("业务与联系人", reply)
+        self.assertIn("已确认决定", reply)
+        self.assertIn("以上内容尚未写入", reply)
         self.assertIn("@机器人", reply)
         analyzed = next(payload for path, payload in self.api.calls if path == "/v1/profile/analyze")
         self.assertEqual(len(analyzed["messages"]), 2)
@@ -1010,7 +1038,7 @@ class FeishuBotTests(unittest.TestCase):
         self.run_group("开启群总结", mentioned=True)
         self.run_group("青禾便当的联系人是林经理", message_id="om_one")
         self.run_group("立即总结", mentioned=True, message_id="om_now")
-        self.assertIn("阶段总结", self.channel.replies[-1][1]["text"])
+        self.assertIn("业务与联系人", self.channel.replies[-1][1]["text"])
 
         call_count = len(self.api.calls)
         self.run_group("暂停自动总结", mentioned=True, message_id="om_pause")
@@ -1040,7 +1068,7 @@ class FeishuBotTests(unittest.TestCase):
 
         asyncio.run(scenario())
 
-        self.assertIn("阶段总结", self.channel.replies[-1][1]["text"])
+        self.assertIn("业务与联系人", self.channel.replies[-1][1]["text"])
 
 
 if __name__ == "__main__":
