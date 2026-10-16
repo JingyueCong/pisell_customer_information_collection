@@ -483,6 +483,9 @@ class FeishuBotTests(unittest.TestCase):
         self.assertTrue(
             _is_group_profile_candidate("C260M 缺纸时没有声音提醒，客户已反馈")
         )
+        self.assertTrue(
+            _is_group_profile_candidate("https://u26197356.ct.sendgrid.net/click")
+        )
 
     def test_group_summary_explains_crm_result_and_specific_next_step(self) -> None:
         text = _group_summary_text(

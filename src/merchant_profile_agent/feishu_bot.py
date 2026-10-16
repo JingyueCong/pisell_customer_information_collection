@@ -533,6 +533,12 @@ def _is_group_profile_candidate(text: str, *, has_media: bool = False) -> bool:
         return False
     if has_media:
         return True
+    # A standalone public link can be durable merchant evidence. Keep it in the
+    # group draft so the URL reader can inspect it when the user asks for a
+    # summary or save; unsupported or irrelevant pages are still filtered by
+    # the analysis and explicit-confirmation boundary.
+    if re.search(r"https://", text, re.IGNORECASE):
+        return True
     profile_terms = (
         "项目进度",
         "飞书项目",
