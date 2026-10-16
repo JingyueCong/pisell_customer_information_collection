@@ -86,6 +86,37 @@ def _mql_like(value: str) -> str:
     return _mql_string(value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_"))
 
 
+_BUSINESS_SUFFIX_WORDS = {
+    "bakery",
+    "bar",
+    "cafe",
+    "café",
+    "coffee",
+    "kitchen",
+    "malatang",
+    "restaurant",
+    "shop",
+    "store",
+    "takeaway",
+}
+_BUSINESS_SUFFIXES = ("麻辣烫", "咖啡店", "咖啡馆", "餐厅", "餐馆", "饭店", "烘焙店")
+
+
+def _shortened_name_variants(name: str) -> list[str]:
+    variants: list[str] = []
+    words = name.split()
+    if len(words) >= 3 and words[-1].casefold().rstrip(".,") in _BUSINESS_SUFFIX_WORDS:
+        variants.append(" ".join(words[:-1]))
+    compact = name.strip()
+    for suffix in _BUSINESS_SUFFIXES:
+        if compact.endswith(suffix):
+            candidate = compact[: -len(suffix)].strip()
+            if len(candidate) >= 2:
+                variants.append(candidate)
+            break
+    return list(dict.fromkeys(variant for variant in variants if variant != name))
+
+
 def _scalar(value: Any) -> str | None:
     if isinstance(value, (str, int)) and str(value).strip():
         return str(value).strip()
@@ -235,6 +266,14 @@ class MeegleCrmResolver:
                 self._mql(f"`name` LIKE '%{_mql_like(merchant_name)}%'")
             )
             match_method = "fuzzy_name"
+        if not candidates and not lookup_hint:
+            for variant in _shortened_name_variants(merchant_name):
+                candidates = self._query(
+                    self._mql(f"`name` LIKE '%{_mql_like(variant)}%'")
+                )
+                if candidates:
+                    match_method = "shortened_name"
+                    break
         status = "unique" if len(candidates) == 1 else "ambiguous" if candidates else "not_found"
         return {
             "status": status,
@@ -253,8 +292,9 @@ class TicketBridgeCrmResolver:
         self.token = token
         self.timeout = timeout
 
-    def resolve(self, request: Mapping[str, Any]) -> dict[str, Any]:
-        merchant_name, lookup_hint = _validated_request(request)
+    def _resolve_once(
+        self, merchant_name: str, lookup_hint: str | None
+    ) -> dict[str, Any]:
         body = {"merchant_name": merchant_name}
         if lookup_hint:
             body["lookup_hint"] = lookup_hint
@@ -290,6 +330,22 @@ class TicketBridgeCrmResolver:
         ):
             raise CrmResolverUnavailable("CRM lookup returned an invalid response")
         return dict(crm)
+
+    def resolve(self, request: Mapping[str, Any]) -> dict[str, Any]:
+        merchant_name, lookup_hint = _validated_request(request)
+        result = self._resolve_once(merchant_name, lookup_hint)
+        if result.get("status") != "not_found" or lookup_hint:
+            return result
+        original_result = result
+        for variant in _shortened_name_variants(merchant_name):
+            result = self._resolve_once(variant, None)
+            if result.get("status") == "not_found":
+                continue
+            result["query"] = {"merchant_name": merchant_name, "lookup_hint": None}
+            result["matched_query"] = variant
+            result["match_method"] = "shortened_name"
+            return result
+        return original_result
 
 
 def create_crm_resolver(settings: Settings) -> CrmResolver:

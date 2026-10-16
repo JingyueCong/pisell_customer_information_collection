@@ -529,8 +529,19 @@ def _group_summary_text(result: dict[str, Any]) -> str:
 
     gaps = result.get("information_gaps")
     add_section("待确认", gaps)
-    if result.get("next_question") and not gaps:
-        sections.append("待确认：\n- " + str(result["next_question"]))
+    if result.get("next_question"):
+        sections.append("下一步：\n- " + str(result["next_question"]))
+
+    crm = result.get("crm")
+    if isinstance(crm, dict) and crm.get("status") == "unique":
+        candidates = crm.get("candidates")
+        candidate = candidates[0] if isinstance(candidates, list) and candidates else None
+        if isinstance(candidate, dict):
+            label = str(candidate.get("name") or "已找到客户")
+            identifier = str(candidate.get("work_item_id") or "").strip()
+            sections.append(
+                f"CRM：已匹配 {label}" + (f"（{identifier}）" if identifier else "")
+            )
 
     if not sections:
         sections.append("本段没有需要记录的商户信息。")
@@ -1260,6 +1271,22 @@ class FeishuBotController:
         return True
 
     async def _save(self, message: Any, session: Session, confirmation: str) -> None:
+        resolution = session.crm_resolution
+        if (
+            session.merchant
+            and isinstance(resolution, dict)
+            and resolution.get("status") in {"not_found", "ambiguous"}
+        ):
+            # CRM data and matching rules may change after the preview. Refresh
+            # unresolved matches on an explicit save attempt instead of trapping
+            # the user behind a stale not_found/ambiguous result.
+            session.current_profile_loaded = False
+            try:
+                await self._analyze_session(session)
+            except MerchantApiError:
+                LOGGER.exception("CRM refresh before save failed")
+                await self._reply(message, "CRM 查询暂不可用，草稿已保留，请稍后重试。")
+                return
         preview = session.preview or {}
         merchant = session.merchant
         updates = preview.get("profile_updates")

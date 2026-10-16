@@ -12,6 +12,7 @@ from pathlib import Path
 from merchant_profile_agent.feishu_bot import (
     FeishuBotController,
     SessionStore,
+    _group_summary_text,
     _messages_for_analysis,
 )
 from merchant_profile_agent.video import VideoEvidence
@@ -286,6 +287,36 @@ class CrmAwareApi(FakeApi):
         }
 
 
+class RefreshingCrmApi(FakeApi):
+    def __init__(self) -> None:
+        super().__init__()
+        self.read_count = 0
+
+    def post(self, path, payload):
+        if path != "/v1/profile/read":
+            return super().post(path, payload)
+        self.calls.append((path, copy.deepcopy(payload)))
+        self.read_count += 1
+        unique = self.read_count >= 2
+        return {
+            "profile": {"fields": {}, "event_count": 0},
+            "crm": {
+                "status": "unique" if unique else "not_found",
+                "candidates": (
+                    [
+                        {
+                            "work_item_id": "6856334446",
+                            "name": "9262 U Bowl Melbourne Central （海底捞）",
+                        }
+                    ]
+                    if unique
+                    else []
+                ),
+                "read_only": True,
+            },
+        }
+
+
 class FeishuBotTests(unittest.TestCase):
     def setUp(self) -> None:
         self.api = FakeApi()
@@ -360,6 +391,22 @@ class FeishuBotTests(unittest.TestCase):
         self.assertEqual(len(bounded[1]["images"]), 1)
         self.assertEqual(len(bounded[0]["images"]), 1)
         self.assertEqual(len(messages[0]["images"]), 4)
+
+    def test_group_summary_explains_crm_result_and_specific_next_step(self) -> None:
+        text = _group_summary_text(
+            {
+                "merchant": {"name": "U Bowl Malatang"},
+                "summary_points": ["识别到点餐屏资料"],
+                "information_gaps": ["CRM 客户唯一匹配"],
+                "next_question": "CRM 中未找到“U Bowl Malatang”，请补充店铺 ID。",
+                "profile_updates": [],
+                "conflicts": [],
+                "save_readiness": "missing_info",
+            }
+        )
+
+        self.assertIn("CRM 中未找到", text)
+        self.assertIn("请补充店铺 ID", text)
 
     def test_image_message_is_downloaded_analyzed_and_not_persisted_as_base64(self) -> None:
         message = Message(
@@ -605,6 +652,21 @@ class FeishuBotTests(unittest.TestCase):
 
         self.assertNotIn("/v1/profile/commit", [path for path, _ in api.calls])
         self.assertIn("不会自动新建 CRM", self.channel.replies[-1][1]["text"])
+
+    def test_save_refreshes_a_previous_crm_miss_and_uses_new_unique_match(self) -> None:
+        api = RefreshingCrmApi()
+        bot = FeishuBotController(api=api, channel=self.channel, sessions=SessionStore())
+
+        async def scenario() -> None:
+            await bot.on_message(Message("U Bowl Malatang 的联系人是林经理"))
+            self.assertIn("CRM 中未找到", self.channel.replies[-1][1]["text"])
+            await bot.on_message(Message("保存吧", message_id="om_save"))
+
+        asyncio.run(scenario())
+
+        commit = next(payload for path, payload in api.calls if path == "/v1/profile/commit")
+        self.assertEqual(commit["merchant"]["id"], "6856334446")
+        self.assertIn("已写入", self.channel.replies[-1][1]["text"])
 
     def test_ambiguous_crm_match_lists_candidates(self) -> None:
         api = CrmAwareApi("ambiguous")
