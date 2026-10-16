@@ -439,6 +439,18 @@ def _is_group_profile_candidate(text: str, *, has_media: bool = False) -> bool:
     )
     if any(term in compact for term in meta_terms):
         return False
+    casual_phone_terms = (
+        "有空吗",
+        "电话聊",
+        "打电话",
+        "电话沟通",
+        "电话会议",
+        "电话说",
+        "通个电话",
+        "约个电话",
+    )
+    if not has_media and any(term in compact for term in casual_phone_terms):
+        return False
     if has_media:
         return True
     profile_terms = (
@@ -452,7 +464,6 @@ def _is_group_profile_candidate(text: str, *, has_media: bool = False) -> bool:
         "店长",
         "经理",
         "负责人",
-        "电话",
         "手机",
         "邮箱",
         "email",
@@ -508,7 +519,24 @@ def _is_group_profile_candidate(text: str, *, has_media: bool = False) -> bool:
         "restaurant",
         "cafe",
     )
-    return any(term in compact for term in profile_terms)
+    if any(term in compact for term in profile_terms):
+        return True
+    if "电话" not in compact:
+        return False
+    phone_fact_cues = (
+        "电话是",
+        "联系电话",
+        "电话号码",
+        "商户电话",
+        "门店电话",
+        "客户电话",
+        "他的电话",
+        "她的电话",
+        "他们电话",
+    )
+    return any(term in compact for term in phone_fact_cues) or bool(
+        re.search(r"\d{6,}", compact)
+    )
 
 
 def _explicitly_mentions_merchant(
@@ -1180,7 +1208,10 @@ class FeishuBotController:
             await self._reply(message, "服务暂不可用，未写入知识库。")
 
     async def _analyze_session(self, session: Session) -> dict[str, Any]:
-        if session.merchant and not session.current_profile_loaded:
+        crm_unresolved = isinstance(session.crm_resolution, dict) and session.crm_resolution.get(
+            "status"
+        ) in {"not_found", "ambiguous"}
+        if session.merchant and (not session.current_profile_loaded or crm_unresolved):
             read = await self._post(
                 "/v1/profile/read",
                 {

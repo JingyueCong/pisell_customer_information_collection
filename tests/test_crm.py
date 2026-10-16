@@ -255,6 +255,59 @@ class CrmResolverTests(unittest.TestCase):
         self.assertEqual(json.loads(second_request.data), {"merchant_name": "U Bowl"})
 
     @patch("merchant_profile_agent.crm.urllib.request.urlopen")
+    def test_ticket_bridge_drops_store_code_and_does_not_treat_it_as_work_item_id(
+        self, urlopen
+    ) -> None:
+        def response(payload):
+            value = MagicMock()
+            value.read.return_value = json.dumps(payload).encode("utf-8")
+            value.__enter__.return_value = value
+            return value
+
+        urlopen.side_effect = [
+            response(
+                {
+                    "ok": True,
+                    "crm": {"status": "not_found", "candidates": [], "read_only": True},
+                }
+            ),
+            response(
+                {
+                    "ok": True,
+                    "crm": {
+                        "status": "unique",
+                        "candidates": [
+                            {
+                                "work_item_id": "6856334446",
+                                "name": "9262 U Bowl Melbourne Central （海底捞）",
+                            }
+                        ],
+                        "read_only": True,
+                    },
+                }
+            ),
+        ]
+        resolver = TicketBridgeCrmResolver(
+            base_url="http://127.0.0.1:8787",
+            token="a" * 32,
+        )
+
+        result = resolver.resolve(
+            {
+                "merchant_name": "9262 U Bowl Melbourne Central（海底捞）",
+                "merchant_id": "9262",
+            }
+        )
+
+        self.assertEqual(result["status"], "unique")
+        self.assertEqual(result["candidates"][0]["work_item_id"], "6856334446")
+        retry = json.loads(urlopen.call_args_list[1].args[0].data)
+        self.assertEqual(
+            retry,
+            {"merchant_name": "U Bowl Melbourne Central（海底捞）"},
+        )
+
+    @patch("merchant_profile_agent.crm.urllib.request.urlopen")
     def test_ticket_bridge_rechecks_the_same_bound_id_with_shortened_name(
         self, urlopen
     ) -> None:

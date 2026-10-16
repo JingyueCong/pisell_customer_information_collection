@@ -104,17 +104,29 @@ _BUSINESS_SUFFIXES = ("麻辣烫", "咖啡店", "咖啡馆", "餐厅", "餐馆",
 
 def _shortened_name_variants(name: str) -> list[str]:
     variants: list[str] = []
-    words = name.split()
-    if len(words) >= 3 and words[-1].casefold().rstrip(".,") in _BUSINESS_SUFFIX_WORDS:
-        variants.append(" ".join(words[:-1]))
-    compact = name.strip()
-    for suffix in _BUSINESS_SUFFIXES:
-        if compact.endswith(suffix):
-            candidate = compact[: -len(suffix)].strip()
-            if len(candidate) >= 2:
-                variants.append(candidate)
-            break
-    return list(dict.fromkeys(variant for variant in variants if variant != name))
+
+    def add(value: str) -> None:
+        value = re.sub(r"\s+", " ", value).strip()
+        if value and value != name and value not in variants:
+            variants.append(value)
+
+    compact = re.sub(r"\s+", " ", name).strip()
+    without_store_code = re.sub(r"^\d{2,8}\s+", "", compact).strip()
+    add(without_store_code)
+    for value in (compact, without_store_code):
+        without_parenthetical = re.sub(r"\s*[（(][^）)]{1,80}[）)]\s*", " ", value)
+        add(without_parenthetical)
+    for value in [compact, *variants]:
+        words = value.split()
+        if len(words) >= 3 and words[-1].casefold().rstrip(".,") in _BUSINESS_SUFFIX_WORDS:
+            add(" ".join(words[:-1]))
+        for suffix in _BUSINESS_SUFFIXES:
+            if value.endswith(suffix):
+                candidate = value[: -len(suffix)].strip()
+                if len(candidate) >= 2:
+                    add(candidate)
+                break
+    return variants
 
 
 def _normalized_name(name: str) -> str:
@@ -349,9 +361,10 @@ class TicketBridgeCrmResolver:
         if result.get("status") != "not_found":
             return result
         original_result = result
-        if lookup_hint:
-            if not re.fullmatch(r"\d{6,30}", lookup_hint):
-                return original_result
+        work_item_hint = bool(
+            lookup_hint and re.fullmatch(r"\d{6,30}", lookup_hint)
+        )
+        if lookup_hint and work_item_hint:
             for variant in _shortened_name_variants(merchant_name):
                 result = self._resolve_once(variant, lookup_hint)
                 candidates = result.get("candidates")

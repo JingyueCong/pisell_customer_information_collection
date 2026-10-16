@@ -851,6 +851,54 @@ class FeishuBotTests(unittest.TestCase):
     def test_group_profile_candidate_accepts_pronoun_address(self) -> None:
         self.assertTrue(_is_group_profile_candidate("他的地址是 123 Collins Street"))
 
+    def test_group_casual_phone_chat_is_not_collected(self) -> None:
+        self.run_group("你有空吗我们电话聊", message_id="om_phone_chat")
+
+        session = self.sessions.get("oc_group:group:root")
+        self.assertEqual(session.group_pending_count, 0)
+        self.assertEqual(session.group_buffer, [])
+        self.assertEqual(self.api.calls, [])
+
+    def test_group_phone_number_is_still_collected(self) -> None:
+        self.run_group("他的电话是 0451100323", message_id="om_phone_fact")
+
+        session = self.sessions.get("oc_group:group:root")
+        self.assertEqual(session.group_pending_count, 1)
+
+    def test_group_rechecks_a_stale_crm_miss_before_analysis(self) -> None:
+        api = CrmAwareApi("unique")
+        sessions = SessionStore()
+        session = sessions.get("oc_refresh:group:root")
+        session.merchant = {
+            "name": "9262 U Bowl Melbourne Central（海底捞）",
+            "id": "9262",
+        }
+        session.current_profile_loaded = True
+        session.crm_resolution = {"status": "not_found", "candidates": []}
+        bot = FeishuBotController(
+            api=api,  # type: ignore[arg-type]
+            channel=self.channel,
+            sessions=sessions,
+            group_message_threshold=1,
+            group_idle_seconds=600,
+            group_idle_min_messages=1,
+        )
+
+        asyncio.run(
+            bot.on_message(
+                Message(
+                    "他的地址是 123 Collins Street",
+                    message_id="om_refresh",
+                    chat_id="oc_refresh",
+                    chat_type="group",
+                )
+            )
+        )
+
+        self.assertEqual(api.calls[0][0], "/v1/profile/read")
+        self.assertEqual(session.merchant["id"], "987654321")
+        self.assertEqual(session.crm_resolution["status"], "unique")
+
     def test_group_save_prunes_old_meta_discussion_from_buffer(self) -> None:
         session = self.sessions.get("oc_group:group:root")
         session.group_buffer = [
