@@ -587,7 +587,7 @@ class FeishuBotTests(unittest.TestCase):
         self.assertEqual(processor.calls, [])
         self.assertIn("不能超过 5 分钟", self.channel.replies[-1][1]["text"])
 
-    def test_group_video_is_not_downloaded_before_recording_is_enabled(self) -> None:
+    def test_group_video_is_not_downloaded_while_recording_is_paused(self) -> None:
         processor = FakeVideoProcessor()
         bot = FeishuBotController(
             api=self.api,  # type: ignore[arg-type]
@@ -596,6 +596,17 @@ class FeishuBotTests(unittest.TestCase):
             video_processor=processor,
         )
 
+        asyncio.run(
+            bot.on_message(
+                Message(
+                    "暂停自动总结",
+                    message_id="om_pause",
+                    chat_id="oc_video_group",
+                    chat_type="group",
+                    mentioned_bot=True,
+                )
+            )
+        )
         asyncio.run(
             bot.on_message(
                 Message(
@@ -637,6 +648,25 @@ class FeishuBotTests(unittest.TestCase):
             self.assertTrue(restored.group_summary_enabled)
             self.assertEqual(restored.group_pending_count, 1)
             self.assertEqual(len(restored.group_buffer), 1)
+
+    def test_session_store_migrates_old_groups_to_default_on(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = Path(directory) / "sessions.json"
+            state_path.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "sessions": {
+                            "oc_old:group:root": {"group_summary_enabled": False}
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            restored = SessionStore(state_path=state_path).get("oc_old:group:root")
+
+            self.assertTrue(restored.group_summary_enabled)
 
     def test_long_direct_chat_keeps_api_request_within_message_limit(self) -> None:
         for index in range(45):
@@ -762,17 +792,20 @@ class FeishuBotTests(unittest.TestCase):
         self.assertIn("CRM 101", reply)
         self.assertIn("CRM 102", reply)
 
-    def test_group_messages_are_ignored_until_explicit_enable(self) -> None:
+    def test_group_messages_are_collected_without_explicit_enable(self) -> None:
         self.run_group("青禾便当的联系人是林经理")
 
         self.assertEqual(self.api.calls, [])
         self.assertEqual(self.channel.replies, [])
+        session = self.sessions.get("oc_group:group:root")
+        self.assertTrue(session.group_summary_enabled)
+        self.assertEqual(session.group_pending_count, 1)
 
-    def test_group_mentioned_message_before_enable_explains_how_to_start(self) -> None:
+    def test_group_mentioned_save_without_data_does_not_write(self) -> None:
         self.run_group("保存吧", mentioned=True)
 
         self.assertEqual(self.api.calls, [])
-        self.assertIn("开始记录", self.channel.replies[-1][1]["text"])
+        self.assertIn("未识别到商户名称", self.channel.replies[-1][1]["text"])
 
     def test_group_start_recording_alias_and_save_flush_pending_messages(self) -> None:
         self.bot = FeishuBotController(
@@ -821,10 +854,10 @@ class FeishuBotTests(unittest.TestCase):
                         )
                     )
                 )
-                self.assertIn("自动总结已开启", channel.replies[-1][1]["text"])
+                self.assertIn("长期记录", channel.replies[-1][1]["text"])
 
-    def test_group_negative_or_incidental_recording_language_does_not_start(self) -> None:
-        examples = ["不要开始记录", "请停止记录", "门店开始记录每日销售额"]
+    def test_group_negative_recording_language_pauses_collection(self) -> None:
+        examples = ["不要开始记录", "请停止记录"]
         for index, text in enumerate(examples):
             with self.subTest(text=text):
                 channel = FakeChannel()
@@ -843,7 +876,32 @@ class FeishuBotTests(unittest.TestCase):
                         )
                     )
                 )
-                self.assertIn("尚未开始记录", channel.replies[-1][1]["text"])
+                self.assertIn("已暂停", channel.replies[-1][1]["text"])
+                session = bot.sessions.get(f"oc_negative_{index}:group:root")
+                self.assertFalse(session.group_summary_enabled)
+
+    def test_incidental_recording_language_is_collected_as_normal_content(self) -> None:
+        self.run_group("门店开始记录每日销售额")
+
+        self.assertEqual(self.api.calls, [])
+        self.assertEqual(self.channel.replies, [])
+        session = self.sessions.get("oc_group:group:root")
+        self.assertEqual(session.group_pending_count, 1)
+
+    def test_group_pause_persists_and_continue_resumes(self) -> None:
+        self.run_group("暂停自动总结", mentioned=True, message_id="om_pause")
+        self.run_group("这条不应记录", message_id="om_ignored")
+
+        session = self.sessions.get("oc_group:group:root")
+        self.assertFalse(session.group_summary_enabled)
+        self.assertEqual(session.group_pending_count, 0)
+
+        self.run_group("继续记录", mentioned=True, message_id="om_resume")
+        self.run_group("青禾便当联系人是林经理", message_id="om_contact")
+
+        self.assertTrue(session.group_summary_enabled)
+        self.assertEqual(session.group_pending_count, 1)
+        self.assertIn("长期记录", self.channel.replies[-1][1]["text"])
 
     def test_group_summarizes_shared_chat_after_threshold(self) -> None:
         self.run_group("开启自动总结", mentioned=True)

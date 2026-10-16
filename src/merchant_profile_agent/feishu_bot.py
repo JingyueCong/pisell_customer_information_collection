@@ -24,13 +24,23 @@ DISCARD_COMMANDS = {"放弃本次对话", "/discard"}
 HELP_COMMANDS = {"/help", "帮助"}
 GROUP_ENABLE_COMMANDS = {
     "开始记录",
+    "继续记录",
+    "恢复记录",
     "开始收集",
     "开始群记录",
     "开启自动总结",
     "开启群总结",
     "启用自动总结",
 }
-GROUP_PAUSE_COMMANDS = {"暂停自动总结", "暂停群总结", "关闭自动总结"}
+GROUP_PAUSE_COMMANDS = {
+    "暂停自动总结",
+    "暂停群总结",
+    "关闭自动总结",
+    "暂停记录",
+    "停止记录",
+    "不要记录",
+    "不要开始记录",
+}
 GROUP_SUMMARIZE_COMMANDS = {"立即总结", "现在总结", "总结本段"}
 NATURAL_SAVE_CONFIRMATIONS = {
     "结束并保存",
@@ -161,7 +171,9 @@ class Session:
     crm_resolution: dict[str, Any] | None = None
     preview: dict[str, Any] | None = None
     last_documents: list[dict[str, str]] = field(default_factory=list)
-    group_summary_enabled: bool = False
+    # Group collection is long-running by default. It only writes after an
+    # explicit @bot save command; this flag is the user's persisted pause state.
+    group_summary_enabled: bool = True
     group_buffer: list[dict[str, Any]] = field(default_factory=list)
     group_pending_count: int = 0
     group_generation: int = 0
@@ -262,7 +274,7 @@ class SessionStore:
         if self.state_path is None:
             return
         payload = {
-            "version": 1,
+            "version": 2,
             "sessions": {
                 key: {
                     name: getattr(session, name)
@@ -285,6 +297,7 @@ class SessionStore:
             return
         try:
             payload = json.loads(self.state_path.read_text(encoding="utf-8"))
+            state_version = int(payload.get("version", 1))
             raw_sessions = payload.get("sessions", {})
             if not isinstance(raw_sessions, Mapping):
                 raise ValueError("sessions must be an object")
@@ -296,6 +309,11 @@ class SessionStore:
                     for name in self._SERIALIZED_FIELDS
                     if name in raw
                 }
+                # Before version 2, false also meant "this group has never
+                # opted in". Version 2 makes group collection default-on, so
+                # old false values must not leave existing groups disabled.
+                if state_version < 2:
+                    values["group_summary_enabled"] = True
                 self._sessions[key] = Session(**values)
             self.prune()
         except (OSError, ValueError, TypeError, json.JSONDecodeError):
@@ -375,6 +393,19 @@ def _is_group_enable_intent(text: str) -> bool:
     return any(
         phrase in normalized
         for phrase in ("可以开始了", "现在开始吧", "准备好了开始吧", "开始工作吧")
+    )
+
+
+def _is_group_pause_intent(text: str) -> bool:
+    normalized = _normalize_intent_text(text)
+    if normalized in GROUP_PAUSE_COMMANDS:
+        return True
+    if not normalized or len(normalized) > 24:
+        return False
+    pause_terms = ("暂停", "停止", "关闭", "取消", "不要", "别", "无需", "不用")
+    record_terms = ("记录", "收集", "整理", "总结", "归纳", "录入")
+    return any(term in normalized for term in pause_terms) and any(
+        term in normalized for term in record_terms
     )
 
 
@@ -929,7 +960,7 @@ class FeishuBotController:
                     if bool(getattr(message, "mentioned_bot", False)):
                         await self._reply(
                             message,
-                            "本群尚未开始记录。请先 @机器人 回复“开始记录”。",
+                            "本群记录已暂停。请 @机器人 回复“继续记录”恢复。",
                         )
                     return
             try:
@@ -1134,27 +1165,27 @@ class FeishuBotController:
         session = self.sessions.get(key)
         mentioned = bool(getattr(message, "mentioned_bot", False))
 
+        if mentioned and _is_group_pause_intent(text):
+            session.group_summary_enabled = False
+            session.clear_group_buffer()
+            await self._reply(message, "自动总结已暂停；恢复时请 @机器人 回复“继续记录”。")
+            return
         if mentioned and _is_group_enable_intent(text):
             session.group_summary_enabled = True
             await self._reply(
                 message,
-                "自动总结已开启：20 条有效消息，或有新资料后安静 10 分钟。"
-                "群消息会发送给 AI 生成摘要；不会自动写知识库。",
+                "本群已长期记录：20 条有效消息，或有新资料后安静 10 分钟自动总结。"
+                "只有明确 @机器人 回复“保存吧”才会写入知识库。",
             )
             return
         if not session.group_summary_enabled:
             if mentioned and _matches_command(text, HELP_COMMANDS):
-                await self._reply(message, "请 @机器人 回复“开始记录”。")
+                await self._reply(message, "本群记录已暂停。请 @机器人 回复“继续记录”恢复。")
             elif mentioned:
                 await self._reply(
                     message,
-                    "本群尚未开始记录。请先 @机器人 回复“开始记录”。",
+                    "本群记录已暂停。请 @机器人 回复“继续记录”恢复。",
                 )
-            return
-        if mentioned and _matches_command(text, GROUP_PAUSE_COMMANDS):
-            session.group_summary_enabled = False
-            session.clear_group_buffer()
-            await self._reply(message, "自动总结已暂停。")
             return
         if mentioned and _matches_command(text, GROUP_SUMMARIZE_COMMANDS):
             if session.group_followup_pending:
@@ -1172,7 +1203,8 @@ class FeishuBotController:
         if mentioned and _matches_command(text, HELP_COMMANDS):
             await self._reply(
                 message,
-                "群总结已开启。可用：立即总结、暂停自动总结、保存吧、/discard。",
+                "本群默认长期记录。普通消息只进入草稿；可用：立即总结、"
+                "暂停自动总结、保存吧、/discard。只有 @机器人 保存吧才会写知识库。",
             )
             return
         if mentioned and _matches_command(text, DISCARD_COMMANDS):
