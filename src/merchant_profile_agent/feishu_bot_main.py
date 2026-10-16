@@ -9,6 +9,7 @@ from pathlib import Path
 from .api_client import MerchantApiClient
 from .feishu_bot import FeishuBotController, SessionStore
 from .settings import ConfigurationError, load_env_file
+from .video import OpenAIAudioTranscriber, OpenAIVideoProcessor
 
 
 def _required(name: str) -> str:
@@ -86,6 +87,22 @@ def build_channel():
         / "merchant-profile-feishu-sessions.json"
     )
     configured_session_store = os.environ.get("FEISHU_BOT_SESSION_STORE", "").strip()
+    video_max_bytes = _integer(
+        "FEISHU_VIDEO_MAX_BYTES", 25 * 1024 * 1024, 1024, 25 * 1024 * 1024
+    )
+    video_max_seconds = _integer("FEISHU_VIDEO_MAX_DURATION_SECONDS", 300, 1, 300)
+    video_processor = OpenAIVideoProcessor(
+        OpenAIAudioTranscriber(
+            _required("OPENAI_API_KEY"),
+            model=os.environ.get(
+                "MERCHANT_AGENT_TRANSCRIPTION_MODEL", "gpt-transcribe"
+            ).strip()
+            or "gpt-transcribe",
+            timeout=_integer("FEISHU_VIDEO_TRANSCRIPTION_TIMEOUT", 180, 10, 600),
+        ),
+        maximum_bytes=video_max_bytes,
+        maximum_duration_seconds=video_max_seconds,
+    )
     controller = FeishuBotController(
         api=api,
         channel=channel,
@@ -102,6 +119,9 @@ def build_channel():
         group_idle_min_messages=_integer(
             "FEISHU_GROUP_SUMMARY_IDLE_MIN_MESSAGES", 1, 1, 50
         ),
+        video_processor=video_processor,
+        maximum_video_bytes=video_max_bytes,
+        maximum_video_duration_seconds=video_max_seconds,
     )
     channel.on("message", controller.on_message)
     channel.on("error", lambda error: logging.getLogger(__name__).error("channel error: %s", error))

@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Mapping, Protocol
 
 from .api_client import MerchantApiClient, MerchantApiError
+from .video import VideoEvidence, VideoProcessingError
 
 
 LOGGER = logging.getLogger("merchant_profile_agent.feishu_bot")
@@ -127,6 +128,23 @@ class ReplyChannel(Protocol):
         resource_type: str = "image",
         message_id: str | None = None,
     ) -> bytes | None: ...
+
+
+class VideoProcessor(Protocol):
+    def process(
+        self,
+        data: bytes,
+        *,
+        file_name: str,
+        duration_ms: int | None = None,
+    ) -> VideoEvidence: ...
+
+
+@dataclass(frozen=True)
+class VideoResource:
+    file_key: str
+    file_name: str
+    duration_ms: int | None
 
 
 @dataclass
@@ -576,6 +594,54 @@ def _without_image_placeholders(text: str) -> str:
     return re.sub(r"[ \t]+", " ", text).strip()
 
 
+def _video_resource(message: Any) -> VideoResource | None:
+    content = getattr(message, "content", None)
+    kind = str(_resource_value(content, "kind") or "").lower()
+    if kind == "media":
+        file_key = _resource_value(content, "file_key")
+        if isinstance(file_key, str) and file_key:
+            return VideoResource(
+                file_key=file_key,
+                file_name=str(_resource_value(content, "file_name") or "video.mp4"),
+                duration_ms=_positive_int(_resource_value(content, "duration_ms")),
+            )
+
+    for resource in getattr(message, "resources", []) or []:
+        resource_type = str(_resource_value(resource, "type") or "").lower()
+        file_name = str(
+            _resource_value(resource, "file_name")
+            or _resource_value(resource, "name")
+            or "video.mp4"
+        )
+        is_video_file = Path(file_name).suffix.lower() in {".mp4", ".mov", ".m4v", ".webm"}
+        if resource_type not in {"video", "media"} and not (
+            resource_type == "file" and is_video_file
+        ):
+            continue
+        file_key = _resource_value(resource, "file_key")
+        if isinstance(file_key, str) and file_key:
+            return VideoResource(
+                file_key=file_key,
+                file_name=file_name,
+                duration_ms=_positive_int(_resource_value(resource, "duration_ms")),
+            )
+    return None
+
+
+def _positive_int(value: Any) -> int | None:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
+
+
+def _without_video_placeholders(text: str) -> str:
+    text = re.sub(r"<media\b[^>]*?/?>", " ", text, flags=re.IGNORECASE)
+    text = re.sub(r"\[(?:video|视频)\](?:\([^)]*\))?", " ", text, flags=re.IGNORECASE)
+    return re.sub(r"[ \t]+", " ", text).strip()
+
+
 def _image_mime_type(data: bytes) -> str | None:
     if data.startswith(b"\x89PNG\r\n\x1a\n"):
         return "image/png"
@@ -600,6 +666,9 @@ class FeishuBotController:
         group_message_threshold: int = 20,
         group_idle_seconds: int = 600,
         group_idle_min_messages: int = 1,
+        video_processor: VideoProcessor | None = None,
+        maximum_video_bytes: int = 25 * 1024 * 1024,
+        maximum_video_duration_seconds: int = 300,
     ) -> None:
         self.api = api
         self.channel = channel
@@ -607,6 +676,9 @@ class FeishuBotController:
         self.group_message_threshold = group_message_threshold
         self.group_idle_seconds = group_idle_seconds
         self.group_idle_min_messages = group_idle_min_messages
+        self.video_processor = video_processor
+        self.maximum_video_bytes = maximum_video_bytes
+        self.maximum_video_duration_seconds = maximum_video_duration_seconds
 
     async def _post(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
         return await asyncio.to_thread(self.api.post, path, payload)
@@ -658,17 +730,104 @@ class FeishuBotController:
             image_data_urls.append(f"data:{mime_type};base64,{encoded}")
         return image_data_urls
 
+    async def _download_video(self, message: Any) -> VideoEvidence | None:
+        resource = _video_resource(message)
+        if resource is None:
+            return None
+        if self.video_processor is None:
+            raise VideoProcessingError("当前服务尚未启用视频处理。")
+        if (
+            resource.duration_ms is not None
+            and resource.duration_ms > self.maximum_video_duration_seconds * 1_000
+        ):
+            raise VideoProcessingError(
+                f"视频不能超过 {self.maximum_video_duration_seconds // 60} 分钟。"
+            )
+        try:
+            data = await self.channel.download_resource(
+                resource.file_key,
+                resource_type="file",
+                message_id=str(getattr(message, "message_id", "") or "") or None,
+            )
+        except Exception as exc:
+            LOGGER.warning(
+                "video resource download raised for message=%s key=%s: %s",
+                str(getattr(message, "message_id", "") or "unknown"),
+                resource.file_key,
+                exc,
+            )
+            raise VideoProcessingError("视频下载失败，请重新发送。") from exc
+        if not isinstance(data, bytes) or not data:
+            raise VideoProcessingError("视频下载失败，请重新发送。")
+        if len(data) > self.maximum_video_bytes:
+            raise VideoProcessingError(
+                f"视频不能超过 {self.maximum_video_bytes // (1024 * 1024)} MB。"
+            )
+        try:
+            return await asyncio.to_thread(
+                self.video_processor.process,
+                data,
+                file_name=resource.file_name,
+                duration_ms=resource.duration_ms,
+            )
+        except VideoProcessingError:
+            raise
+        except Exception as exc:
+            LOGGER.exception("unexpected video processing failure")
+            raise VideoProcessingError("服务器暂时无法处理视频，请稍后重试。") from exc
+
     async def on_message(self, message: Any) -> None:
         raw_text = str(getattr(message, "body_text", "") or "").strip()
-        if not raw_text and not _image_resource_keys(message):
+        has_video = _video_resource(message) is not None
+        image_keys = _image_resource_keys(message)
+        if not raw_text and not image_keys and not has_video:
             return
         try:
+            if _is_group_message(message) and (image_keys or has_video):
+                group_session = self.sessions.get(_session_key(message))
+                if not group_session.group_summary_enabled:
+                    if bool(getattr(message, "mentioned_bot", False)):
+                        await self._reply(
+                            message,
+                            "本群尚未开始记录。请先 @机器人 回复“开始记录”。",
+                        )
+                    return
             try:
                 images = await self._download_images(message)
+                video = await self._download_video(message) if has_video else None
             except ImageInputError as exc:
                 await self._reply(message, str(exc))
                 return
-            text = _without_image_placeholders(raw_text)
+            except VideoProcessingError as exc:
+                LOGGER.warning(
+                    "video processing rejected message=%s: %s",
+                    str(getattr(message, "message_id", "") or "unknown"),
+                    exc,
+                )
+                await self._reply(message, f"视频处理失败：{exc}")
+                return
+            text = _without_video_placeholders(_without_image_placeholders(raw_text))
+            if video is not None:
+                if video.transcript:
+                    text = "\n".join(
+                        part
+                        for part in (
+                            text,
+                            "视频语音转写（请只提取明确事实）：\n" + video.transcript,
+                        )
+                        if part
+                    )
+                if video.frames:
+                    images.extend(video.frames)
+                    images = images[:MAX_IMAGES_PER_MESSAGE]
+                    text = "\n".join(
+                        part
+                        for part in (
+                            text,
+                            "已附视频关键帧，请结合画面中明确可见的信息进行提取。",
+                        )
+                        if part
+                    )
             if images and not text:
                 text = "用户上传了截图，请提取其中明确可见且适合客户档案的有用信息。"
             if not text:
@@ -692,6 +851,7 @@ class FeishuBotController:
                 message,
                 "发送商户名称和要记录的资料。"
                 "\n- 可直接发送截图，我会提取其中明确可见的有用信息"
+                "\n- 可发送 5 分钟、25 MB 以内的视频，我会转写语音并读取关键帧"
                 "\n- 可说“没问题，保存吧”或“结束并保存”"
                 "\n- /discard：放弃草稿",
             )

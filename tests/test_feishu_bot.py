@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from merchant_profile_agent.feishu_bot import FeishuBotController, SessionStore
+from merchant_profile_agent.video import VideoEvidence
 
 
 @dataclass
@@ -44,6 +45,22 @@ class FakeChannel:
         self.downloads.append((file_key, resource_type, message_id))
         return base64.b64decode(
             "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+        )
+
+
+class FakeVideoProcessor:
+    def __init__(self) -> None:
+        self.calls = []
+
+    def process(self, data, *, file_name, duration_ms=None):
+        self.calls.append((data, file_name, duration_ms))
+        frame = (
+            "data:image/jpeg;base64,"
+            + base64.b64encode(b"\xff\xd8\xfftest-frame").decode("ascii")
+        )
+        return VideoEvidence(
+            transcript="汪汪咖啡店店长是 Lily，电话 0451100323。",
+            frames=[frame],
         )
 
 
@@ -361,6 +378,100 @@ class FeishuBotTests(unittest.TestCase):
             self.channel.downloads,
             [("img_real_raw_key", "image", "om_raw_image")],
         )
+
+    def test_video_is_transcribed_and_key_frames_are_analyzed_but_not_committed(self) -> None:
+        processor = FakeVideoProcessor()
+        bot = FeishuBotController(
+            api=self.api,  # type: ignore[arg-type]
+            channel=self.channel,
+            sessions=SessionStore(),
+            video_processor=processor,
+        )
+        message = Message(
+            "<media />",
+            message_id="om_video",
+            content={
+                "kind": "media",
+                "file_key": "file_video",
+                "file_name": "merchant-tour.mp4",
+                "duration_ms": 45_000,
+            },
+        )
+
+        asyncio.run(bot.on_message(message))
+
+        self.assertEqual(self.channel.downloads, [("file_video", "file", "om_video")])
+        self.assertEqual(processor.calls[0][1:], ("merchant-tour.mp4", 45_000))
+        analyze = next(payload for path, payload in self.api.calls if path == "/v1/profile/analyze")
+        analyzed_message = analyze["messages"][0]
+        self.assertIn("视频语音转写", analyzed_message["content"])
+        self.assertIn("0451100323", analyzed_message["content"])
+        self.assertTrue(analyzed_message["images"][0].startswith("data:image/jpeg;base64,"))
+
+        asyncio.run(bot.on_message(Message("保存吧", message_id="om_save")))
+        commit = next(payload for path, payload in self.api.calls if path == "/v1/profile/commit")
+        self.assertNotIn("images", commit["messages"][0])
+        self.assertIn(
+            "feishu://chat/oc_test/message/om_video",
+            commit["messages"][0]["source_ref"],
+        )
+
+    def test_video_over_five_minutes_is_rejected_before_download(self) -> None:
+        processor = FakeVideoProcessor()
+        bot = FeishuBotController(
+            api=self.api,  # type: ignore[arg-type]
+            channel=self.channel,
+            sessions=SessionStore(),
+            video_processor=processor,
+        )
+
+        asyncio.run(
+            bot.on_message(
+                Message(
+                    "<media />",
+                    message_id="om_long_video",
+                    content={
+                        "kind": "media",
+                        "file_key": "file_long_video",
+                        "file_name": "long.mp4",
+                        "duration_ms": 301_000,
+                    },
+                )
+            )
+        )
+
+        self.assertEqual(self.channel.downloads, [])
+        self.assertEqual(processor.calls, [])
+        self.assertIn("不能超过 5 分钟", self.channel.replies[-1][1]["text"])
+
+    def test_group_video_is_not_downloaded_before_recording_is_enabled(self) -> None:
+        processor = FakeVideoProcessor()
+        bot = FeishuBotController(
+            api=self.api,  # type: ignore[arg-type]
+            channel=self.channel,
+            sessions=SessionStore(),
+            video_processor=processor,
+        )
+
+        asyncio.run(
+            bot.on_message(
+                Message(
+                    "<media />",
+                    message_id="om_group_video",
+                    chat_id="oc_video_group",
+                    chat_type="group",
+                    content={
+                        "kind": "media",
+                        "file_key": "file_group_video",
+                        "file_name": "demo.mp4",
+                        "duration_ms": 20_000,
+                    },
+                )
+            )
+        )
+
+        self.assertEqual(self.channel.downloads, [])
+        self.assertEqual(processor.calls, [])
 
     def test_session_store_restores_group_recording_and_buffer(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
