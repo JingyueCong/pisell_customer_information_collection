@@ -14,6 +14,7 @@ from merchant_profile_agent.feishu_bot import (
     SessionStore,
     _group_summary_text,
     _messages_for_analysis,
+    _without_video_placeholders,
 )
 from merchant_profile_agent.video import VideoEvidence
 
@@ -317,6 +318,34 @@ class RefreshingCrmApi(FakeApi):
         }
 
 
+class EmptyThenUpdateApi(FakeApi):
+    def __init__(self) -> None:
+        super().__init__()
+        self.analyze_count = 0
+
+    def post(self, path, payload):
+        if path != "/v1/profile/analyze":
+            return super().post(path, payload)
+        self.analyze_count += 1
+        if self.analyze_count > 1:
+            result = super().post(path, payload)
+            result["merchant"] = {"name": "U Bowl Malatang", "id": None}
+            return result
+        self.calls.append((path, copy.deepcopy(payload)))
+        return {
+            "merchant": {"name": "U Bowl Malatang", "id": None},
+            "reply": "已总结界面测试。",
+            "profile_updates": [],
+            "conflicts": [],
+            "save_readiness": "needs_input",
+            "next_question": None,
+            "summary_points": ["发现点餐屏图片缺失"],
+            "decisions": [],
+            "action_items": [],
+            "information_gaps": [],
+        }
+
+
 class FeishuBotTests(unittest.TestCase):
     def setUp(self) -> None:
         self.api = FakeApi()
@@ -391,6 +420,18 @@ class FeishuBotTests(unittest.TestCase):
         self.assertEqual(len(bounded[1]["images"]), 1)
         self.assertEqual(len(bounded[0]["images"]), 1)
         self.assertEqual(len(messages[0]["images"]), 4)
+
+    def test_html_escaped_video_placeholders_are_removed(self) -> None:
+        text = (
+            '成员：&lt;video key=&quot;file_test&quot; name=&quot;demo.mp4&quot;/&gt;\n'
+            "视频语音转写：图片缺失"
+        )
+
+        cleaned = _without_video_placeholders(text)
+
+        self.assertNotIn("file_test", cleaned)
+        self.assertNotIn("&lt;video", cleaned)
+        self.assertIn("图片缺失", cleaned)
 
     def test_group_summary_explains_crm_result_and_specific_next_step(self) -> None:
         text = _group_summary_text(
@@ -666,6 +707,20 @@ class FeishuBotTests(unittest.TestCase):
 
         commit = next(payload for path, payload in api.calls if path == "/v1/profile/commit")
         self.assertEqual(commit["merchant"]["id"], "6856334446")
+        self.assertIn("已写入", self.channel.replies[-1][1]["text"])
+
+    def test_save_reanalyzes_an_empty_preview_before_saying_there_is_nothing_new(self) -> None:
+        api = EmptyThenUpdateApi()
+        bot = FeishuBotController(api=api, channel=self.channel, sessions=SessionStore())
+
+        async def scenario() -> None:
+            await bot.on_message(Message("U Bowl Malatang 点餐屏有图片缺失"))
+            await bot.on_message(Message("保存吧", message_id="om_save"))
+
+        asyncio.run(scenario())
+
+        self.assertEqual(api.analyze_count, 2)
+        self.assertIn("/v1/profile/commit", [path for path, _ in api.calls])
         self.assertIn("已写入", self.channel.replies[-1][1]["text"])
 
     def test_ambiguous_crm_match_lists_candidates(self) -> None:

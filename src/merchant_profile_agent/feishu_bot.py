@@ -648,7 +648,13 @@ def _positive_int(value: Any) -> int | None:
 
 
 def _without_video_placeholders(text: str) -> str:
-    text = re.sub(r"<media\b[^>]*?/?>", " ", text, flags=re.IGNORECASE)
+    text = re.sub(r"<(?:media|video)\b[^>]*?/?>", " ", text, flags=re.IGNORECASE)
+    text = re.sub(
+        r"&lt;(?:media|video)\b.*?/?&gt;",
+        " ",
+        text,
+        flags=re.IGNORECASE,
+    )
     text = re.sub(r"\[(?:video|视频)\](?:\([^)]*\))?", " ", text, flags=re.IGNORECASE)
     return re.sub(r"[ \t]+", " ", text).strip()
 
@@ -1272,17 +1278,26 @@ class FeishuBotController:
 
     async def _save(self, message: Any, session: Session, confirmation: str) -> None:
         resolution = session.crm_resolution
-        if (
+        preview_updates = (session.preview or {}).get("profile_updates")
+        unresolved_crm = (
             session.merchant
             and isinstance(resolution, dict)
             and resolution.get("status") in {"not_found", "ambiguous"}
-        ):
+        )
+        if session.messages and (unresolved_crm or not preview_updates):
             # CRM data and matching rules may change after the preview. Refresh
-            # unresolved matches on an explicit save attempt instead of trapping
-            # the user behind a stale not_found/ambiguous result.
-            session.current_profile_loaded = False
+            # unresolved matches and empty extraction results on an explicit save
+            # attempt instead of trapping the user behind stale analysis.
+            if unresolved_crm:
+                session.current_profile_loaded = False
             try:
                 await self._analyze_session(session)
+            except MerchantSwitchError:
+                await self._reply(
+                    message,
+                    "重新分析识别到了不同商户，暂未保存；请先确认商户名称。",
+                )
+                return
             except MerchantApiError:
                 LOGGER.exception("CRM refresh before save failed")
                 await self._reply(message, "CRM 查询暂不可用，草稿已保留，请稍后重试。")
