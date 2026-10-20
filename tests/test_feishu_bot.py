@@ -741,6 +741,41 @@ class FeishuBotTests(unittest.TestCase):
         )
         self.assertIn("已归档附件：1 个", self.channel.replies[-1][1]["text"])
 
+    def test_pdf_file_uses_the_same_document_archive_flow(self) -> None:
+        api = MediaOnlyArchiveApi()
+        archiver = FakeMediaArchiver()
+        with tempfile.TemporaryDirectory() as directory:
+            bot = FeishuBotController(
+                api=api,  # type: ignore[arg-type]
+                channel=self.channel,
+                sessions=SessionStore(),
+                media_staging=MediaStagingStore(Path(directory)),
+                media_archiver=archiver,  # type: ignore[arg-type]
+            )
+            asyncio.run(
+                bot.on_message(
+                    Message(
+                        "<file />",
+                        message_id="om_pdf",
+                        content={
+                            "kind": "file",
+                            "file_key": "file_pdf",
+                            "file_name": "NAB_Statement.pdf",
+                        },
+                    )
+                )
+            )
+            self.assertEqual(self.channel.downloads, [("file_pdf", "file", "om_pdf")])
+            analyze = next(payload for path, payload in api.calls if path == "/v1/profile/analyze")
+            self.assertIn("NAB_Statement.pdf", analyze["messages"][0]["content"])
+            self.assertNotIn("has_media", analyze["messages"][0])
+            self.assertIn("NAB_Statement.pdf", self.channel.replies[-1][1]["text"])
+
+            asyncio.run(bot.on_message(Message("保存吧", message_id="om_save_pdf")))
+
+        self.assertEqual(archiver.calls[0][0]["file_name"], "NAB_Statement.pdf")
+        self.assertIn("已归档附件：1 个", self.channel.replies[-1][1]["text"])
+
     def test_image_key_can_be_recovered_from_raw_feishu_body(self) -> None:
         message = Message(
             "<image key=wrong_resource_key />",

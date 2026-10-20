@@ -5,6 +5,7 @@ import base64
 import copy
 import json
 import logging
+import mimetypes
 import re
 import time
 import uuid
@@ -26,6 +27,20 @@ LOGGER = logging.getLogger("merchant_profile_agent.feishu_bot")
 MAX_IMAGES_PER_MESSAGE = 4
 MAX_IMAGE_BYTES = 4 * 1024 * 1024
 MAX_TOTAL_IMAGE_BYTES = 6 * 1024 * 1024
+MAX_ARCHIVE_FILE_BYTES = 25 * 1024 * 1024
+ARCHIVE_FILE_EXTENSIONS = {
+    ".pdf",
+    ".doc",
+    ".docx",
+    ".xls",
+    ".xlsx",
+    ".ppt",
+    ".pptx",
+    ".csv",
+    ".txt",
+    ".rtf",
+    ".zip",
+}
 SAVE_COMMANDS = {"结束并保存", "/save"}
 DISCARD_COMMANDS = {"放弃本次对话", "/discard"}
 HELP_COMMANDS = {"/help", "帮助"}
@@ -206,6 +221,12 @@ class VideoResource:
     file_key: str
     file_name: str
     duration_ms: int | None
+
+
+@dataclass(frozen=True)
+class ArchiveFileResource:
+    file_key: str
+    file_name: str
 
 
 @dataclass
@@ -1104,6 +1125,37 @@ def _video_resource(message: Any) -> VideoResource | None:
     return None
 
 
+def _archive_file_resources(message: Any) -> list[ArchiveFileResource]:
+    resources: list[ArchiveFileResource] = []
+
+    def add(file_key: Any, file_name: Any) -> None:
+        if not isinstance(file_key, str) or not file_key:
+            return
+        name = str(file_name or "attachment.bin")
+        suffix = Path(name).suffix.lower()
+        if suffix not in ARCHIVE_FILE_EXTENSIONS:
+            return
+        if any(item.file_key == file_key for item in resources):
+            return
+        resources.append(ArchiveFileResource(file_key=file_key, file_name=name))
+
+    content = getattr(message, "content", None)
+    kind = str(_resource_value(content, "kind") or "").lower()
+    if kind == "file":
+        add(
+            _resource_value(content, "file_key"),
+            _resource_value(content, "file_name") or _resource_value(content, "name"),
+        )
+    for resource in getattr(message, "resources", []) or []:
+        if str(_resource_value(resource, "type") or "").lower() != "file":
+            continue
+        add(
+            _resource_value(resource, "file_key"),
+            _resource_value(resource, "file_name") or _resource_value(resource, "name"),
+        )
+    return resources
+
+
 def _positive_int(value: Any) -> int | None:
     try:
         parsed = int(value)
@@ -1121,6 +1173,12 @@ def _without_video_placeholders(text: str) -> str:
         flags=re.IGNORECASE,
     )
     text = re.sub(r"\[(?:video|视频)\](?:\([^)]*\))?", " ", text, flags=re.IGNORECASE)
+    return re.sub(r"[ \t]+", " ", text).strip()
+
+
+def _without_file_placeholders(text: str) -> str:
+    text = re.sub(r"<file\b[^>]*?/?>", " ", text, flags=re.IGNORECASE)
+    text = re.sub(r"&lt;file\b.*?/?&gt;", " ", text, flags=re.IGNORECASE)
     return re.sub(r"[ \t]+", " ", text).strip()
 
 
@@ -1262,7 +1320,11 @@ def _messages_for_analysis(messages: list[dict[str, Any]]) -> list[dict[str, Any
     media message cannot make the whole segment fail validation.
     """
     copied = [
-        {key: value for key, value in message.items() if key != "images"}
+        {
+            key: value
+            for key, value in message.items()
+            if key not in {"images", "has_media"}
+        }
         for message in messages
     ]
     selected: dict[int, list[str]] = {}
@@ -1485,15 +1547,44 @@ class FeishuBotController:
             LOGGER.exception("unexpected video processing failure")
             raise VideoProcessingError("服务器暂时无法处理视频，请稍后重试。") from exc
 
+    async def _download_archive_files(self, message: Any) -> list[DownloadedMedia]:
+        downloaded: list[DownloadedMedia] = []
+        for resource in _archive_file_resources(message):
+            try:
+                data = await self.channel.download_resource(
+                    resource.file_key,
+                    resource_type="file",
+                    message_id=str(getattr(message, "message_id", "") or "") or None,
+                )
+            except Exception as exc:
+                raise MediaArchiveError("文件下载失败，请重新发送原文件。") from exc
+            if not isinstance(data, bytes) or not data:
+                raise MediaArchiveError("文件下载失败，请重新发送原文件。")
+            if len(data) > MAX_ARCHIVE_FILE_BYTES:
+                raise MediaArchiveError("单个归档文件不能超过 25 MB。")
+            media_type = mimetypes.guess_type(resource.file_name)[0] or "application/octet-stream"
+            downloaded.append(
+                DownloadedMedia(
+                    data=data,
+                    file_name=resource.file_name,
+                    media_type=media_type,
+                    source_ref=_source_ref(message),
+                )
+            )
+        return downloaded
+
     async def on_message(self, message: Any) -> None:
         raw_text = str(getattr(message, "body_text", "") or "").strip()
-        text = _without_video_placeholders(_without_image_placeholders(raw_text))
+        text = _without_file_placeholders(
+            _without_video_placeholders(_without_image_placeholders(raw_text))
+        )
         has_video = _video_resource(message) is not None
+        has_archive_file = bool(_archive_file_resources(message))
         image_keys = _image_resource_keys(message)
-        if not raw_text and not image_keys and not has_video:
+        if not raw_text and not image_keys and not has_video and not has_archive_file:
             return
         try:
-            if _is_group_message(message) and (image_keys or has_video):
+            if _is_group_message(message) and (image_keys or has_video or has_archive_file):
                 group_session = self.sessions.get(_session_key(message))
                 if not group_session.group_summary_enabled:
                     if bool(getattr(message, "mentioned_bot", False)):
@@ -1532,6 +1623,12 @@ class FeishuBotController:
                 if video_download is not None:
                     video, downloaded_video = video_download
                     downloaded_media.append(downloaded_video)
+            if has_archive_file:
+                try:
+                    downloaded_media.extend(await self._download_archive_files(message))
+                except MediaArchiveError as exc:
+                    await self._reply(message, f"文件处理失败：{exc}")
+                    return
             if video is not None:
                 if video.transcript:
                     text = "\n".join(
@@ -1555,6 +1652,9 @@ class FeishuBotController:
                     )
             if images and not text:
                 text = "用户上传了截图，请提取其中明确可见且适合客户档案的有用信息。"
+            if downloaded_media and not text:
+                names = "、".join(item.file_name for item in downloaded_media[:5])
+                text = f"用户上传了待归档文件：{names}。只记录文件元数据，不推断文件内容。"
             if not text:
                 return
             if _is_group_message(message):
@@ -1581,6 +1681,7 @@ class FeishuBotController:
                 "发送商户名称和要记录的资料。"
                 "\n- 可直接发送截图，我会提取其中明确可见的有用信息"
                 "\n- 可发送 5 分钟、25 MB 以内的视频，我会转写语音并读取关键帧"
+                "\n- 可发送 25 MB 以内的 PDF、Office、CSV、TXT、RTF 或 ZIP 文件归档"
                 "\n- 可说“没问题，保存吧”或“结束并保存”"
                 "\n- /discard：放弃草稿",
             )
@@ -1607,6 +1708,8 @@ class FeishuBotController:
         }
         if images:
             user_message["images"] = images
+        if downloaded_media:
+            user_message["has_media"] = True
         session.messages.append(user_message)
         # Assistant previews are not needed by the extractor. Keeping only user
         # turns doubles useful conversation capacity and avoids the API's
@@ -1855,7 +1958,7 @@ class FeishuBotController:
         if not _is_effective_group_message(text):
             return
         if not (session.group_followup_pending and mentioned) and not _is_group_profile_candidate(
-            text, has_media=bool(images)
+            text, has_media=bool(images or downloaded_media)
         ):
             return
 
@@ -1872,6 +1975,8 @@ class FeishuBotController:
         }
         if images:
             user_message["images"] = images
+        if downloaded_media:
+            user_message["has_media"] = True
         if downloaded_media:
             try:
                 self._append_pending_media(
@@ -1920,7 +2025,7 @@ class FeishuBotController:
             for item in session.group_buffer
             if _is_group_profile_candidate(
                 str(item.get("content") or ""),
-                has_media=bool(item.get("images")),
+                has_media=bool(item.get("images") or item.get("has_media")),
             )
         ]
         if not segment:
