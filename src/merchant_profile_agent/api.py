@@ -278,6 +278,7 @@ def create_server(
                         "service": "pisell-merchant-profile-agent",
                         "version": __version__,
                         "model": settings.model,
+                        "classifier_model": settings.classifier_model,
                         "knowledge_store": store.name,
                         "crm_resolver": crm.name,
                     },

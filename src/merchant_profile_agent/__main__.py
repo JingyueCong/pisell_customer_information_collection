@@ -33,6 +33,11 @@ def main() -> int:
         model=settings.model,
         timeout=settings.openai_timeout,
     )
+    classification_client = OpenAIResponsesClient(
+        api_key=settings.openai_api_key,
+        model=settings.classifier_model,
+        timeout=settings.openai_timeout,
+    )
     try:
         knowledge_store = create_knowledge_store(settings)
     except KnowledgeStoreUnavailable as exc:
@@ -48,15 +53,20 @@ def main() -> int:
         )
     server = create_server(
         settings,
-        MerchantProfileAgent(client, url_reader=url_reader),
+        MerchantProfileAgent(
+            client,
+            url_reader=url_reader,
+            classification_client=classification_client,
+        ),
         knowledge_store,
         crm_resolver,
     )
     logging.getLogger("merchant_profile_agent").info(
-        "listening on http://%s:%d model=%s knowledge_store=%s crm_resolver=%s url_reader=%s",
+        "listening on http://%s:%d model=%s classifier_model=%s knowledge_store=%s crm_resolver=%s url_reader=%s",
         settings.host,
         settings.port,
         settings.model,
+        settings.classifier_model,
         knowledge_store.name,
         crm_resolver.name,
         "enabled" if settings.url_reading_enabled else "disabled",

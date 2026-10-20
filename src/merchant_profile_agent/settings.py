@@ -55,6 +55,7 @@ class Settings:
     host: str = "127.0.0.1"
     port: int = 8090
     model: str = "gpt-6-luna"
+    classifier_model: str = "gpt-6-sol"
     openai_timeout: int = 60
     max_body_bytes: int = 10_485_760
     knowledge_store: str = "disabled"
@@ -81,6 +82,9 @@ class Settings:
         api_key = os.environ.get("MERCHANT_AGENT_API_KEY", "").strip()
         openai_api_key = os.environ.get("OPENAI_API_KEY", "").strip()
         model = os.environ.get("MERCHANT_AGENT_MODEL", "gpt-6-luna").strip()
+        classifier_model = os.environ.get(
+            "MERCHANT_AGENT_CLASSIFIER_MODEL", "gpt-6-sol"
+        ).strip()
         host = os.environ.get("MERCHANT_AGENT_HOST", "127.0.0.1").strip()
         if len(api_key) < 24:
             raise ConfigurationError("MERCHANT_AGENT_API_KEY must be at least 24 characters")
@@ -88,6 +92,8 @@ class Settings:
             raise ConfigurationError("OPENAI_API_KEY is required")
         if not model:
             raise ConfigurationError("MERCHANT_AGENT_MODEL is required")
+        if not classifier_model:
+            raise ConfigurationError("MERCHANT_AGENT_CLASSIFIER_MODEL is required")
         if not host:
             raise ConfigurationError("MERCHANT_AGENT_HOST is required")
         knowledge_store = os.environ.get(
@@ -142,6 +148,7 @@ class Settings:
             host=host,
             port=_integer("MERCHANT_AGENT_PORT", 8090, 1, 65_535),
             model=model,
+            classifier_model=classifier_model,
             openai_timeout=_integer("MERCHANT_AGENT_OPENAI_TIMEOUT", 60, 5, 300),
             max_body_bytes=_integer(
                 "MERCHANT_AGENT_MAX_BODY_BYTES", 10_485_760, 1_024, 16_777_216

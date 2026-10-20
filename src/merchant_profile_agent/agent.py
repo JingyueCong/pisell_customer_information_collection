@@ -6,7 +6,15 @@ import json
 import re
 from typing import Any, Mapping, Protocol, Sequence
 
-from .validation import ProfileValidationError, validate_update_set
+from .openai_client import OpenAIClientError
+from .validation import (
+    MODULES,
+    ProfileValidationError,
+    canonical_field_path,
+    document_for_field,
+    reroute_field_path,
+    validate_update_set,
+)
 from .url_reader import PublicUrlReader
 
 
@@ -42,10 +50,6 @@ Keep the knowledge base minimal:
   implementation or support. Keep the value concise and factual. For example, missing images or a
   mandatory choice with only one available option are recordable; vague aesthetic reactions such as
   "looks ugly" are not. Do not save an uncertain question as a fact.
-- Treat physical network topology as installation evidence, not software configuration. Routers,
-  cables, wall ports, LAN connections, printer wiring, NBN links, backup 4G routers and SIM-based
-  failover belong under installation.network_topology so they are stored in Hardware & Installation.
-
 Use only these field prefixes:
 - business.*, contacts.*
 - menu.*, content.*
@@ -87,7 +91,6 @@ Use these canonical paths whenever they apply; do not invent shorter aliases:
   contacts.primary.email
 - contacts.secondary.name, contacts.secondary.phone, contacts.secondary.email
 - stores.primary.name, stores.primary.address, stores.primary.phone
-- installation.network_topology
 
 Treat supplied account details like every other durable merchant fact: include them in the normal
 preview without asking for any extra password-specific confirmation. The ordinary save confirmation
@@ -116,6 +119,63 @@ supports the value. Set replace_confirmed true only if the user explicitly agree
 different current value. Keep reply to one short sentence and next_question to one short question.
 Reply in concise natural Chinese unless the user used another language.
 Do not claim that anything was saved or written."""
+
+
+MODULE_ROUTER_PROMPT = """You classify already-extracted merchant facts into knowledge-base modules.
+
+Judge the fact from its complete meaning and source-message context. The proposed field path is only
+an untrusted hint: do not copy its module mechanically. Classify by the purpose for which a future
+staff member would retrieve the fact. Use the semantic boundaries below, not keyword matching.
+
+- business-contacts: business identity, people, roles and contact methods
+- menu-content: menu facts and reusable content assets
+- system-configuration: software behaviour, application settings, user flows and workarounds
+- hardware-installation: physical equipment, cabling, connectivity, site installation and topology
+- risk-compliance: compliance, risk evidence and controls
+- commercial-information: general commercial context not covered by package/payment modules
+- store-profile: store identity, location and store-level details
+- project-progress: implementation milestones, status and project links
+- data-collection: intake forms, collected source bundles and basic-profile collection
+- package-commercial: plan, billing, payment and deduction arrangements
+- hardware-records: equipment inventory, hardware commercial terms and configuration records
+- card-terminal: EFTPOS/card-terminal applications, counts and surcharge settings
+- special-matters: exceptional handling and important one-off matters
+- menu-collection: menu acquisition source and collection status
+- document-archive: documents or links whose business module cannot be determined reliably
+- communication-profile: durable communication preferences and collaboration style
+- content-settings: content-entry requirements and setup instructions
+- credential-records: account login records and passwords
+
+Distinguish the subject from the medium: a video of a physical installation is still
+hardware-installation; a screenshot of a software option is system-configuration. If two modules
+are plausible, choose the one that best owns the operational subject and lower confidence. Confidence
+must reflect genuine certainty, not a desire to avoid review. Never repeat a password or secret in
+the reason. Return one result for every input update index, with no missing or duplicate indexes."""
+
+
+MODULE_ROUTER_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "classifications": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "update_index": {"type": "integer", "minimum": 0},
+                    "document_type": {"type": "string", "enum": list(MODULES)},
+                    "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+                    "reason": {"type": "string", "maxLength": 160},
+                },
+                "required": ["update_index", "document_type", "confidence", "reason"],
+            },
+        }
+    },
+    "required": ["classifications"],
+}
+
+AUTO_CLASSIFICATION_CONFIDENCE = 0.72
 
 
 OUTPUT_SCHEMA: dict[str, Any] = {
@@ -295,9 +355,113 @@ class MerchantProfileAgent:
         self,
         client: StructuredClient,
         url_reader: PublicUrlReader | None = None,
+        classification_client: StructuredClient | None = None,
     ) -> None:
         self.client = client
         self.url_reader = url_reader
+        self.classification_client = classification_client
+
+    def _classify_updates(
+        self,
+        messages: Sequence[Mapping[str, Any]],
+        updates: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        if self.classification_client is None or not updates:
+            return []
+        router_input = {
+            "messages": [
+                {"index": index, "content": item["content"]}
+                for index, item in enumerate(messages)
+                if item.get("role") == "user"
+            ],
+            "updates": [
+                {
+                    "update_index": index,
+                    "proposed_field_path": item["field_path"],
+                    "value": (
+                        "（密码已隐藏）"
+                        if str(item["field_path"]).endswith(".password")
+                        else item["value"]
+                    ),
+                    "source_message_index": item["source_message_index"],
+                }
+                for index, item in enumerate(updates)
+            ],
+        }
+        try:
+            routed = self.classification_client.create_structured(
+                system_prompt=MODULE_ROUTER_PROMPT,
+                user_input=json.dumps(router_input, ensure_ascii=False, separators=(",", ":")),
+                schema=MODULE_ROUTER_SCHEMA,
+            )
+        except OpenAIClientError:
+            return [
+                {
+                    "update_index": index,
+                    "source_ref": update["source_ref"],
+                    "original_field_path": canonical_field_path(str(update["field_path"])),
+                    "field_path": canonical_field_path(str(update["field_path"])),
+                    "original_document_type": document_for_field(str(update["field_path"])),
+                    "document_type": document_for_field(str(update["field_path"])),
+                    "confidence": 0.0,
+                    "reason": "分类服务暂不可用",
+                    "status": "needs_confirmation",
+                }
+                for index, update in enumerate(updates)
+            ]
+        raw_items = routed.get("classifications")
+        if not isinstance(raw_items, list) or len(raw_items) != len(updates):
+            raise ProfileValidationError("module classifier returned incomplete results")
+        by_index: dict[int, Mapping[str, Any]] = {}
+        for item in raw_items:
+            if not isinstance(item, Mapping):
+                raise ProfileValidationError("module classifier returned a non-object result")
+            index = item.get("update_index")
+            if not isinstance(index, int) or not 0 <= index < len(updates) or index in by_index:
+                raise ProfileValidationError("module classifier returned an invalid update index")
+            by_index[index] = item
+
+        classifications: list[dict[str, Any]] = []
+        for index, update in enumerate(updates):
+            item = by_index[index]
+            document_type = item.get("document_type")
+            confidence = item.get("confidence")
+            reason = item.get("reason")
+            if document_type not in MODULES:
+                raise ProfileValidationError("module classifier returned an invalid module")
+            if not isinstance(confidence, (int, float)) or isinstance(confidence, bool):
+                raise ProfileValidationError("module classifier returned invalid confidence")
+            confidence = float(confidence)
+            if not 0 <= confidence <= 1:
+                raise ProfileValidationError("module classifier confidence is out of range")
+            if not isinstance(reason, str) or not reason.strip():
+                raise ProfileValidationError("module classifier returned no reason")
+            original_path = canonical_field_path(str(update["field_path"]))
+            original_document_type = document_for_field(original_path)
+            routed_path = (
+                original_path
+                if document_type == original_document_type
+                else reroute_field_path(original_path, str(document_type))
+            )
+            update["field_path"] = routed_path
+            classifications.append(
+                {
+                    "update_index": index,
+                    "source_ref": update["source_ref"],
+                    "original_field_path": original_path,
+                    "field_path": routed_path,
+                    "original_document_type": original_document_type,
+                    "document_type": document_type,
+                    "confidence": confidence,
+                    "reason": reason.strip(),
+                    "status": (
+                        "auto"
+                        if confidence >= AUTO_CLASSIFICATION_CONFIDENCE
+                        else "needs_confirmation"
+                    ),
+                }
+            )
+        return classifications
 
     def analyze(self, request: Mapping[str, Any]) -> dict[str, Any]:
         extra = set(request) - {"messages", "current_profile"}
@@ -357,8 +521,13 @@ class MerchantProfileAgent:
                     "value": raw.get("value"),
                     "source_ref": source_message["source_ref"],
                     "replace_confirmed": raw.get("replace_confirmed"),
+                    "source_message_index": source_index,
                 }
             )
+
+        module_classifications = self._classify_updates(messages, raw_updates)
+        for item in raw_updates:
+            item.pop("source_message_index", None)
 
         validated = validate_update_set(
             extracted.get("merchant_name"), raw_updates, current_profile
@@ -398,7 +567,19 @@ class MerchantProfileAgent:
                 for item in url_evidence
             ],
             "model": self.client.model,
+            "classifier_model": (
+                self.classification_client.model if self.classification_client is not None else None
+            ),
+            "module_classifications": module_classifications,
+            "classification_review_required": any(
+                item["status"] == "needs_confirmation" for item in module_classifications
+            ),
         }
+        if result["classification_review_required"]:
+            result["save_readiness"] = "needs_confirmation"
+            result["next_question"] = (
+                "资料归类置信度较低，请明确回复这些资料应归入哪个模块后再保存。"
+            )
         if result["save_readiness"] == "needs_confirmation" and not result["next_question"]:
             result["next_question"] = "检测到与现有档案不同的值，请确认保留旧值还是替换为新值？"
         return result

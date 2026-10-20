@@ -11,7 +11,9 @@ from pathlib import Path
 
 from merchant_profile_agent.feishu_bot import (
     FeishuBotController,
+    Session,
     SessionStore,
+    _apply_explicit_module_to_preview,
     _group_summary_text,
     _is_group_profile_candidate,
     _messages_for_analysis,
@@ -515,6 +517,44 @@ class UnanchoredSwitchApi(FakeApi):
 
 
 class FeishuBotTests(unittest.TestCase):
+    def test_user_can_confirm_a_low_confidence_fact_module(self) -> None:
+        session = Session(
+            preview={
+                "merchant": {"name": "MCKINLY Eatery", "id": None},
+                "profile_updates": [
+                    {
+                        "field_path": "system.network_topology",
+                        "value": "NBN 路由器通过墙内网线连接打印机。",
+                        "source_ref": "feishu://message/network",
+                        "replace_confirmed": False,
+                        "state": "explicit",
+                        "document_type": "system-configuration",
+                    }
+                ],
+                "module_classifications": [
+                    {
+                        "field_path": "system.network_topology",
+                        "document_type": "system-configuration",
+                        "confidence": 0.6,
+                        "reason": "边界不明确",
+                        "status": "needs_confirmation",
+                    }
+                ],
+                "classification_review_required": True,
+                "save_readiness": "needs_confirmation",
+            }
+        )
+
+        changed = _apply_explicit_module_to_preview(session, "hardware-installation")
+
+        self.assertEqual(changed, 1)
+        self.assertEqual(
+            session.preview["profile_updates"][0]["field_path"],
+            "hardware.network_topology",
+        )
+        self.assertFalse(session.preview["classification_review_required"])
+        self.assertEqual(session.preview["save_readiness"], "ready")
+
     def setUp(self) -> None:
         self.api = FakeApi()
         self.channel = FakeChannel()
@@ -883,7 +923,7 @@ class FeishuBotTests(unittest.TestCase):
             asyncio.run(bot.on_message(Message("保存吧", message_id="om_save_pdf")))
 
         self.assertEqual(archiver.calls[0][0]["file_name"], "NAB_Statement.pdf")
-        self.assertEqual(archiver.calls[0][1], "wik_package")
+        self.assertEqual(archiver.calls[0][1], "wik_archive")
         self.assertIn("已保存到对应模块的附件：1 个", self.channel.replies[-1][1]["text"])
 
     def test_image_key_can_be_recovered_from_raw_feishu_body(self) -> None:

@@ -4,6 +4,7 @@ import base64
 import unittest
 
 from merchant_profile_agent.agent import MerchantProfileAgent
+from merchant_profile_agent.openai_client import OpenAIClientError
 from merchant_profile_agent.validation import ProfileValidationError
 
 
@@ -37,6 +38,13 @@ class FakeUrlReader:
         ]
 
 
+class FailingClassifier:
+    model = "classifier-test-model"
+
+    def create_structured(self, **kwargs):
+        raise OpenAIClientError("temporary failure")
+
+
 def extraction(**overrides):
     value = {
         "merchant_name": "青禾便当",
@@ -63,6 +71,95 @@ def extraction(**overrides):
 
 
 class AgentTests(unittest.TestCase):
+    def test_independent_classifier_routes_by_semantics(self) -> None:
+        extractor = FakeClient(
+            extraction(
+                updates=[
+                    {
+                        "field_path": "configuration.network_topology",
+                        "value": "NBN 路由器通过墙内网线连接后厨打印机。",
+                        "source_message_index": 0,
+                        "replace_confirmed": False,
+                    }
+                ]
+            )
+        )
+        classifier = FakeClient(
+            {
+                "classifications": [
+                    {
+                        "update_index": 0,
+                        "document_type": "hardware-installation",
+                        "confidence": 0.94,
+                        "reason": "描述的是现场物理网络和设备连接关系",
+                    }
+                ]
+            }
+        )
+        agent = MerchantProfileAgent(extractor, classification_client=classifier)
+
+        result = agent.analyze(
+            {
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": "MCKINLY 的 NBN 路由器通过墙内网线连接后厨打印机",
+                        "source_ref": "feishu://message/network",
+                    }
+                ],
+                "current_profile": {},
+            }
+        )
+
+        self.assertEqual(
+            result["profile_updates"][0]["field_path"],
+            "hardware.network_topology",
+        )
+        self.assertEqual(result["affected_modules"], ["hardware-installation"])
+        self.assertFalse(result["classification_review_required"])
+        self.assertIn("untrusted hint", classifier.calls[0]["system_prompt"])
+
+    def test_low_confidence_classification_requires_confirmation(self) -> None:
+        extractor = FakeClient(extraction())
+        classifier = FakeClient(
+            {
+                "classifications": [
+                    {
+                        "update_index": 0,
+                        "document_type": "business-contacts",
+                        "confidence": 0.51,
+                        "reason": "上下文不足",
+                    }
+                ]
+            }
+        )
+        agent = MerchantProfileAgent(extractor, classification_client=classifier)
+
+        result = agent.analyze(
+            {"messages": [{"role": "user", "content": "联系人是林经理"}]}
+        )
+
+        self.assertTrue(result["classification_review_required"])
+        self.assertEqual(result["save_readiness"], "needs_confirmation")
+        self.assertIn("哪个模块", result["next_question"])
+
+    def test_classifier_outage_keeps_draft_and_requires_confirmation(self) -> None:
+        agent = MerchantProfileAgent(
+            FakeClient(extraction()),
+            classification_client=FailingClassifier(),  # type: ignore[arg-type]
+        )
+
+        result = agent.analyze(
+            {"messages": [{"role": "user", "content": "联系人是林经理"}]}
+        )
+
+        self.assertEqual(len(result["profile_updates"]), 1)
+        self.assertTrue(result["classification_review_required"])
+        self.assertEqual(
+            result["module_classifications"][0]["reason"],
+            "分类服务暂不可用",
+        )
+
     def test_uses_caller_source_and_never_writes(self) -> None:
         client = FakeClient(extraction())
         agent = MerchantProfileAgent(client)

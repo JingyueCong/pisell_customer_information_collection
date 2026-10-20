@@ -21,7 +21,7 @@ from .media_archive import (
     MediaArchiveError,
     MediaStagingStore,
 )
-from .validation import document_for_field
+from .validation import document_for_field, reroute_field_path, validate_update_set
 
 
 LOGGER = logging.getLogger("merchant_profile_agent.feishu_bot")
@@ -155,22 +155,6 @@ MEDIA_FIELD_PREFIXES = {
     "credential-records": "credentials",
 }
 MEDIA_ROUTE_PRIORITY = tuple(MEDIA_FIELD_PREFIXES)
-MEDIA_ROUTE_KEYWORDS = (
-    ("credential-records", ("账号", "帐号", "密码", "登录", "登陆", "后台", "username", "password", "login")),
-    ("menu-collection", ("菜单文件", "菜单照片", "菜单截图", "菜品照片", "菜品图片", "menu file", "menu photo")),
-    ("card-terminal", ("刷卡机", "eftpos", "surcharge")),
-    ("hardware-records", ("打印机", "pos机", "pos 机", "设备清单", "硬件设备", "机器视频", "printer")),
-    ("hardware-installation", ("安装", "布线", "接线", "网络设备")),
-    ("project-progress", ("项目进度", "项目链接", "上线进度")),
-    ("package-commercial", ("套餐", "付款方式", "扣款", "账单", "statement")),
-    ("risk-compliance", ("风控", "合规", "证件", "abn", "合同")),
-    ("store-profile", ("门店照片", "店铺照片", "门店地址", "店铺地址", "店面")),
-    ("business-contacts", ("联系人", "联系电话", "联系邮箱", "名片")),
-    ("content-settings", ("内容设置", "页面设置", "图片设置")),
-    ("system-configuration", ("系统配置", "报错截图", "故障视频", "点餐流程", "操作视频")),
-    ("commercial-information", ("商务", "报价", "佣金", "费用")),
-    ("data-collection", ("商家信息表", "资料表", "申请表")),
-)
 FIELD_LABELS = {
     "project.feishu_link": "飞书项目链接",
     "project.status": "项目进度",
@@ -207,6 +191,7 @@ FIELD_LABELS = {
     "archive.folder_url": "资料文件夹",
     "archive.document_links": "文档链接",
     "installation.network_topology": "网络拓扑",
+    "hardware.network_topology": "网络拓扑",
     "communication.preferences": "沟通偏好",
     "communication.notes": "沟通特点",
     "content.url": "内容链接",
@@ -912,6 +897,23 @@ def _preview_text(result: dict[str, Any]) -> str:
         if lines:
             lines.append("")
         lines.append("有旧值冲突，请确认是否替换。")
+    classifications = result.get("module_classifications")
+    if isinstance(classifications, list):
+        uncertain = [
+            item
+            for item in classifications
+            if isinstance(item, Mapping) and item.get("status") == "needs_confirmation"
+        ]
+        if uncertain:
+            if lines:
+                lines.append("")
+            lines.append("待确认归类：")
+            for item in uncertain[:5]:
+                document_type = str(item.get("document_type") or "")
+                label = DOCUMENT_LABELS.get(document_type, document_type)
+                confidence = float(item.get("confidence") or 0)
+                lines.append(f"- {label}（{confidence:.0%}）：{item.get('reason')}")
+            lines.append("可回复“这些资料归到硬件与安装”等明确模块。")
     url_lines = _url_evidence_lines(result)
     if url_lines:
         if lines:
@@ -1068,6 +1070,25 @@ def _group_summary_text(result: dict[str, Any]) -> str:
         ]
         if lines:
             sections.append("资料冲突：\n" + "\n".join(lines))
+
+    classifications = result.get("module_classifications")
+    if isinstance(classifications, list):
+        uncertain_lines = []
+        for item in classifications:
+            if not isinstance(item, Mapping) or item.get("status") != "needs_confirmation":
+                continue
+            document_type = str(item.get("document_type") or "")
+            label = DOCUMENT_LABELS.get(document_type, document_type)
+            confidence = float(item.get("confidence") or 0)
+            uncertain_lines.append(
+                f"- {label}（{confidence:.0%}）：{item.get('reason')}"
+            )
+        if uncertain_lines:
+            sections.append(
+                "待确认归类：\n"
+                + "\n".join(uncertain_lines[:5])
+                + "\n请 @机器人 回复“这些资料归到硬件与安装”等明确模块。"
+            )
 
     gaps = result.get("information_gaps")
     add_section("待确认", gaps)
@@ -1354,6 +1375,66 @@ def _current_profile_values(session: Session) -> dict[str, Any]:
     return values
 
 
+def _apply_explicit_module_to_preview(session: Session, document_type: str) -> int:
+    preview = session.preview
+    if not isinstance(preview, dict):
+        return 0
+    raw_classifications = preview.get("module_classifications")
+    if not isinstance(raw_classifications, list):
+        return 0
+    uncertain = [
+        item
+        for item in raw_classifications
+        if isinstance(item, dict) and item.get("status") == "needs_confirmation"
+    ]
+    if not uncertain:
+        return 0
+    updates = preview.get("profile_updates")
+    if not isinstance(updates, list):
+        return 0
+    by_path = {
+        str(item.get("field_path")): item
+        for item in uncertain
+        if isinstance(item.get("field_path"), str)
+    }
+    rerouted: list[dict[str, Any]] = []
+    changed = 0
+    for item in updates:
+        if not isinstance(item, Mapping):
+            continue
+        clean = {
+            "field_path": item.get("field_path"),
+            "value": item.get("value"),
+            "source_ref": item.get("source_ref"),
+            "replace_confirmed": bool(item.get("replace_confirmed")),
+        }
+        classification = by_path.get(str(clean["field_path"]))
+        if classification is not None:
+            clean["field_path"] = reroute_field_path(str(clean["field_path"]), document_type)
+            classification["field_path"] = clean["field_path"]
+            classification["document_type"] = document_type
+            classification["confidence"] = 1.0
+            classification["reason"] = "用户明确指定模块"
+            classification["status"] = "confirmed"
+            changed += 1
+        rerouted.append(clean)
+    if not changed:
+        return 0
+    merchant = preview.get("merchant")
+    merchant_name = merchant.get("name") if isinstance(merchant, Mapping) else None
+    validated = validate_update_set(merchant_name, rerouted, _current_profile_values(session))
+    preview.update(validated)
+    preview["classification_review_required"] = any(
+        isinstance(item, Mapping) and item.get("status") == "needs_confirmation"
+        for item in raw_classifications
+    )
+    if preview["classification_review_required"]:
+        preview["save_readiness"] = "needs_confirmation"
+    else:
+        preview["next_question"] = None
+    return changed
+
+
 def _media_field_base(item: Mapping[str, Any]) -> str | None:
     archive_id = str(item.get("archive_id") or "")
     document_type = str(item.get("target_document_type") or "")
@@ -1377,16 +1458,6 @@ def _document_type_for_update(item: Mapping[str, Any]) -> str | None:
     except (ValueError, TypeError):
         return None
     return document_type if document_type in MEDIA_FIELD_PREFIXES else None
-
-
-def _infer_media_module_from_text(text: str) -> str | None:
-    normalized = text.casefold()
-    matches = [
-        document_type
-        for document_type, keywords in MEDIA_ROUTE_KEYWORDS
-        if any(keyword in normalized for keyword in keywords)
-    ]
-    return matches[0] if len(set(matches)) == 1 else None
 
 
 def _explicit_media_module(text: str) -> str | None:
@@ -1422,12 +1493,17 @@ def _explicit_media_module(text: str) -> str | None:
 def _assign_media_modules(session: Session) -> None:
     updates = (session.preview or {}).get("profile_updates")
     update_items = updates if isinstance(updates, list) else []
-    messages = {
-        str(item.get("source_ref") or ""): str(item.get("content") or "")
-        for item in session.messages
-        if isinstance(item, Mapping)
-    }
     priority = {name: index for index, name in enumerate(MEDIA_ROUTE_PRIORITY)}
+    raw_classifications = (session.preview or {}).get("module_classifications")
+    classified_paths: set[str] | None = None
+    if isinstance(raw_classifications, list):
+        classified_paths = {
+            str(item.get("field_path"))
+            for item in raw_classifications
+            if isinstance(item, Mapping)
+            and item.get("status") in {"auto", "confirmed"}
+            and isinstance(item.get("field_path"), str)
+        }
     for media in session.pending_media:
         if str(media.get("target_document_type") or "") in MEDIA_FIELD_PREFIXES:
             continue
@@ -1437,6 +1513,10 @@ def _assign_media_modules(session: Session) -> None:
             for update in update_items
             if isinstance(update, Mapping)
             and str(update.get("source_ref") or "") == source_ref
+            and (
+                classified_paths is None
+                or str(update.get("field_path") or "") in classified_paths
+            )
             and (candidate := _document_type_for_update(update)) is not None
         ]
         if candidates:
@@ -1446,8 +1526,7 @@ def _assign_media_modules(session: Session) -> None:
                 key=lambda candidate: (-counts[candidate], priority.get(candidate, 999)),
             )
             continue
-        inferred = _infer_media_module_from_text(messages.get(source_ref, ""))
-        media["target_document_type"] = inferred or "document-archive"
+        media["target_document_type"] = "document-archive"
 
 
 def _unresolved_media(session: Session) -> list[dict[str, Any]]:
@@ -2051,7 +2130,11 @@ class FeishuBotController:
             await self._reply(message, _links_text(session.last_documents))
             return
         explicit_module = _explicit_media_module(text)
-        if explicit_module and session.pending_media:
+        if explicit_module and (
+            session.pending_media
+            or bool((session.preview or {}).get("classification_review_required"))
+        ):
+            changed_facts = _apply_explicit_module_to_preview(session, explicit_module)
             routable = [
                 item
                 for item in session.pending_media
@@ -2059,9 +2142,14 @@ class FeishuBotController:
             ]
             for item in routable:
                 item["target_document_type"] = explicit_module
+            details = []
+            if changed_facts:
+                details.append(f"{changed_facts} 条资料")
+            if routable:
+                details.append(f"{len(routable)} 个附件")
             await self._reply(
                 message,
-                f"已将 {len(routable)} 个附件归到“{DOCUMENT_LABELS[explicit_module]}”。"
+                f"已将{'和'.join(details)}归到“{DOCUMENT_LABELS[explicit_module]}”。"
                 "回复“保存吧”即可写入。",
             )
             return
@@ -2252,7 +2340,11 @@ class FeishuBotController:
         mentioned = bool(getattr(message, "mentioned_bot", False))
 
         explicit_module = _explicit_media_module(text) if mentioned else None
-        if explicit_module and session.pending_media:
+        if explicit_module and (
+            session.pending_media
+            or bool((session.preview or {}).get("classification_review_required"))
+        ):
+            changed_facts = _apply_explicit_module_to_preview(session, explicit_module)
             routable = [
                 item
                 for item in session.pending_media
@@ -2260,9 +2352,14 @@ class FeishuBotController:
             ]
             for item in routable:
                 item["target_document_type"] = explicit_module
+            details = []
+            if changed_facts:
+                details.append(f"{changed_facts} 条资料")
+            if routable:
+                details.append(f"{len(routable)} 个附件")
             await self._reply(
                 message,
-                f"已将 {len(routable)} 个附件归到“{DOCUMENT_LABELS[explicit_module]}”。"
+                f"已将{'和'.join(details)}归到“{DOCUMENT_LABELS[explicit_module]}”。"
                 "需要写入时请 @机器人 回复“保存吧”。",
             )
             return
@@ -2593,14 +2690,24 @@ class FeishuBotController:
         updates = list(raw_updates) if isinstance(raw_updates, list) else []
         conflicts = preview.get("conflicts")
         has_conflicts = isinstance(conflicts, list) and bool(conflicts)
+        classification_ready = not bool(preview.get("classification_review_required"))
         crm_ready = not isinstance(resolution, dict) or resolution.get("status") in {
             "unique",
             "disabled",
         }
         media_updates = _pending_media_updates(session)
-        media_ready = bool(session.pending_media) and bool(merchant) and crm_ready and not has_conflicts
+        media_ready = (
+            bool(session.pending_media)
+            and bool(merchant)
+            and crm_ready
+            and not has_conflicts
+            and classification_ready
+        )
         profile_ready = (
-            preview.get("save_readiness") == "ready" and bool(updates) and not has_conflicts
+            preview.get("save_readiness") == "ready"
+            and bool(updates)
+            and not has_conflicts
+            and classification_ready
         )
         if not merchant or not (profile_ready or media_ready):
             if _is_group_message(message):
@@ -2619,6 +2726,14 @@ class FeishuBotController:
                         "检测到知识库现有资料不同，暂未写入：\n"
                         + "\n".join(lines)
                         + "\n如需用新值替换，请 @机器人 回复“确认替换”。",
+                    )
+                elif not classification_ready:
+                    await self._reply(
+                        message,
+                        str(
+                            preview.get("next_question")
+                            or "资料模块尚未确认，暂未写入。请明确回复要归入的模块。"
+                        ),
                     )
                 elif not merchant:
                     await self._reply(

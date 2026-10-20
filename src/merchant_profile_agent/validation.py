@@ -52,8 +52,11 @@ FIELD_PATH_ALIASES = {
     "stores.name": "stores.primary.name",
     "stores.address": "stores.primary.address",
     "stores.phone": "stores.primary.phone",
-    "system.network_topology": "installation.network_topology",
-    "configuration.network_topology": "installation.network_topology",
+}
+
+MODULE_CANONICAL_PREFIX = {
+    document_type: prefixes[0].removesuffix(".")
+    for document_type, prefixes in MODULES.items()
 }
 
 
@@ -61,11 +64,28 @@ class ProfileValidationError(ValueError):
     pass
 
 
+def canonical_field_path(field_path: str) -> str:
+    return FIELD_PATH_ALIASES.get(field_path, field_path)
+
+
 def document_for_field(field_path: str) -> str:
     for document_type, prefixes in MODULES.items():
         if any(field_path.startswith(prefix) for prefix in prefixes):
             return document_type
     raise ProfileValidationError(f"unsupported merchant profile field path: {field_path!r}")
+
+
+def reroute_field_path(field_path: str, document_type: str) -> str:
+    """Move a semantic field to a module without encoding content-specific rules."""
+    field_path = canonical_field_path(field_path)
+    if document_for_field(field_path) == document_type:
+        return field_path
+    prefix = MODULE_CANONICAL_PREFIX.get(document_type)
+    if prefix is None:
+        raise ProfileValidationError(f"unsupported document type: {document_type!r}")
+    parts = field_path.split(".", 1)
+    suffix = parts[1] if len(parts) == 2 else "notes"
+    return f"{prefix}.{suffix}"
 
 
 def _luhn_valid(candidate: str) -> bool:
@@ -103,7 +123,7 @@ def validate_update(raw: Mapping[str, Any]) -> dict[str, Any]:
     field_path = raw.get("field_path")
     if not isinstance(field_path, str) or not FIELD_PATH.fullmatch(field_path):
         raise ProfileValidationError("profile update field_path is invalid")
-    field_path = FIELD_PATH_ALIASES.get(field_path, field_path)
+    field_path = canonical_field_path(field_path)
     is_password_field = PLAINTEXT_PASSWORD_FIELD.fullmatch(field_path) is not None
     if SENSITIVE_FIELD_PATH.search(field_path) and not is_password_field:
         raise ProfileValidationError(f"profile update {field_path!r} targets sensitive data")
@@ -148,7 +168,7 @@ def _current_fields(profile: Mapping[str, Any] | None) -> dict[str, Any]:
     for field_path, raw_value in raw_fields.items():
         if not isinstance(field_path, str):
             continue
-        field_path = FIELD_PATH_ALIASES.get(field_path, field_path)
+        field_path = canonical_field_path(field_path)
         if isinstance(raw_value, Mapping) and "value" in raw_value:
             fields[field_path] = raw_value["value"]
         else:
