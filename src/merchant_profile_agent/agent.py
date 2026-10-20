@@ -42,6 +42,9 @@ Keep the knowledge base minimal:
   implementation or support. Keep the value concise and factual. For example, missing images or a
   mandatory choice with only one available option are recordable; vague aesthetic reactions such as
   "looks ugly" are not. Do not save an uncertain question as a fact.
+- Treat physical network topology as installation evidence, not software configuration. Routers,
+  cables, wall ports, LAN connections, printer wiring, NBN links, backup 4G routers and SIM-based
+  failover belong under installation.network_topology so they are stored in Hardware & Installation.
 
 Use only these field prefixes:
 - business.*, contacts.*
@@ -84,6 +87,7 @@ Use these canonical paths whenever they apply; do not invent shorter aliases:
   contacts.primary.email
 - contacts.secondary.name, contacts.secondary.phone, contacts.secondary.email
 - stores.primary.name, stores.primary.address, stores.primary.phone
+- installation.network_topology
 
 Treat supplied account details like every other durable merchant fact: include them in the normal
 preview without asking for any extra password-specific confirmation. The ordinary save confirmation

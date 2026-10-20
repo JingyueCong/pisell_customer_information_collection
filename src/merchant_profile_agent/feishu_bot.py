@@ -206,6 +206,7 @@ FIELD_LABELS = {
     "menu_collection.status": "菜单收集状态",
     "archive.folder_url": "资料文件夹",
     "archive.document_links": "文档链接",
+    "installation.network_topology": "网络拓扑",
     "communication.preferences": "沟通偏好",
     "communication.notes": "沟通特点",
     "content.url": "内容链接",
@@ -1289,11 +1290,16 @@ def _image_mime_type(data: bytes) -> str | None:
 def _image_file_name(message: Any, ordinal: int, media_type: str) -> str:
     content = getattr(message, "content", None)
     supplied = _resource_value(content, "file_name") or _resource_value(content, "name")
-    if isinstance(supplied, str) and supplied.strip():
-        return supplied.strip()
     extension = {"image/png": ".png", "image/jpeg": ".jpg", "image/webp": ".webp"}[
         media_type
     ]
+    if (
+        isinstance(supplied, str)
+        and supplied.strip()
+        and Path(supplied.strip()).suffix.lower()
+        in {".png", ".jpg", ".jpeg", ".webp"}
+    ):
+        return supplied.strip()
     message_id = re.sub(
         r"[^A-Za-z0-9_-]+", "_", str(getattr(message, "message_id", "image"))
     )[:80]
@@ -1915,7 +1921,14 @@ class FeishuBotController:
                 processing_reaction_id = await self._start_processing_status(message)
             media_failure: str | None = None
             try:
-                images, downloaded_media = await self._download_images(message)
+                # Native Feishu video messages expose a poster image in their raw
+                # payload. The video processor already produces representative key
+                # frames, so treating that poster as a separate original attachment
+                # creates a misleading duplicate beside the actual video.
+                if has_video:
+                    images, downloaded_media = [], []
+                else:
+                    images, downloaded_media = await self._download_images(message)
             except ImageInputError as exc:
                 if not _is_group_message(message):
                     # A normal URL preview can expose an inaccessible thumbnail.

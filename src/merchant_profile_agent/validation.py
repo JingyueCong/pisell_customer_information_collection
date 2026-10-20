@@ -52,6 +52,8 @@ FIELD_PATH_ALIASES = {
     "stores.name": "stores.primary.name",
     "stores.address": "stores.primary.address",
     "stores.phone": "stores.primary.phone",
+    "system.network_topology": "installation.network_topology",
+    "configuration.network_topology": "installation.network_topology",
 }
 
 

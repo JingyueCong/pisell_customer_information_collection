@@ -1132,6 +1132,18 @@ class FeishuBotTests(unittest.TestCase):
                 "file_name": "merchant-tour.mp4",
                 "duration_ms": 45_000,
             },
+            raw={
+                "event": {
+                    "message": {
+                        "content": json.dumps(
+                            {
+                                "file_key": "file_video",
+                                "image_key": "img_video_poster",
+                            }
+                        )
+                    }
+                }
+            },
         )
 
         asyncio.run(bot.on_message(message))

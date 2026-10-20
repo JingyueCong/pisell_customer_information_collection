@@ -32,6 +32,25 @@ class ValidationTests(unittest.TestCase):
             "contacts.primary.phone",
         )
 
+    def test_network_topology_is_canonicalized_to_hardware_installation(self) -> None:
+        for field_path in ("system.network_topology", "configuration.network_topology"):
+            with self.subTest(field_path=field_path):
+                result = validate_update_set(
+                    "MCKINLY Eatery",
+                    [
+                        update(
+                            field_path=field_path,
+                            value="NBN 路由器通过 LAN 口和墙内网线连接后厨打印机。",
+                        )
+                    ],
+                    {},
+                )
+                self.assertEqual(
+                    result["profile_updates"][0]["field_path"],
+                    "installation.network_topology",
+                )
+                self.assertEqual(result["affected_modules"], ["hardware-installation"])
+
     def test_alias_conflicts_with_existing_canonical_field(self) -> None:
         result = validate_update_set(
             "青禾便当",
