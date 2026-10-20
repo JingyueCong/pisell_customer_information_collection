@@ -24,6 +24,7 @@ MODULES: "OrderedDict[str, tuple[str, ...]]" = OrderedDict(
         ("document-archive", ("archive.", "documents.")),
         ("communication-profile", ("communication.",)),
         ("content-settings", ("content_setup.",)),
+        ("credential-records", ("credentials.",)),
     ]
 )
 
@@ -36,6 +37,9 @@ SENSITIVE_VALUE_LABEL = re.compile(
     r"(?:password|passcode|verification\s*code|api\s*key|access\s*token|private\s*key|"
     r"secret|bearer\s+[a-z0-9._-]+|密码|口令|验证码|密钥|访问令牌)",
     re.IGNORECASE,
+)
+PLAINTEXT_PASSWORD_FIELD = re.compile(
+    r"^credentials\.[a-z0-9_-]+\.password$"
 )
 PRIVATE_KEY_MARKER = re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----")
 LONG_DIGIT_CANDIDATE = re.compile(r"(?<!\d)(?:\d[ -]?){13,19}(?!\d)")
@@ -98,7 +102,8 @@ def validate_update(raw: Mapping[str, Any]) -> dict[str, Any]:
     if not isinstance(field_path, str) or not FIELD_PATH.fullmatch(field_path):
         raise ProfileValidationError("profile update field_path is invalid")
     field_path = FIELD_PATH_ALIASES.get(field_path, field_path)
-    if SENSITIVE_FIELD_PATH.search(field_path):
+    is_password_field = PLAINTEXT_PASSWORD_FIELD.fullmatch(field_path) is not None
+    if SENSITIVE_FIELD_PATH.search(field_path) and not is_password_field:
         raise ProfileValidationError(f"profile update {field_path!r} targets sensitive data")
     document_type = document_for_field(field_path)
 
@@ -107,7 +112,7 @@ def validate_update(raw: Mapping[str, Any]) -> dict[str, Any]:
         raise ProfileValidationError(f"profile update {field_path!r} has no text value")
     if len(value) > 4_000:
         raise ProfileValidationError(f"profile update {field_path!r} value is too long")
-    if contains_sensitive_value(value):
+    if not is_password_field and contains_sensitive_value(value):
         raise ProfileValidationError(f"profile update {field_path!r} contains sensitive data")
 
     source_ref = raw.get("source_ref")
@@ -173,7 +178,14 @@ def validate_update_set(
             accepted.append(update)
         elif str(current_value) == update["value"]:
             unchanged.append(
-                {"field_path": update["field_path"], "value": update["value"]}
+                {
+                    "field_path": update["field_path"],
+                    "value": (
+                        "••••••（已隐藏）"
+                        if PLAINTEXT_PASSWORD_FIELD.fullmatch(update["field_path"])
+                        else update["value"]
+                    ),
+                }
             )
         elif update["replace_confirmed"]:
             accepted.append(update)
@@ -181,8 +193,16 @@ def validate_update_set(
             conflicts.append(
                 {
                     "field_path": update["field_path"],
-                    "current_value": current_value,
-                    "proposed_value": update["value"],
+                    "current_value": (
+                        "••••••（已隐藏）"
+                        if PLAINTEXT_PASSWORD_FIELD.fullmatch(update["field_path"])
+                        else current_value
+                    ),
+                    "proposed_value": (
+                        "••••••（已隐藏）"
+                        if PLAINTEXT_PASSWORD_FIELD.fullmatch(update["field_path"])
+                        else update["value"]
+                    ),
                 }
             )
 

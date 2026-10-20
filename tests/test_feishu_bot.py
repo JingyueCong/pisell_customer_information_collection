@@ -15,6 +15,8 @@ from merchant_profile_agent.feishu_bot import (
     _group_summary_text,
     _is_group_profile_candidate,
     _messages_for_analysis,
+    _preview_text,
+    _profile_for_analysis,
     _without_video_placeholders,
 )
 from merchant_profile_agent.video import VideoEvidence
@@ -530,6 +532,58 @@ class FeishuBotTests(unittest.TestCase):
         self.assertNotIn("阶段总结", text)
         self.assertNotIn("可写入知识库", text)
         self.assertNotIn("member login", text)
+
+    def test_password_is_hidden_from_previews_conflicts_and_model_context(self) -> None:
+        example_password = "Example-Only-Password-123"
+        result = {
+            "profile_updates": [
+                {
+                    "field_path": "credentials.pisell_admin.password",
+                    "value": example_password,
+                }
+            ],
+            "conflicts": [
+                {
+                    "field_path": "credentials.pisell_admin.password",
+                    "current_value": "Old-Example-Password",
+                    "proposed_value": example_password,
+                }
+            ],
+            "decisions": [f"使用密码 {example_password}"],
+            "save_readiness": "needs_confirmation",
+        }
+
+        for rendered in (_preview_text(result), _group_summary_text(result)):
+            self.assertIn("密码：••••••", rendered)
+            self.assertNotIn(example_password, rendered)
+            self.assertNotIn("Old-Example-Password", rendered)
+
+        profile = {
+            "fields": {
+                "credentials.pisell_admin.password": {"value": example_password},
+                "credentials.pisell_admin.username": {"value": "demo@example.invalid"},
+            }
+        }
+        sanitized = _profile_for_analysis(profile)
+        self.assertEqual(
+            sanitized["fields"]["credentials.pisell_admin.password"]["value"],
+            "[已保存，未显示]",
+        )
+        self.assertEqual(
+            sanitized["fields"]["credentials.pisell_admin.username"]["value"],
+            "demo@example.invalid",
+        )
+        self.assertEqual(
+            profile["fields"]["credentials.pisell_admin.password"]["value"],
+            example_password,
+        )
+
+    def test_account_and_password_are_group_profile_candidates(self) -> None:
+        self.assertTrue(
+            _is_group_profile_candidate(
+                "商户后台账号 demo@example.invalid，密码 Example-Only-Password-123"
+            )
+        )
 
     def test_image_message_is_downloaded_analyzed_and_not_persisted_as_base64(self) -> None:
         message = Message(

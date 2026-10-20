@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import copy
 import json
 import logging
 import re
@@ -103,6 +104,7 @@ DOCUMENT_LABELS = {
     "document-archive": "资料归档",
     "communication-profile": "沟通特点",
     "content-settings": "内容设置注意事项",
+    "credential-records": "账号与密码",
 }
 FIELD_LABELS = {
     "project.feishu_link": "飞书项目链接",
@@ -165,6 +167,10 @@ FIELD_SUFFIX_LABELS = {
     "status": "状态",
     "hours": "营业时间",
     "notes": "备注",
+    "system": "系统",
+    "login_url": "登录入口",
+    "username": "账号",
+    "password": "密码",
 }
 
 
@@ -558,6 +564,10 @@ def _is_group_profile_candidate(text: str, *, has_media: bool = False) -> bool:
         "手机",
         "邮箱",
         "email",
+        "账号",
+        "密码",
+        "登录",
+        "后台",
         "业务",
         "规模",
         "员工",
@@ -714,7 +724,66 @@ def _field_label(field_path: Any) -> str:
     if path in FIELD_LABELS:
         return FIELD_LABELS[path]
     suffix = path.rsplit(".", 1)[-1]
-    return FIELD_SUFFIX_LABELS.get(suffix, suffix.replace("_", " ") or "资料")
+    label = FIELD_SUFFIX_LABELS.get(suffix, suffix.replace("_", " ") or "资料")
+    parts = path.split(".")
+    if len(parts) >= 3 and parts[0] == "credentials":
+        account = parts[1].replace("_", " ").replace("-", " ")
+        return f"{account} · {label}"
+    return label
+
+
+def _is_password_field(field_path: Any) -> bool:
+    path = str(field_path or "")
+    return (
+        path.startswith("credentials.")
+        and path.endswith(".password")
+        and len(path.split(".")) >= 3
+    )
+
+
+def _display_value(field_path: Any, value: Any) -> Any:
+    if _is_password_field(field_path):
+        return "••••••（已隐藏）"
+    return value
+
+
+def _profile_for_analysis(profile: Mapping[str, Any]) -> dict[str, Any]:
+    """Keep a committed password out of later model context and bot replies."""
+    result = copy.deepcopy(dict(profile))
+    fields = result.get("fields")
+    if not isinstance(fields, dict):
+        return result
+    for field_path, password in fields.items():
+        if not _is_password_field(field_path):
+            continue
+        if isinstance(password, dict) and "value" in password:
+            password["value"] = "[已保存，未显示]"
+        else:
+            fields[field_path] = "[已保存，未显示]"
+    return result
+
+
+def _hide_password_values(text: str, result: Mapping[str, Any]) -> str:
+    secrets: list[str] = []
+    for item in result.get("profile_updates") or []:
+        if isinstance(item, Mapping) and _is_password_field(item.get("field_path")):
+            secrets.append(str(item.get("value") or ""))
+    for item in result.get("conflicts") or []:
+        if isinstance(item, Mapping) and _is_password_field(item.get("field_path")):
+            secrets.extend(
+                [
+                    str(item.get("current_value") or ""),
+                    str(item.get("proposed_value") or ""),
+                ]
+            )
+    for secret in sorted({value for value in secrets if value}, key=len, reverse=True):
+        text = text.replace(secret, "••••••")
+    return re.sub(
+        r"((?:password|passcode|密码|口令)\s*(?:[:：=]|是)\s*)([^\s,，;；]+)",
+        r"\1••••••",
+        text,
+        flags=re.IGNORECASE,
+    )
 
 
 def _url_evidence_lines(result: dict[str, Any]) -> list[str]:
@@ -745,7 +814,10 @@ def _preview_text(result: dict[str, Any]) -> str:
         lines.append("待保存：")
         for item in updates[:20]:
             if isinstance(item, dict):
-                lines.append(f"- {_field_label(item.get('field_path'))}：{item.get('value')}")
+                lines.append(
+                    f"- {_field_label(item.get('field_path'))}："
+                    f"{_display_value(item.get('field_path'), item.get('value'))}"
+                )
     conflicts = result.get("conflicts")
     if isinstance(conflicts, list) and conflicts:
         if lines:
@@ -765,7 +837,7 @@ def _preview_text(result: dict[str, Any]) -> str:
         lines.append(str(result["next_question"]))
     else:
         lines.append(str(result.get("reply") or "没有需要记录的信息。"))
-    return "\n".join(lines)
+    return _hide_password_values("\n".join(lines), result)
 
 
 def _crm_question(resolution: dict[str, Any], merchant_name: str) -> str | None:
@@ -852,6 +924,10 @@ def _group_summary_text(result: dict[str, Any]) -> str:
                 "商务信息",
                 lambda path: path.startswith("commercial."),
             ),
+            (
+                "账号与密码",
+                lambda path: path.startswith("credentials."),
+            ),
         ]
         remaining = [item for item in updates[:20] if isinstance(item, dict)]
         for title, matches in definitions:
@@ -866,7 +942,8 @@ def _group_summary_text(result: dict[str, Any]) -> str:
                 title
                 + "：\n"
                 + "\n".join(
-                    f"- {_field_label(item.get('field_path'))}：{item.get('value')}"
+                    f"- {_field_label(item.get('field_path'))}："
+                    f"{_display_value(item.get('field_path'), item.get('value'))}"
                     for item in selected
                 )
             )
@@ -876,7 +953,8 @@ def _group_summary_text(result: dict[str, Any]) -> str:
             sections.append(
                 "其他商户资料：\n"
                 + "\n".join(
-                    f"- {_field_label(item.get('field_path'))}：{item.get('value')}"
+                    f"- {_field_label(item.get('field_path'))}："
+                    f"{_display_value(item.get('field_path'), item.get('value'))}"
                     for item in remaining
                 )
             )
@@ -894,7 +972,8 @@ def _group_summary_text(result: dict[str, Any]) -> str:
     if isinstance(conflicts, list) and conflicts:
         lines = [
             f"- {_field_label(item.get('field_path'))}："
-            f"{item.get('current_value')} → {item.get('proposed_value')}"
+            f"{_display_value(item.get('field_path'), item.get('current_value'))} → "
+            f"{_display_value(item.get('field_path'), item.get('proposed_value'))}"
             for item in conflicts[:10]
             if isinstance(item, dict)
         ]
@@ -921,7 +1000,7 @@ def _group_summary_text(result: dict[str, Any]) -> str:
         sections.append("本段没有需要记录的商户信息。")
     if result.get("save_readiness") == "ready" and updates:
         sections.append("以上内容尚未写入。如需保存，请 @机器人 回复“保存吧”。")
-    return "\n\n".join(sections)
+    return _hide_password_values("\n\n".join(sections), result)
 
 
 class ImageInputError(RuntimeError):
@@ -1370,7 +1449,7 @@ class FeishuBotController:
             session.current_profile = profile if isinstance(profile, dict) else {}
             self._apply_crm_resolution(session, read.get("crm"))
             session.current_profile_loaded = True
-        analysis_profile = dict(session.current_profile)
+        analysis_profile = _profile_for_analysis(session.current_profile)
         if session.merchant:
             existing_identity = analysis_profile.get("merchant")
             identity = dict(existing_identity) if isinstance(existing_identity, dict) else {}
@@ -1736,7 +1815,8 @@ class FeishuBotController:
                 if isinstance(conflicts, list) and conflicts:
                     lines = [
                         f"- {_field_label(item.get('field_path'))}："
-                        f"{item.get('current_value')} → {item.get('proposed_value')}"
+                        f"{_display_value(item.get('field_path'), item.get('current_value'))} → "
+                        f"{_display_value(item.get('field_path'), item.get('proposed_value'))}"
                         for item in conflicts[:10]
                         if isinstance(item, dict)
                     ]

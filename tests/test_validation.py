@@ -72,6 +72,7 @@ class ValidationTests(unittest.TestCase):
             "archive.folder_url": "document-archive",
             "communication.preferences": "communication-profile",
             "content_setup.notes": "content-settings",
+            "credentials.pisell_admin.password": "credential-records",
         }
         for field_path, document_type in cases.items():
             with self.subTest(field_path=field_path):
@@ -123,6 +124,47 @@ class ValidationTests(unittest.TestCase):
                     validate_update_set(
                         "青禾便当", [update(field_path="system.notes", value=value)], {}
                     )
+
+    def test_plaintext_password_is_allowed_only_in_password_field(self) -> None:
+        result = validate_update_set(
+            "青禾便当",
+            [
+                update(
+                    field_path="credentials.pisell_admin.password",
+                    value="后台密码是 Example-Only-123",
+                )
+            ],
+            {},
+        )
+
+        self.assertEqual(result["affected_modules"], ["credential-records"])
+        self.assertEqual(
+            result["profile_updates"][0]["value"],
+            "后台密码是 Example-Only-123",
+        )
+
+        with self.assertRaisesRegex(ProfileValidationError, "sensitive data"):
+            validate_update_set(
+                "青禾便当",
+                [update(field_path="credentials.api_key", value="Example-Only-123")],
+                {},
+            )
+
+    def test_password_conflict_values_are_hidden(self) -> None:
+        result = validate_update_set(
+            "青禾便当",
+            [
+                update(
+                    field_path="credentials.pisell_admin.password",
+                    value="New-Example-Password",
+                )
+            ],
+            {"credentials.pisell_admin.password": "Old-Example-Password"},
+        )
+
+        self.assertEqual(result["save_readiness"], "needs_confirmation")
+        self.assertEqual(result["conflicts"][0]["current_value"], "••••••（已隐藏）")
+        self.assertEqual(result["conflicts"][0]["proposed_value"], "••••••（已隐藏）")
 
     def test_duplicate_path_is_rejected(self) -> None:
         with self.assertRaisesRegex(ProfileValidationError, "duplicate field paths"):
