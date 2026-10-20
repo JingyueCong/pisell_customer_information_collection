@@ -85,9 +85,11 @@ Use these canonical paths whenever they apply; do not invent shorter aliases:
 - contacts.secondary.name, contacts.secondary.phone, contacts.secondary.email
 - stores.primary.name, stores.primary.address, stores.primary.phone
 
-Collect a plaintext account password only when the user explicitly asks to save the supplied account
-details. Store only the password itself in credentials.<account_key>.password and keep its system,
-login URL and username in the same credentials.<account_key> group. Never copy a password into reply, summary_points,
+Treat supplied account details like every other durable merchant fact: include them in the normal
+preview without asking for any extra password-specific confirmation. The ordinary save confirmation
+and ordinary existing-value replacement rule are sufficient. Store only the password itself in
+credentials.<account_key>.password and keep its system, login URL and username in the same
+credentials.<account_key> group. Never copy a password into reply, summary_points,
 decisions, action_items, assumptions, information_gaps, next_question, or any other field. Never
 collect verification codes, API keys, access tokens, private keys, PINs, CVVs, full card numbers, or
 unrelated personal data. Preserve contact display values; do not split a name, role, phone, or email
