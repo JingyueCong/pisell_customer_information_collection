@@ -19,6 +19,7 @@ from merchant_profile_agent.feishu_bot import (
     _profile_for_analysis,
     _without_video_placeholders,
 )
+from merchant_profile_agent.media_archive import MediaStagingStore
 from merchant_profile_agent.video import VideoEvidence
 
 
@@ -128,6 +129,64 @@ class FakeApi:
                 },
             }
         raise AssertionError(path)
+
+
+class FakeMediaArchiver:
+    def __init__(self) -> None:
+        self.calls = []
+
+    def archive(self, item, *, wiki_token):
+        self.calls.append((copy.deepcopy(item), wiki_token))
+        return {
+            "file_token": "file_archived_123",
+            "url": "https://example.feishu.cn/file/file_archived_123",
+            "name": item["file_name"],
+        }
+
+
+class ArchiveApi(FakeApi):
+    def post(self, path, payload):
+        if path != "/v1/profile/commit":
+            return super().post(path, payload)
+        self.calls.append((path, copy.deepcopy(payload)))
+        return {
+            "write_performed": True,
+            "result": {
+                "store_status": "stored",
+                "wiki_documents_updated": 2,
+                "documents": [
+                    {
+                        "document_type": "merchant-overview",
+                        "node_token": "wik_overview",
+                        "url": "https://example.feishu.cn/wiki/overview",
+                    },
+                    {
+                        "document_type": "document-archive",
+                        "node_token": "wik_archive",
+                        "url": "https://example.feishu.cn/wiki/archive",
+                    },
+                ],
+            },
+        }
+
+
+class MediaOnlyArchiveApi(ArchiveApi):
+    def post(self, path, payload):
+        if path == "/v1/profile/analyze":
+            self.calls.append((path, copy.deepcopy(payload)))
+            return {
+                "merchant": {"name": "青禾便当", "id": None},
+                "reply": "未从画面提取到新的文字资料。",
+                "profile_updates": [],
+                "conflicts": [],
+                "save_readiness": "needs_input",
+                "next_question": None,
+                "summary_points": [],
+                "decisions": [],
+                "action_items": [],
+                "information_gaps": [],
+            }
+        return super().post(path, payload)
 
 
 class MissingMerchantThenCorrectionApi(FakeApi):
@@ -608,6 +667,79 @@ class FeishuBotTests(unittest.TestCase):
         commit = next(payload for path, payload in self.api.calls if path == "/v1/profile/commit")
         self.assertNotIn("images", commit["messages"][0])
         self.assertIn("feishu://chat/oc_test/message/om_image", commit["messages"][0]["source_ref"])
+
+    def test_image_is_uploaded_and_linked_in_document_archive_on_save(self) -> None:
+        api = ArchiveApi()
+        archiver = FakeMediaArchiver()
+        with tempfile.TemporaryDirectory() as directory:
+            staging = MediaStagingStore(Path(directory))
+            bot = FeishuBotController(
+                api=api,  # type: ignore[arg-type]
+                channel=self.channel,
+                sessions=SessionStore(),
+                media_staging=staging,
+                media_archiver=archiver,  # type: ignore[arg-type]
+            )
+            message = Message(
+                "<image />",
+                message_id="om_archive_image",
+                content={"kind": "image", "image_key": "img_archive"},
+            )
+
+            asyncio.run(bot.on_message(message))
+            self.assertIn("待归档附件", self.channel.replies[-1][1]["text"])
+            session = bot.sessions.get("oc_test:ou_test:root")
+            staged_path = Path(session.pending_media[0]["local_path"])
+            self.assertTrue(staged_path.is_file())
+
+            asyncio.run(bot.on_message(Message("保存吧", message_id="om_save_archive")))
+
+            commits = [payload for path, payload in api.calls if path == "/v1/profile/commit"]
+            self.assertEqual(len(commits), 2)
+            first_paths = {item["field_path"] for item in commits[0]["updates"]}
+            self.assertTrue(any(path.startswith("documents.media_") for path in first_paths))
+            self.assertIn("documents.media_", " ".join(first_paths))
+            second_values = {
+                item["field_path"].rsplit(".", 1)[-1]: item["value"]
+                for item in commits[1]["updates"]
+            }
+            self.assertEqual(second_values["url"], "https://example.feishu.cn/file/file_archived_123")
+            self.assertEqual(second_values["status"], "已归档")
+            self.assertEqual(archiver.calls[0][1], "wik_archive")
+            self.assertFalse(staged_path.exists())
+            self.assertIn("已归档附件：1 个", self.channel.replies[-1][1]["text"])
+
+    def test_media_only_message_can_still_be_saved_to_archive(self) -> None:
+        api = MediaOnlyArchiveApi()
+        archiver = FakeMediaArchiver()
+        with tempfile.TemporaryDirectory() as directory:
+            bot = FeishuBotController(
+                api=api,  # type: ignore[arg-type]
+                channel=self.channel,
+                sessions=SessionStore(),
+                media_staging=MediaStagingStore(Path(directory)),
+                media_archiver=archiver,  # type: ignore[arg-type]
+            )
+            asyncio.run(
+                bot.on_message(
+                    Message(
+                        "青禾便当现场截图",
+                        message_id="om_media_only",
+                        content={"kind": "image", "image_key": "img_media_only"},
+                    )
+                )
+            )
+            asyncio.run(bot.on_message(Message("保存吧", message_id="om_save_media")))
+
+        commits = [payload for path, payload in api.calls if path == "/v1/profile/commit"]
+        self.assertEqual(len(commits), 2)
+        self.assertTrue(
+            all(
+                item["field_path"].startswith("documents.media_")
+                for item in commits[0]["updates"]
+            )
+        )
+        self.assertIn("已归档附件：1 个", self.channel.replies[-1][1]["text"])
 
     def test_image_key_can_be_recovered_from_raw_feishu_body(self) -> None:
         message = Message(

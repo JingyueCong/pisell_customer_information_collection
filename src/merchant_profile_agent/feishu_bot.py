@@ -14,6 +14,12 @@ from typing import Any, Mapping, Protocol
 
 from .api_client import MerchantApiClient, MerchantApiError
 from .video import VideoEvidence, VideoProcessingError
+from .media_archive import (
+    DownloadedMedia,
+    FeishuDriveArchiver,
+    MediaArchiveError,
+    MediaStagingStore,
+)
 
 
 LOGGER = logging.getLogger("merchant_profile_agent.feishu_bot")
@@ -212,6 +218,8 @@ class Session:
     crm_resolution: dict[str, Any] | None = None
     preview: dict[str, Any] | None = None
     last_documents: list[dict[str, str]] = field(default_factory=list)
+    pending_media: list[dict[str, Any]] = field(default_factory=list)
+    media_archive_node_token: str | None = None
     # Group collection is long-running by default. It only writes after an
     # explicit @bot save command; this flag is the user's persisted pause state.
     group_summary_enabled: bool = True
@@ -233,6 +241,8 @@ class Session:
         self.merchant = merchant
         self.crm_resolution = None
         self.preview = None
+        self.pending_media.clear()
+        self.media_archive_node_token = None
         self.group_followup_pending = False
         self.group_save_pending = False
         self.touched_at = time.time()
@@ -261,6 +271,8 @@ class SessionStore:
         "crm_resolution",
         "preview",
         "last_documents",
+        "pending_media",
+        "media_archive_node_token",
         "group_summary_enabled",
         "group_buffer",
         "group_pending_count",
@@ -1122,6 +1134,117 @@ def _image_mime_type(data: bytes) -> str | None:
     return None
 
 
+def _image_file_name(message: Any, ordinal: int, media_type: str) -> str:
+    content = getattr(message, "content", None)
+    supplied = _resource_value(content, "file_name") or _resource_value(content, "name")
+    if isinstance(supplied, str) and supplied.strip():
+        return supplied.strip()
+    extension = {"image/png": ".png", "image/jpeg": ".jpg", "image/webp": ".webp"}[
+        media_type
+    ]
+    message_id = re.sub(
+        r"[^A-Za-z0-9_-]+", "_", str(getattr(message, "message_id", "image"))
+    )[:80]
+    suffix = f"-{ordinal + 1}" if ordinal else ""
+    return f"screenshot-{message_id}{suffix}{extension}"
+
+
+def _media_preview_suffix(items: Sequence[Mapping[str, Any]]) -> str:
+    if not items:
+        return ""
+    names = [str(item.get("file_name") or "附件") for item in items[:5]]
+    remainder = len(items) - len(names)
+    line = "待归档附件：" + "、".join(names)
+    if remainder > 0:
+        line += f"，另有 {remainder} 个"
+    return f"\n\n{line}\n回复“保存吧”后会上传到 15｜资料归档。"
+
+
+def _current_profile_values(session: Session) -> dict[str, Any]:
+    fields = session.current_profile.get("fields")
+    if not isinstance(fields, Mapping):
+        return {}
+    values: dict[str, Any] = {}
+    for path, raw in fields.items():
+        if not isinstance(path, str):
+            continue
+        values[path] = raw.get("value") if isinstance(raw, Mapping) else raw
+    return values
+
+
+def _pending_media_updates(session: Session) -> list[dict[str, Any]]:
+    current = _current_profile_values(session)
+    updates: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in session.pending_media:
+        archive_id = str(item.get("archive_id") or "")
+        if (
+            not re.fullmatch(r"media_[a-f0-9]{16}", archive_id)
+            or archive_id in seen
+        ):
+            continue
+        seen.add(archive_id)
+        source_ref = str(item.get("source_ref") or "feishu://unknown")
+        values = {
+            "name": str(item.get("file_name") or "附件"),
+            "media_type": str(item.get("media_type") or "application/octet-stream"),
+            "size_bytes": str(item.get("size_bytes") or "0"),
+            "sha256": str(item.get("sha256") or ""),
+            "source_ref": source_ref,
+            "status": "待上传",
+        }
+        for suffix, value in values.items():
+            field_path = f"documents.{archive_id}.{suffix}"
+            if field_path in current:
+                continue
+            updates.append(
+                {
+                    "field_path": field_path,
+                    "value": value,
+                    "source_ref": source_ref,
+                    "replace_confirmed": False,
+                    "state": "explicit",
+                }
+            )
+    return updates
+
+
+def _archived_media_updates(
+    item: Mapping[str, Any], uploaded: Mapping[str, Any]
+) -> list[dict[str, Any]]:
+    archive_id = str(item["archive_id"])
+    source_ref = str(item.get("source_ref") or "feishu://unknown")
+    values = {
+        "url": str(uploaded["url"]),
+        "file_token": str(uploaded["file_token"]),
+        "status": "已归档",
+    }
+    return [
+        {
+            "field_path": f"documents.{archive_id}.{suffix}",
+            "value": value,
+            "source_ref": source_ref,
+            "replace_confirmed": suffix == "status",
+            "state": "explicit",
+        }
+        for suffix, value in values.items()
+    ]
+
+
+def _archive_wiki_token(store_result: Mapping[str, Any]) -> str | None:
+    documents = store_result.get("documents")
+    if not isinstance(documents, list):
+        return None
+    for item in documents:
+        if (
+            isinstance(item, Mapping)
+            and item.get("document_type") == "document-archive"
+            and isinstance(item.get("node_token"), str)
+        ):
+            return str(item["node_token"])
+    return None
+
+
 def _image_data_url_bytes(value: Any) -> int:
     if not isinstance(value, str) or ";base64," not in value:
         return 0
@@ -1193,6 +1316,8 @@ class FeishuBotController:
         video_processor: VideoProcessor | None = None,
         maximum_video_bytes: int = 25 * 1024 * 1024,
         maximum_video_duration_seconds: int = 300,
+        media_staging: MediaStagingStore | None = None,
+        media_archiver: FeishuDriveArchiver | None = None,
     ) -> None:
         self.api = api
         self.channel = channel
@@ -1203,6 +1328,8 @@ class FeishuBotController:
         self.video_processor = video_processor
         self.maximum_video_bytes = maximum_video_bytes
         self.maximum_video_duration_seconds = maximum_video_duration_seconds
+        self.media_staging = media_staging
+        self.media_archiver = media_archiver
 
     async def _post(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
         return await asyncio.to_thread(self.api.post, path, payload)
@@ -1212,15 +1339,52 @@ class FeishuBotController:
         # links, or mentions when a preview is echoed into a group chat.
         await self.channel.reply(message, {"text": text})
 
-    async def _download_images(self, message: Any) -> list[str]:
+    def _discard_pending_media(self, session: Session) -> None:
+        if self.media_staging is not None:
+            self.media_staging.discard(session.pending_media)
+        session.pending_media.clear()
+
+    def _stage_downloaded_media(
+        self, downloaded_media: Sequence[DownloadedMedia]
+    ) -> list[dict[str, Any]]:
+        if self.media_staging is None:
+            return []
+        staged: list[dict[str, Any]] = []
+        try:
+            for item in downloaded_media:
+                staged.append(self.media_staging.stage(item))
+        except MediaArchiveError:
+            self.media_staging.discard(staged)
+            raise
+        return staged
+
+    def _append_pending_media(
+        self, session: Session, staged: Sequence[dict[str, Any]]
+    ) -> None:
+        existing = {
+            str(item.get("archive_id") or "") for item in session.pending_media
+        }
+        for item in staged:
+            archive_id = str(item.get("archive_id") or "")
+            if archive_id in existing:
+                if self.media_staging is not None:
+                    self.media_staging.discard([item])
+                continue
+            session.pending_media.append(item)
+            existing.add(archive_id)
+
+    async def _download_images(
+        self, message: Any
+    ) -> tuple[list[str], list[DownloadedMedia]]:
         file_keys = _image_resource_keys(message)
         if not file_keys:
-            return []
+            return [], []
         if len(file_keys) > MAX_IMAGES_PER_MESSAGE:
             raise ImageInputError(f"每条消息最多支持 {MAX_IMAGES_PER_MESSAGE} 张图片。")
         image_data_urls: list[str] = []
+        downloaded: list[DownloadedMedia] = []
         total_bytes = 0
-        for file_key in file_keys:
+        for ordinal, file_key in enumerate(file_keys):
             try:
                 data = await self.channel.download_resource(
                     file_key,
@@ -1252,9 +1416,19 @@ class FeishuBotController:
                 raise ImageInputError("仅支持 PNG、JPEG 或 WEBP 图片。")
             encoded = base64.b64encode(data).decode("ascii")
             image_data_urls.append(f"data:{mime_type};base64,{encoded}")
-        return image_data_urls
+            downloaded.append(
+                DownloadedMedia(
+                    data=data,
+                    file_name=_image_file_name(message, ordinal, mime_type),
+                    media_type=mime_type,
+                    source_ref=_source_ref(message),
+                )
+            )
+        return image_data_urls, downloaded
 
-    async def _download_video(self, message: Any) -> VideoEvidence | None:
+    async def _download_video(
+        self, message: Any
+    ) -> tuple[VideoEvidence, DownloadedMedia] | None:
         resource = _video_resource(message)
         if resource is None:
             return None
@@ -1288,11 +1462,22 @@ class FeishuBotController:
                 f"视频不能超过 {self.maximum_video_bytes // (1024 * 1024)} MB。"
             )
         try:
-            return await asyncio.to_thread(
+            evidence = await asyncio.to_thread(
                 self.video_processor.process,
                 data,
                 file_name=resource.file_name,
                 duration_ms=resource.duration_ms,
+            )
+            return evidence, DownloadedMedia(
+                data=data,
+                file_name=resource.file_name,
+                media_type={
+                    ".mp4": "video/mp4",
+                    ".mov": "video/quicktime",
+                    ".m4v": "video/x-m4v",
+                    ".webm": "video/webm",
+                }.get(Path(resource.file_name).suffix.lower(), "video/mp4"),
+                source_ref=_source_ref(message),
             )
         except VideoProcessingError:
             raise
@@ -1318,7 +1503,7 @@ class FeishuBotController:
                         )
                     return
             try:
-                images = await self._download_images(message)
+                images, downloaded_media = await self._download_images(message)
             except ImageInputError as exc:
                 # Link previews and quoted rich posts may expose an image_key
                 # that Feishu refuses with "File not in msg". Keep valid text
@@ -1331,10 +1516,11 @@ class FeishuBotController:
                     str(getattr(message, "message_id", "") or "unknown"),
                 )
                 images = []
+                downloaded_media = []
             video = None
             if has_video:
                 try:
-                    video = await self._download_video(message)
+                    video_download = await self._download_video(message)
                 except VideoProcessingError as exc:
                     LOGGER.warning(
                         "video processing rejected message=%s: %s",
@@ -1343,6 +1529,9 @@ class FeishuBotController:
                     )
                     await self._reply(message, f"视频处理失败：{exc}")
                     return
+                if video_download is not None:
+                    video, downloaded_video = video_download
+                    downloaded_media.append(downloaded_video)
             if video is not None:
                 if video.transcript:
                     text = "\n".join(
@@ -1369,9 +1558,9 @@ class FeishuBotController:
             if not text:
                 return
             if _is_group_message(message):
-                await self._on_group_message(message, text, images)
+                await self._on_group_message(message, text, images, downloaded_media)
                 return
-            await self._on_direct_message(message, text, images)
+            await self._on_direct_message(message, text, images, downloaded_media)
         finally:
             try:
                 self.sessions.persist()
@@ -1379,7 +1568,11 @@ class FeishuBotController:
                 LOGGER.exception("could not persist Feishu session state")
 
     async def _on_direct_message(
-        self, message: Any, text: str, images: list[str]
+        self,
+        message: Any,
+        text: str,
+        images: list[str],
+        downloaded_media: list[DownloadedMedia],
     ) -> None:
         key = _session_key(message)
         if text in HELP_COMMANDS:
@@ -1393,6 +1586,8 @@ class FeishuBotController:
             )
             return
         if text in DISCARD_COMMANDS:
+            session = self.sessions.get(key)
+            self._discard_pending_media(session)
             self.sessions.discard(key)
             await self._reply(message, "已放弃，未写入知识库。")
             return
@@ -1420,8 +1615,15 @@ class FeishuBotController:
             session.messages = session.messages[-40:]
         try:
             preview = await self._analyze_session(session)
-            reply_text = _preview_text(preview)
+            if downloaded_media:
+                self._append_pending_media(
+                    session, self._stage_downloaded_media(downloaded_media)
+                )
+            reply_text = _preview_text(preview) + _media_preview_suffix(session.pending_media)
             await self._reply(message, reply_text)
+        except MediaArchiveError as exc:
+            session.messages.pop()
+            await self._reply(message, f"附件暂存失败：{exc}")
         except MerchantSwitchError:
             session.messages.pop()
             await self._reply(
@@ -1565,7 +1767,11 @@ class FeishuBotController:
             preview["information_gaps"] = gaps
 
     async def _on_group_message(
-        self, message: Any, text: str, images: list[str]
+        self,
+        message: Any,
+        text: str,
+        images: list[str],
+        downloaded_media: list[DownloadedMedia],
     ) -> None:
         key = _session_key(message)
         session = self.sessions.get(key)
@@ -1616,6 +1822,7 @@ class FeishuBotController:
             )
             return
         if mentioned and _matches_command(text, DISCARD_COMMANDS):
+            self._discard_pending_media(session)
             session.reset_draft()
             session.clear_group_buffer()
             await self._reply(message, "已放弃当前摘要草稿，静默记录仍开启。")
@@ -1665,6 +1872,14 @@ class FeishuBotController:
         }
         if images:
             user_message["images"] = images
+        if downloaded_media:
+            try:
+                self._append_pending_media(
+                    session, self._stage_downloaded_media(downloaded_media)
+                )
+            except MediaArchiveError as exc:
+                await self._reply(message, f"附件暂存失败：{exc}")
+                return
         session.group_buffer.append(user_message)
         session.group_pending_count += 1
         session.group_generation += 1
@@ -1731,7 +1946,10 @@ class FeishuBotController:
             return False
         session.clear_group_buffer()
         if reply_on_success or session.group_followup_pending:
-            await self._reply(message, _group_summary_text(preview))
+            await self._reply(
+                message,
+                _group_summary_text(preview) + _media_preview_suffix(session.pending_media),
+            )
         return True
 
     async def _summarize_group_followup(
@@ -1770,7 +1988,10 @@ class FeishuBotController:
             and updates
         )
         if reply_on_success or session.group_followup_pending:
-            await self._reply(message, _group_summary_text(preview))
+            await self._reply(
+                message,
+                _group_summary_text(preview) + _media_preview_suffix(session.pending_media),
+            )
         return True
 
     async def _save(self, message: Any, session: Session, confirmation: str) -> None:
@@ -1801,18 +2022,24 @@ class FeishuBotController:
                 return
         preview = session.preview or {}
         merchant = session.merchant
-        updates = preview.get("profile_updates")
-        if (
-            not merchant
-            or preview.get("save_readiness") != "ready"
-            or not isinstance(updates, list)
-            or not updates
-        ):
+        raw_updates = preview.get("profile_updates")
+        updates = list(raw_updates) if isinstance(raw_updates, list) else []
+        conflicts = preview.get("conflicts")
+        has_conflicts = isinstance(conflicts, list) and bool(conflicts)
+        crm_ready = not isinstance(resolution, dict) or resolution.get("status") in {
+            "unique",
+            "disabled",
+        }
+        media_updates = _pending_media_updates(session)
+        media_ready = bool(session.pending_media) and bool(merchant) and crm_ready and not has_conflicts
+        profile_ready = (
+            preview.get("save_readiness") == "ready" and bool(updates) and not has_conflicts
+        )
+        if not merchant or not (profile_ready or media_ready):
             if _is_group_message(message):
                 session.group_followup_pending = True
                 session.group_save_pending = True
-                conflicts = preview.get("conflicts")
-                if isinstance(conflicts, list) and conflicts:
+                if has_conflicts:
                     lines = [
                         f"- {_field_label(item.get('field_path'))}："
                         f"{_display_value(item.get('field_path'), item.get('current_value'))} → "
@@ -1831,7 +2058,7 @@ class FeishuBotController:
                         message,
                         "未识别到商户名称，暂未写入。请 @机器人 补充商户名称。",
                     )
-                elif not isinstance(updates, list) or not updates:
+                elif not updates and not session.pending_media:
                     session.group_followup_pending = False
                     session.group_save_pending = False
                     await self._reply(message, "没有需要写入的新资料。")
@@ -1849,54 +2076,143 @@ class FeishuBotController:
                 )
                 await self._reply(message, f"暂不能保存：{question}")
             return
-        try:
-            result = await self._post(
-                "/v1/profile/commit",
-                {
-                    "confirmation": confirmation,
-                    "conversation_id": f"feishu:{session.conversation_id}",
-                    "merchant": merchant,
-                    # Image bytes are used only for the preview analysis. The
-                    # durable event keeps the Feishu source reference, not a
-                    # base64 copy of the screenshot.
-                    "messages": [
+        messages = [
+            {
+                key: item[key]
+                for key in ("role", "content", "source_ref")
+                if key in item
+            }
+            for item in session.messages
+        ]
+        combined_updates = [*updates, *media_updates]
+        first_result: dict[str, Any] | None = None
+        first_store: dict[str, Any] = {}
+        documents: list[dict[str, str]] = []
+        if combined_updates:
+            try:
+                first_result = await self._post(
+                    "/v1/profile/commit",
+                    {
+                        "confirmation": confirmation,
+                        "conversation_id": f"feishu:{session.conversation_id}",
+                        "merchant": merchant,
+                        "messages": messages,
+                        "updates": combined_updates,
+                    },
+                )
+            except MerchantApiError as exc:
+                LOGGER.exception("merchant profile commit failed")
+                if exc.code == "crm_resolution_required":
+                    await self._reply(
+                        message,
+                        "保存前 CRM 身份校验未通过，暂未写入；草稿已保留。"
+                        "请重新发送“保存”，我会再次核对同一客户。",
+                    )
+                else:
+                    await self._reply(message, "保存失败，草稿已保留，请稍后重试。")
+                return
+            first_store = (
+                first_result.get("result")
+                if isinstance(first_result.get("result"), dict)
+                else {}
+            )
+            if not (first_result.get("write_performed") or first_store.get("duplicate")):
+                await self._reply(message, "提交未完成，草稿已保留。")
+                return
+            documents = _document_links(first_store)
+            session.media_archive_node_token = (
+                _archive_wiki_token(first_store) or session.media_archive_node_token
+            )
+
+        archived_count = 0
+        if session.pending_media:
+            current = _current_profile_values(session)
+            outstanding = [
+                item
+                for item in session.pending_media
+                if not current.get(f"documents.{item.get('archive_id')}.url")
+            ]
+            archived_count = len(session.pending_media) - len(outstanding)
+            if outstanding:
+                if self.media_archiver is None or not session.media_archive_node_token:
+                    session.current_profile_loaded = False
+                    session.preview = None
+                    await self._reply(
+                        message,
+                        "文字资料已写入，但附件尚未归档；草稿和原文件已保留，请稍后再次回复“保存吧”。",
+                    )
+                    return
+                uploaded_updates: list[dict[str, Any]] = []
+                try:
+                    for item in outstanding:
+                        uploaded = item.get("uploaded")
+                        if not isinstance(uploaded, Mapping):
+                            uploaded = await asyncio.to_thread(
+                                self.media_archiver.archive,
+                                item,
+                                wiki_token=session.media_archive_node_token,
+                            )
+                            item["uploaded"] = dict(uploaded)
+                        uploaded_updates.extend(_archived_media_updates(item, uploaded))
+                except MediaArchiveError as exc:
+                    LOGGER.exception("merchant media archive upload failed")
+                    session.current_profile_loaded = False
+                    session.preview = None
+                    await self._reply(
+                        message,
+                        f"文字资料已写入，但附件归档失败：{exc} 草稿和原文件已保留，可稍后重试。",
+                    )
+                    return
+                try:
+                    media_result = await self._post(
+                        "/v1/profile/commit",
                         {
-                            key: item[key]
-                            for key in ("role", "content", "source_ref")
-                            if key in item
-                        }
-                        for item in session.messages
-                    ],
-                    "updates": updates,
-                },
-            )
-        except MerchantApiError as exc:
-            LOGGER.exception("merchant profile commit failed")
-            if exc.code == "crm_resolution_required":
-                await self._reply(
-                    message,
-                    "保存前 CRM 身份校验未通过，暂未写入；草稿已保留。"
-                    "请重新发送“保存”，我会再次核对同一客户。",
+                            "confirmation": confirmation,
+                            "conversation_id": f"feishu:{session.conversation_id}:media",
+                            "merchant": merchant,
+                            "messages": messages,
+                            "updates": uploaded_updates,
+                        },
+                    )
+                except MerchantApiError:
+                    LOGGER.exception("merchant media link commit failed")
+                    session.current_profile_loaded = False
+                    session.preview = None
+                    await self._reply(
+                        message,
+                        "附件已上传，但资料归档链接写入失败；草稿已保留，可再次回复“保存吧”重试。",
+                    )
+                    return
+                media_store = (
+                    media_result.get("result")
+                    if isinstance(media_result.get("result"), dict)
+                    else {}
                 )
-            else:
-                await self._reply(message, "保存失败，草稿已保留，请稍后重试。")
-            return
-        store_result = result.get("result") if isinstance(result.get("result"), dict) else {}
-        if result.get("write_performed") or store_result.get("duplicate"):
-            duplicate = "（此前已保存，本次未重复写入）" if store_result.get("duplicate") else ""
-            documents = _document_links(store_result)
-            if documents:
-                session.last_documents = documents
-            if documents:
-                reply_text = "已写入：\n" + "\n".join(
-                    f"- {item['label']}：{item['url']}" for item in documents
-                )
-            else:
-                reply_text = f"已写入知识库。{duplicate}"
-            await self._reply(
-                message,
-                reply_text,
+                if not (media_result.get("write_performed") or media_store.get("duplicate")):
+                    session.current_profile_loaded = False
+                    session.preview = None
+                    await self._reply(message, "附件链接提交未完成，草稿已保留。")
+                    return
+                archived_count += len(outstanding)
+                media_documents = _document_links(media_store)
+                if media_documents:
+                    documents = media_documents
+
+        if documents:
+            session.last_documents = documents
+        duplicate = (
+            "（此前已保存，本次未重复写入）"
+            if first_store.get("duplicate") and not archived_count
+            else ""
+        )
+        if documents:
+            reply_text = "已写入：\n" + "\n".join(
+                f"- {item['label']}：{item['url']}" for item in documents
             )
-            session.reset_draft(preserve_merchant=_is_group_message(message))
-            return
-        await self._reply(message, "提交未完成，草稿已保留。")
+        else:
+            reply_text = f"已写入知识库。{duplicate}"
+        if archived_count:
+            reply_text += f"\n- 已归档附件：{archived_count} 个"
+        self._discard_pending_media(session)
+        await self._reply(message, reply_text)
+        session.reset_draft(preserve_merchant=_is_group_message(message))

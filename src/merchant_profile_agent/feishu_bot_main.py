@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import logging
 import os
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from .api_client import MerchantApiClient
 from .feishu_bot import FeishuBotController, SessionStore
+from .media_archive import FeishuDriveArchiver, MediaStagingStore
 from .settings import ConfigurationError, load_env_file
 from .video import OpenAIAudioTranscriber, OpenAIVideoProcessor
 
@@ -28,6 +31,38 @@ def _integer(name: str, default: int, minimum: int, maximum: int) -> int:
     if not minimum <= value <= maximum:
         raise ConfigurationError(f"{name} must be between {minimum} and {maximum}")
     return value
+
+
+def _feishu_origin() -> str:
+    configured = os.environ.get("FEISHU_DRIVE_ORIGIN", "").strip()
+    if configured:
+        parsed = urlsplit(configured)
+        if parsed.scheme == "https" and parsed.netloc:
+            return f"{parsed.scheme}://{parsed.netloc}"
+        raise ConfigurationError("FEISHU_DRIVE_ORIGIN must be an https origin")
+    config_path = os.environ.get("PISELL_FEISHU_DATA_LAYER_CONFIG", "").strip()
+    if config_path:
+        try:
+            payload = json.loads(Path(config_path).expanduser().read_text(encoding="utf-8"))
+            if not isinstance(payload, dict):
+                raise ValueError("data-layer config must be an object")
+            projection = payload.get("knowledge_projection", {})
+            profiles = (
+                projection.get("routing_profiles", {})
+                if isinstance(projection, dict)
+                else {}
+            )
+            for profile in profiles.values():
+                root_url = profile.get("root_url") if isinstance(profile, dict) else None
+                if isinstance(root_url, str):
+                    parsed = urlsplit(root_url)
+                    if parsed.scheme == "https" and parsed.netloc:
+                        return f"{parsed.scheme}://{parsed.netloc}"
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            logging.getLogger(__name__).warning(
+                "could not derive Feishu origin from data-layer config"
+            )
+    return "https://www.feishu.cn"
 
 
 def build_channel():
@@ -87,6 +122,17 @@ def build_channel():
         / "merchant-profile-feishu-sessions.json"
     )
     configured_session_store = os.environ.get("FEISHU_BOT_SESSION_STORE", "").strip()
+    media_staging_path = os.environ.get("FEISHU_MEDIA_STAGING_DIR", "").strip()
+    media_staging = MediaStagingStore(
+        Path(media_staging_path)
+        if media_staging_path
+        else Path.home() / "files" / "PiSell" / "merchant-profile-pending",
+        ttl_seconds=int(os.environ.get("FEISHU_BOT_SESSION_TTL", "604800")),
+    )
+    media_archiver = FeishuDriveArchiver(
+        executable=os.environ.get("LARK_CLI", "lark-cli").strip() or "lark-cli",
+        origin=_feishu_origin(),
+    )
     video_max_bytes = _integer(
         "FEISHU_VIDEO_MAX_BYTES", 25 * 1024 * 1024, 1024, 25 * 1024 * 1024
     )
@@ -122,6 +168,8 @@ def build_channel():
         video_processor=video_processor,
         maximum_video_bytes=video_max_bytes,
         maximum_video_duration_seconds=video_max_seconds,
+        media_staging=media_staging,
+        media_archiver=media_archiver,
     )
     channel.on("message", controller.on_message)
     channel.on("error", lambda error: logging.getLogger(__name__).error("channel error: %s", error))
