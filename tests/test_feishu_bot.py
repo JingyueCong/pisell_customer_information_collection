@@ -200,6 +200,11 @@ class ArchiveApi(FakeApi):
                         "node_token": "wik_package",
                         "url": "https://example.feishu.cn/wiki/package",
                     },
+                    {
+                        "document_type": "document-archive",
+                        "node_token": "wik_archive",
+                        "url": "https://example.feishu.cn/wiki/archive",
+                    },
                 ],
             },
         }
@@ -775,7 +780,7 @@ class FeishuBotTests(unittest.TestCase):
             self.assertFalse(staged_path.exists())
             self.assertIn("已保存到对应模块的附件：1 个", self.channel.replies[-1][1]["text"])
 
-    def test_media_only_message_requires_an_explicit_module_before_save(self) -> None:
+    def test_media_only_message_falls_back_to_document_archive(self) -> None:
         api = MediaOnlyArchiveApi()
         archiver = FakeMediaArchiver()
         with tempfile.TemporaryDirectory() as directory:
@@ -796,17 +801,47 @@ class FeishuBotTests(unittest.TestCase):
                 )
             )
             asyncio.run(bot.on_message(Message("保存吧", message_id="om_save_media")))
-            self.assertIn("尚未确定对应模块", self.channel.replies[-1][1]["text"])
-            self.assertFalse([payload for path, payload in api.calls if path == "/v1/profile/commit"])
+
+        commits = [payload for path, payload in api.calls if path == "/v1/profile/commit"]
+        self.assertEqual(len(commits), 2)
+        self.assertTrue(
+            all(
+                item["field_path"].startswith("documents.media_")
+                for item in commits[0]["updates"]
+            )
+        )
+        self.assertEqual(archiver.calls[0][1], "wik_archive")
+        self.assertIn("已保存到对应模块的附件：1 个", self.channel.replies[-1][1]["text"])
+
+    def test_user_can_override_fallback_archive_before_save(self) -> None:
+        api = MediaOnlyArchiveApi()
+        archiver = FakeMediaArchiver()
+        with tempfile.TemporaryDirectory() as directory:
+            bot = FeishuBotController(
+                api=api,  # type: ignore[arg-type]
+                channel=self.channel,
+                sessions=SessionStore(),
+                media_staging=MediaStagingStore(Path(directory)),
+                media_archiver=archiver,  # type: ignore[arg-type]
+            )
+            asyncio.run(
+                bot.on_message(
+                    Message(
+                        "青禾便当现场截图",
+                        message_id="om_media_override",
+                        content={"kind": "image", "image_key": "img_media_override"},
+                    )
+                )
+            )
+            self.assertIn("资料归档（未识别明确归属，兜底）", self.channel.replies[-1][1]["text"])
             asyncio.run(
                 bot.on_message(
                     Message("附件归到门店档案", message_id="om_route_media")
                 )
             )
-            asyncio.run(bot.on_message(Message("保存吧", message_id="om_save_media_2")))
+            asyncio.run(bot.on_message(Message("保存吧", message_id="om_save_media")))
 
         commits = [payload for path, payload in api.calls if path == "/v1/profile/commit"]
-        self.assertEqual(len(commits), 2)
         self.assertTrue(
             all(
                 item["field_path"].startswith("stores.evidence.media_")
@@ -814,7 +849,6 @@ class FeishuBotTests(unittest.TestCase):
             )
         )
         self.assertEqual(archiver.calls[0][1], "wik_store")
-        self.assertIn("已保存到对应模块的附件：1 个", self.channel.replies[-1][1]["text"])
 
     def test_pdf_file_uses_the_same_document_archive_flow(self) -> None:
         api = MediaOnlyArchiveApi()

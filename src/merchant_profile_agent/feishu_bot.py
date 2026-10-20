@@ -149,6 +149,7 @@ MEDIA_FIELD_PREFIXES = {
     "card-terminal": "card_terminal",
     "special-matters": "special",
     "menu-collection": "menu_collection",
+    "document-archive": "documents",
     "communication-profile": "communication",
     "content-settings": "content_setup",
     "credential-records": "credentials",
@@ -1309,7 +1310,8 @@ def _media_preview_suffix(items: Sequence[Mapping[str, Any]]) -> str:
         name = str(item.get("file_name") or "附件")
         document_type = str(item.get("target_document_type") or "")
         if document_type in MEDIA_FIELD_PREFIXES:
-            routed.append(f"- {name} → {DOCUMENT_LABELS[document_type]}")
+            suffix = "（未识别明确归属，兜底）" if document_type == "document-archive" else ""
+            routed.append(f"- {name} → {DOCUMENT_LABELS[document_type]}{suffix}")
         else:
             unresolved.append(name)
     lines = ["待保存附件：", *routed]
@@ -1352,6 +1354,8 @@ def _media_field_base(item: Mapping[str, Any]) -> str | None:
     prefix = MEDIA_FIELD_PREFIXES.get(document_type)
     if not prefix or not re.fullmatch(r"media_[a-f0-9]{16}", archive_id):
         return None
+    if document_type == "document-archive":
+        return f"documents.{archive_id}"
     return f"{prefix}.evidence.{archive_id}"
 
 
@@ -1437,8 +1441,7 @@ def _assign_media_modules(session: Session) -> None:
             )
             continue
         inferred = _infer_media_module_from_text(messages.get(source_ref, ""))
-        if inferred:
-            media["target_document_type"] = inferred
+        media["target_document_type"] = inferred or "document-archive"
 
 
 def _unresolved_media(session: Session) -> list[dict[str, Any]]:
@@ -2036,12 +2039,16 @@ class FeishuBotController:
             return
         explicit_module = _explicit_media_module(text)
         if explicit_module and session.pending_media:
-            unresolved = _unresolved_media(session)
-            for item in unresolved:
+            routable = [
+                item
+                for item in session.pending_media
+                if not isinstance(item.get("uploaded"), Mapping)
+            ]
+            for item in routable:
                 item["target_document_type"] = explicit_module
             await self._reply(
                 message,
-                f"已将 {len(unresolved)} 个待确认附件归到“{DOCUMENT_LABELS[explicit_module]}”。"
+                f"已将 {len(routable)} 个附件归到“{DOCUMENT_LABELS[explicit_module]}”。"
                 "回复“保存吧”即可写入。",
             )
             return
@@ -2233,12 +2240,16 @@ class FeishuBotController:
 
         explicit_module = _explicit_media_module(text) if mentioned else None
         if explicit_module and session.pending_media:
-            unresolved = _unresolved_media(session)
-            for item in unresolved:
+            routable = [
+                item
+                for item in session.pending_media
+                if not isinstance(item.get("uploaded"), Mapping)
+            ]
+            for item in routable:
                 item["target_document_type"] = explicit_module
             await self._reply(
                 message,
-                f"已将 {len(unresolved)} 个待确认附件归到“{DOCUMENT_LABELS[explicit_module]}”。"
+                f"已将 {len(routable)} 个附件归到“{DOCUMENT_LABELS[explicit_module]}”。"
                 "需要写入时请 @机器人 回复“保存吧”。",
             )
             return
