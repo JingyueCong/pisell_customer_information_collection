@@ -43,6 +43,12 @@ ARCHIVE_FILE_EXTENSIONS = {
 }
 SAVE_COMMANDS = {"结束并保存", "/save"}
 DISCARD_COMMANDS = {"放弃本次对话", "/discard"}
+TEXT_ONLY_SAVE_COMMANDS = {
+    "仅保存文字",
+    "只保存文字",
+    "忽略图片保存",
+    "忽略附件保存",
+}
 HELP_COMMANDS = {"/help", "帮助"}
 GROUP_ENABLE_COMMANDS = {
     "开始记录",
@@ -240,6 +246,7 @@ class Session:
     preview: dict[str, Any] | None = None
     last_documents: list[dict[str, str]] = field(default_factory=list)
     pending_media: list[dict[str, Any]] = field(default_factory=list)
+    media_failures: list[dict[str, str]] = field(default_factory=list)
     media_archive_node_token: str | None = None
     # Group collection is long-running by default. It only writes after an
     # explicit @bot save command; this flag is the user's persisted pause state.
@@ -263,6 +270,7 @@ class Session:
         self.crm_resolution = None
         self.preview = None
         self.pending_media.clear()
+        self.media_failures.clear()
         self.media_archive_node_token = None
         self.group_followup_pending = False
         self.group_save_pending = False
@@ -293,6 +301,7 @@ class SessionStore:
         "preview",
         "last_documents",
         "pending_media",
+        "media_failures",
         "media_archive_node_token",
         "group_summary_enabled",
         "group_buffer",
@@ -1085,6 +1094,45 @@ def _image_resource_keys(message: Any) -> list[str]:
     return keys
 
 
+def _resource_message_ids(message: Any) -> list[str]:
+    """Return plausible owners for resources embedded in quoted/rich messages."""
+
+    message_ids: list[str] = []
+
+    def append(value: Any) -> None:
+        if (
+            isinstance(value, str)
+            and value.startswith(("om_", "omt_"))
+            and value not in message_ids
+        ):
+            message_ids.append(value)
+
+    append(getattr(message, "message_id", None))
+
+    def collect(value: Any) -> None:
+        if isinstance(value, Mapping):
+            # These are the common resource-owning IDs exposed by Feishu for
+            # replies, quoted posts, threads and merged-forward children.
+            for key in ("message_id", "parent_id", "root_id", "upper_message_id"):
+                append(value.get(key))
+            for nested in value.values():
+                collect(nested)
+        elif isinstance(value, list):
+            for nested in value:
+                collect(nested)
+        elif isinstance(value, str) and any(
+            token in value
+            for token in ("message_id", "parent_id", "root_id", "upper_message_id")
+        ):
+            try:
+                collect(json.loads(value))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                return
+
+    collect(getattr(message, "raw", None))
+    return message_ids[:12]
+
+
 def _without_image_placeholders(text: str) -> str:
     text = re.sub(r"!\[image\]\([^)]+\)", " ", text)
     text = re.sub(r"<image\b[^>]*?/?>", " ", text, flags=re.IGNORECASE)
@@ -1218,6 +1266,17 @@ def _media_preview_suffix(items: Sequence[Mapping[str, Any]]) -> str:
     return f"\n\n{line}\n回复“保存吧”后会上传到 15｜资料归档。"
 
 
+def _media_failure_suffix(items: Sequence[Mapping[str, Any]]) -> str:
+    if not items:
+        return ""
+    count = len(items)
+    return (
+        f"\n\n⚠️ 有 {count} 个图片/附件未能从飞书读取，内容尚未进入总结，"
+        "本次不会保存这些附件中的信息。请重新发送原图；"
+        "如确认不需要图片内容，请 @机器人 回复“仅保存文字”。"
+    )
+
+
 def _current_profile_values(session: Session) -> dict[str, Any]:
     fields = session.current_profile.get("fields")
     if not isinstance(fields, Mapping):
@@ -1323,7 +1382,7 @@ def _messages_for_analysis(messages: list[dict[str, Any]]) -> list[dict[str, Any
         {
             key: value
             for key, value in message.items()
-            if key not in {"images", "has_media"}
+            if key not in {"images", "has_media", "media_failed"}
         }
         for message in messages
     ]
@@ -1435,6 +1494,35 @@ class FeishuBotController:
             session.pending_media.append(item)
             existing.add(archive_id)
 
+    @staticmethod
+    def _record_media_failure(
+        session: Session,
+        message: Any,
+        reason: str,
+    ) -> None:
+        source_ref = _source_ref(message)
+        if any(item.get("source_ref") == source_ref for item in session.media_failures):
+            return
+        session.media_failures.append(
+            {
+                "source_ref": source_ref,
+                "reason": reason,
+                "message_id": str(getattr(message, "message_id", "") or ""),
+                "sender_id": str(getattr(message, "sender_id", "") or ""),
+            }
+        )
+
+    @staticmethod
+    def _resolve_media_failures_for_sender(session: Session, message: Any) -> None:
+        sender_id = str(getattr(message, "sender_id", "") or "")
+        if not sender_id:
+            return
+        session.media_failures = [
+            item
+            for item in session.media_failures
+            if str(item.get("sender_id") or "") != sender_id
+        ]
+
     async def _download_images(
         self, message: Any
     ) -> tuple[list[str], list[DownloadedMedia]]:
@@ -1446,28 +1534,46 @@ class FeishuBotController:
         image_data_urls: list[str] = []
         downloaded: list[DownloadedMedia] = []
         total_bytes = 0
+        owner_message_ids = _resource_message_ids(message) or [None]
         for ordinal, file_key in enumerate(file_keys):
-            try:
-                data = await self.channel.download_resource(
-                    file_key,
-                    resource_type="image",
-                    message_id=str(getattr(message, "message_id", "") or "") or None,
-                )
-            except Exception as exc:
-                LOGGER.warning(
-                    "image resource download raised for message=%s key=%s: %s",
-                    str(getattr(message, "message_id", "") or "unknown"),
-                    file_key,
-                    exc,
-                )
-                raise ImageInputError("图片下载失败，请重新发送截图。") from exc
+            data: bytes | None = None
+            last_error: Exception | None = None
+            for owner_message_id in owner_message_ids:
+                try:
+                    candidate = await self.channel.download_resource(
+                        file_key,
+                        resource_type="image",
+                        message_id=owner_message_id,
+                    )
+                except Exception as exc:
+                    last_error = exc
+                    LOGGER.warning(
+                        "image resource download raised for message=%s owner=%s key=%s: %s",
+                        str(getattr(message, "message_id", "") or "unknown"),
+                        owner_message_id or "none",
+                        file_key,
+                        exc,
+                    )
+                    continue
+                if isinstance(candidate, bytes) and candidate:
+                    data = candidate
+                    if owner_message_id != owner_message_ids[0]:
+                        LOGGER.info(
+                            "image resource recovered from referenced message=%s key=%s",
+                            owner_message_id,
+                            file_key,
+                        )
+                    break
             if not isinstance(data, bytes) or not data:
                 LOGGER.warning(
-                    "image resource download returned no bytes for message=%s key=%s",
+                    "image resource download returned no bytes for message=%s owners=%s key=%s",
                     str(getattr(message, "message_id", "") or "unknown"),
+                    owner_message_ids,
                     file_key,
                 )
-                raise ImageInputError("图片下载失败，请重新发送截图。")
+                if last_error is not None:
+                    raise ImageInputError("图片下载失败，请重新发送原图。") from last_error
+                raise ImageInputError("图片下载失败，请重新发送原图。")
             if len(data) > MAX_IMAGE_BYTES:
                 raise ImageInputError("单张图片不能超过 4 MB。")
             total_bytes += len(data)
@@ -1593,21 +1699,34 @@ class FeishuBotController:
                             "本群记录已暂停。请 @机器人 回复“继续记录”恢复。",
                         )
                     return
+            media_failure: str | None = None
             try:
                 images, downloaded_media = await self._download_images(message)
             except ImageInputError as exc:
-                # Link previews and quoted rich posts may expose an image_key
-                # that Feishu refuses with "File not in msg". Keep valid text
-                # or video instead of failing the entire message.
-                if not text and not has_video:
-                    await self._reply(message, str(exc))
-                    return
-                LOGGER.warning(
-                    "ignoring unavailable optional image for text message=%s",
-                    str(getattr(message, "message_id", "") or "unknown"),
-                )
-                images = []
-                downloaded_media = []
+                if not _is_group_message(message):
+                    # A normal URL preview can expose an inaccessible thumbnail.
+                    # Keep useful direct-message text, while image-only messages
+                    # still fail explicitly instead of pretending to be read.
+                    if not text and not has_video:
+                        await self._reply(message, str(exc))
+                        return
+                    LOGGER.warning(
+                        "ignoring unavailable optional direct-message image for message=%s",
+                        str(getattr(message, "message_id", "") or "unknown"),
+                    )
+                    images = []
+                    downloaded_media = []
+                else:
+                    # Group collection stays silent, but failed evidence is retained
+                    # as a blocking state and surfaced on the next explicit summary
+                    # or save. It must never disappear behind a successful save.
+                    media_failure = str(exc)
+                    LOGGER.warning(
+                        "recording unavailable group image for message=%s",
+                        str(getattr(message, "message_id", "") or "unknown"),
+                    )
+                    images = []
+                    downloaded_media = []
             video = None
             if has_video:
                 try:
@@ -1655,10 +1774,16 @@ class FeishuBotController:
             if downloaded_media and not text:
                 names = "、".join(item.file_name for item in downloaded_media[:5])
                 text = f"用户上传了待归档文件：{names}。只记录文件元数据，不推断文件内容。"
-            if not text:
+            if not text and not media_failure:
                 return
             if _is_group_message(message):
-                await self._on_group_message(message, text, images, downloaded_media)
+                await self._on_group_message(
+                    message,
+                    text,
+                    images,
+                    downloaded_media,
+                    media_failure=media_failure,
+                )
                 return
             await self._on_direct_message(message, text, images, downloaded_media)
         finally:
@@ -1788,11 +1913,11 @@ class FeishuBotController:
                     )
                 )
                 if not explicit_switch:
-                    # Pronouns such as “他的地址” belong to the active merchant.
-                    merchant = {**merchant, "name": previous_name, "id": previous_id}
-                    preview["merchant"] = merchant
-                    proposed_name = str(previous_name)
-                    is_switch = False
+                    # The analyzer found a different merchant but the evidence
+                    # does not explicitly anchor that identity. Never silently
+                    # route it to the previously active merchant: a false prompt
+                    # is recoverable, while a cross-merchant write is not.
+                    raise MerchantSwitchError
                 elif has_unsaved_draft or session.group_followup_pending:
                     raise MerchantSwitchError
                 else:
@@ -1875,6 +2000,8 @@ class FeishuBotController:
         text: str,
         images: list[str],
         downloaded_media: list[DownloadedMedia],
+        *,
+        media_failure: str | None = None,
     ) -> None:
         key = _session_key(message)
         session = self.sessions.get(key)
@@ -1921,7 +2048,8 @@ class FeishuBotController:
                 message,
                 "本群默认静默记录，普通消息只进入草稿且不会自动发言。可用："
                 "@机器人 总结吧、@机器人 暂停记录、@机器人 保存吧、"
-                "@机器人 /discard。只有保存吧才会写知识库。",
+                "@机器人 /discard。图片读取失败时可重新发原图，或回复"
+                "“仅保存文字”。只有保存吧才会写知识库。",
             )
             return
         if mentioned and _matches_command(text, DISCARD_COMMANDS):
@@ -1947,6 +2075,21 @@ class FeishuBotController:
                     return
             await self._save(message, session, "结束并保存")
             return
+        if mentioned and _matches_command(text, TEXT_ONLY_SAVE_COMMANDS):
+            session.media_failures.clear()
+            if session.group_buffer:
+                if session.group_followup_pending:
+                    ready = await self._summarize_group_followup(
+                        session, message, reply_on_success=False
+                    )
+                else:
+                    ready = await self._summarize_group(
+                        session, message, reply_on_success=False
+                    )
+                if not ready:
+                    return
+            await self._save(message, session, "仅保存文字")
+            return
         if not mentioned and (
             _is_group_save_confirmation(text)
             or _matches_command(text, GROUP_ENABLE_COMMANDS)
@@ -1955,10 +2098,20 @@ class FeishuBotController:
             or _matches_command(text, DISCARD_COMMANDS)
         ):
             return
-        if not _is_effective_group_message(text):
+        failed_profile_media = bool(
+            media_failure
+            and (
+                not text
+                or _is_group_profile_candidate(text, has_media=False)
+            )
+        )
+        if not _is_effective_group_message(text) and not failed_profile_media:
             return
-        if not (session.group_followup_pending and mentioned) and not _is_group_profile_candidate(
-            text, has_media=bool(images or downloaded_media)
+        if not (session.group_followup_pending and mentioned) and not (
+            _is_group_profile_candidate(
+                text, has_media=bool(images or downloaded_media)
+            )
+            or failed_profile_media
         ):
             return
 
@@ -1967,7 +2120,8 @@ class FeishuBotController:
             sender_id = str(getattr(message, "sender_id", "") or "").strip()
             if sender_id:
                 sender_name = f"成员[{sender_id[-8:]}]"
-        content = f"{sender_name}：{text}" if sender_name else text
+        message_text = text or "用户上传了一张未能读取的图片。"
+        content = f"{sender_name}：{message_text}" if sender_name else message_text
         user_message: dict[str, Any] = {
             "role": "user",
             "content": content,
@@ -1977,11 +2131,19 @@ class FeishuBotController:
             user_message["images"] = images
         if downloaded_media:
             user_message["has_media"] = True
+        if failed_profile_media:
+            user_message["has_media"] = True
+            user_message["media_failed"] = True
+            self._record_media_failure(session, message, str(media_failure))
         if downloaded_media:
             try:
                 self._append_pending_media(
                     session, self._stage_downloaded_media(downloaded_media)
                 )
+                # A successful image from the same sender resolves that sender's
+                # unavailable-image state. Failures belonging to other members
+                # remain blocking, so unrelated uploads cannot hide them.
+                self._resolve_media_failures_for_sender(session, message)
             except MediaArchiveError as exc:
                 await self._reply(message, f"附件暂存失败：{exc}")
                 return
@@ -1991,6 +2153,12 @@ class FeishuBotController:
         session.group_last_message = message
         if mentioned:
             session.cancel_idle_task()
+            if failed_profile_media:
+                await self._reply(
+                    message,
+                    _media_failure_suffix(session.media_failures).strip(),
+                )
+                return
             if session.group_followup_pending:
                 save_pending = session.group_save_pending
                 analyzed = await self._summarize_group_followup(
@@ -2053,7 +2221,9 @@ class FeishuBotController:
         if reply_on_success or session.group_followup_pending:
             await self._reply(
                 message,
-                _group_summary_text(preview) + _media_preview_suffix(session.pending_media),
+                _group_summary_text(preview)
+                + _media_preview_suffix(session.pending_media)
+                + _media_failure_suffix(session.media_failures),
             )
         return True
 
@@ -2095,11 +2265,19 @@ class FeishuBotController:
         if reply_on_success or session.group_followup_pending:
             await self._reply(
                 message,
-                _group_summary_text(preview) + _media_preview_suffix(session.pending_media),
+                _group_summary_text(preview)
+                + _media_preview_suffix(session.pending_media)
+                + _media_failure_suffix(session.media_failures),
             )
         return True
 
     async def _save(self, message: Any, session: Session, confirmation: str) -> None:
+        if session.media_failures:
+            await self._reply(
+                message,
+                _media_failure_suffix(session.media_failures).strip(),
+            )
+            return
         resolution = session.crm_resolution
         preview_updates = (session.preview or {}).get("profile_updates")
         unresolved_crm = (

@@ -64,6 +64,16 @@ class MissingImageChannel(FakeChannel):
         return None
 
 
+class ReferencedImageChannel(FakeChannel):
+    async def download_resource(self, file_key, resource_type="image", message_id=None):
+        self.downloads.append((file_key, resource_type, message_id))
+        if message_id != "om_parent":
+            return None
+        return base64.b64decode(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+        )
+
+
 class FakeVideoProcessor:
     def __init__(self) -> None:
         self.calls = []
@@ -444,6 +454,36 @@ class NamedMerchantApi(FakeApi):
         }
 
 
+class UnanchoredSwitchApi(FakeApi):
+    def post(self, path, payload):
+        if path != "/v1/profile/analyze":
+            return super().post(path, payload)
+        self.calls.append((path, copy.deepcopy(payload)))
+        content = "\n".join(item["content"] for item in payload["messages"])
+        proposed_name = "Dandong咖啡厅" if "他的地址" in content else "青禾便当"
+        return {
+            "merchant": {"name": proposed_name, "id": None},
+            "reply": "已识别。",
+            "profile_updates": [
+                {
+                    "field_path": "stores.primary.address",
+                    "value": "123 Collins Street" if "他的地址" in content else "1 青禾路",
+                    "source_ref": payload["messages"][0]["source_ref"],
+                    "replace_confirmed": False,
+                    "state": "explicit",
+                    "document_type": "merchant-overview",
+                }
+            ],
+            "conflicts": [],
+            "save_readiness": "ready",
+            "next_question": None,
+            "summary_points": ["已识别地址"],
+            "decisions": [],
+            "action_items": [],
+            "information_gaps": [],
+        }
+
+
 class FeishuBotTests(unittest.TestCase):
     def setUp(self) -> None:
         self.api = FakeApi()
@@ -797,6 +837,40 @@ class FeishuBotTests(unittest.TestCase):
             [("img_real_raw_key", "image", "om_raw_image")],
         )
 
+    def test_image_download_retries_referenced_message_owner(self) -> None:
+        channel = ReferencedImageChannel()
+        bot = FeishuBotController(
+            api=self.api,  # type: ignore[arg-type]
+            channel=channel,
+            sessions=SessionStore(),
+        )
+        message = Message(
+            "青禾便当的联系人是林经理\n![image](img_quoted)",
+            message_id="om_wrapper",
+            content={"kind": "post"},
+            raw={
+                "event": {
+                    "message": {
+                        "message_id": "om_wrapper",
+                        "parent_id": "om_parent",
+                        "content": json.dumps({"image_key": "img_quoted"}),
+                    }
+                }
+            },
+        )
+
+        asyncio.run(bot.on_message(message))
+
+        self.assertEqual(
+            channel.downloads,
+            [
+                ("img_quoted", "image", "om_wrapper"),
+                ("img_quoted", "image", "om_parent"),
+            ],
+        )
+        analyze = next(payload for path, payload in self.api.calls if path == "/v1/profile/analyze")
+        self.assertIn("images", analyze["messages"][0])
+
     def test_unavailable_link_preview_image_does_not_block_text(self) -> None:
         channel = MissingImageChannel()
         bot = FeishuBotController(
@@ -857,6 +931,97 @@ class FeishuBotTests(unittest.TestCase):
         self.assertEqual(self.api.calls, [])
         self.assertEqual(channel.replies, [])
         self.assertEqual(sessions.get("oc_support:group:root").group_buffer, [])
+
+    def test_group_broken_merchant_image_blocks_save_until_user_chooses_text_only(self) -> None:
+        channel = MissingImageChannel()
+        sessions = SessionStore()
+        bot = FeishuBotController(
+            api=self.api,  # type: ignore[arg-type]
+            channel=channel,
+            sessions=sessions,
+        )
+        base = {
+            "chat_id": "oc_failed_media",
+            "chat_type": "group",
+            "sender_name": "测试成员",
+        }
+
+        asyncio.run(
+            bot.on_message(
+                Message(
+                    "青禾便当的联系人是林经理\n![image](img_missing)",
+                    message_id="om_failed_media",
+                    content={"kind": "post"},
+                    resources=[{"type": "image", "file_key": "img_missing"}],
+                    **base,
+                )
+            )
+        )
+        session = sessions.get("oc_failed_media:group:root")
+        self.assertEqual(len(session.media_failures), 1)
+        self.assertEqual(channel.replies, [])
+
+        asyncio.run(
+            bot.on_message(
+                Message(
+                    "保存吧",
+                    message_id="om_blocked_save",
+                    mentioned_bot=True,
+                    **base,
+                )
+            )
+        )
+
+        self.assertNotIn("/v1/profile/commit", [path for path, _ in self.api.calls])
+        self.assertIn("未能从飞书读取", channel.replies[-1][1]["text"])
+
+        asyncio.run(
+            bot.on_message(
+                Message(
+                    "仅保存文字",
+                    message_id="om_text_only_save",
+                    mentioned_bot=True,
+                    **base,
+                )
+            )
+        )
+
+        self.assertIn("/v1/profile/commit", [path for path, _ in self.api.calls])
+        self.assertEqual(session.media_failures, [])
+
+    def test_successful_group_image_resend_clears_failed_media_state(self) -> None:
+        channel = MissingImageChannel()
+        sessions = SessionStore()
+        bot = FeishuBotController(
+            api=self.api,  # type: ignore[arg-type]
+            channel=channel,
+            sessions=sessions,
+        )
+        base = {
+            "chat_id": "oc_resend",
+            "chat_type": "group",
+            "sender_name": "测试成员",
+        }
+        failed = Message(
+            "![image](img_failed)",
+            message_id="om_failed",
+            content={"kind": "image", "image_key": "img_failed"},
+            **base,
+        )
+        asyncio.run(bot.on_message(failed))
+        session = sessions.get("oc_resend:group:root")
+        self.assertEqual(len(session.media_failures), 1)
+
+        bot.channel = FakeChannel()
+        resent = Message(
+            "青禾便当现场截图",
+            message_id="om_resent",
+            content={"kind": "image", "image_key": "img_resent"},
+            **base,
+        )
+        asyncio.run(bot.on_message(resent))
+
+        self.assertEqual(session.media_failures, [])
 
     def test_video_is_transcribed_and_key_frames_are_analyzed_but_not_committed(self) -> None:
         processor = FakeVideoProcessor()
@@ -1263,6 +1428,34 @@ class FeishuBotTests(unittest.TestCase):
 
         commits = [payload for path, payload in api.calls if path == "/v1/profile/commit"]
         self.assertEqual([item["merchant"]["name"] for item in commits], ["青禾便当", "Dandong咖啡厅"])
+
+    def test_group_unanchored_new_merchant_is_not_routed_to_active_merchant(self) -> None:
+        api = UnanchoredSwitchApi()
+        bot = FeishuBotController(
+            api=api,  # type: ignore[arg-type]
+            channel=self.channel,
+            sessions=SessionStore(),
+        )
+
+        async def scenario() -> None:
+            base = {"chat_id": "oc_guard", "chat_type": "group", "sender_name": "测试成员"}
+            await bot.on_message(Message("青禾便当地址是 1 青禾路", message_id="om_one", **base))
+            await bot.on_message(
+                Message("保存吧", message_id="om_save_one", mentioned_bot=True, **base)
+            )
+            await bot.on_message(
+                Message("他的地址是 123 Collins Street", message_id="om_ambiguous", **base)
+            )
+            await bot.on_message(
+                Message("保存吧", message_id="om_save_two", mentioned_bot=True, **base)
+            )
+
+        asyncio.run(scenario())
+
+        commits = [payload for path, payload in api.calls if path == "/v1/profile/commit"]
+        self.assertEqual(len(commits), 1)
+        self.assertEqual(commits[0]["merchant"]["name"], "青禾便当")
+        self.assertIn("切换商户前", self.channel.replies[-1][1]["text"])
 
     def test_group_mentioned_save_without_data_does_not_write(self) -> None:
         self.run_group("保存吧", mentioned=True)
