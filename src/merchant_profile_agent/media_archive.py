@@ -111,7 +111,7 @@ class MediaStagingStore:
 
 
 class FeishuDriveArchiver:
-    """Upload staged media below a merchant's ``15｜资料归档`` Wiki node."""
+    """Upload staged media below its resolved merchant module Wiki node."""
 
     def __init__(
         self,
@@ -127,9 +127,9 @@ class FeishuDriveArchiver:
     def archive(self, item: Mapping[str, Any], *, wiki_token: str) -> dict[str, str]:
         path = Path(str(item.get("local_path") or "")).expanduser().resolve()
         if not path.is_file():
-            raise MediaArchiveError("待归档附件已不存在，请重新发送原文件。")
+            raise MediaArchiveError("待保存附件已不存在，请重新发送原文件。")
         if not wiki_token:
-            raise MediaArchiveError("未找到资料归档页面，附件尚未上传。")
+            raise MediaArchiveError("未找到附件对应的知识库模块，附件尚未上传。")
         name = _safe_file_name(
             str(item.get("file_name") or path.name), fallback="attachment.bin"
         )

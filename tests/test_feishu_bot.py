@@ -186,9 +186,19 @@ class ArchiveApi(FakeApi):
                         "url": "https://example.feishu.cn/wiki/overview",
                     },
                     {
-                        "document_type": "document-archive",
-                        "node_token": "wik_archive",
-                        "url": "https://example.feishu.cn/wiki/archive",
+                        "document_type": "business-contacts",
+                        "node_token": "wik_contacts",
+                        "url": "https://example.feishu.cn/wiki/contacts",
+                    },
+                    {
+                        "document_type": "store-profile",
+                        "node_token": "wik_store",
+                        "url": "https://example.feishu.cn/wiki/store",
+                    },
+                    {
+                        "document_type": "package-commercial",
+                        "node_token": "wik_package",
+                        "url": "https://example.feishu.cn/wiki/package",
                     },
                 ],
             },
@@ -723,7 +733,7 @@ class FeishuBotTests(unittest.TestCase):
         self.assertNotIn("images", commit["messages"][0])
         self.assertIn("feishu://chat/oc_test/message/om_image", commit["messages"][0]["source_ref"])
 
-    def test_image_is_uploaded_and_linked_in_document_archive_on_save(self) -> None:
+    def test_image_is_uploaded_and_linked_in_matching_module_on_save(self) -> None:
         api = ArchiveApi()
         archiver = FakeMediaArchiver()
         with tempfile.TemporaryDirectory() as directory:
@@ -742,7 +752,8 @@ class FeishuBotTests(unittest.TestCase):
             )
 
             asyncio.run(bot.on_message(message))
-            self.assertIn("待归档附件", self.channel.replies[-1][1]["text"])
+            self.assertIn("待保存附件", self.channel.replies[-1][1]["text"])
+            self.assertIn("业务与联系人", self.channel.replies[-1][1]["text"])
             session = bot.sessions.get("oc_test:ou_test:root")
             staged_path = Path(session.pending_media[0]["local_path"])
             self.assertTrue(staged_path.is_file())
@@ -752,19 +763,19 @@ class FeishuBotTests(unittest.TestCase):
             commits = [payload for path, payload in api.calls if path == "/v1/profile/commit"]
             self.assertEqual(len(commits), 2)
             first_paths = {item["field_path"] for item in commits[0]["updates"]}
-            self.assertTrue(any(path.startswith("documents.media_") for path in first_paths))
-            self.assertIn("documents.media_", " ".join(first_paths))
+            self.assertTrue(any(path.startswith("business.evidence.media_") for path in first_paths))
+            self.assertIn("business.evidence.media_", " ".join(first_paths))
             second_values = {
                 item["field_path"].rsplit(".", 1)[-1]: item["value"]
                 for item in commits[1]["updates"]
             }
             self.assertEqual(second_values["url"], "https://example.feishu.cn/file/file_archived_123")
-            self.assertEqual(second_values["status"], "已归档")
-            self.assertEqual(archiver.calls[0][1], "wik_archive")
+            self.assertEqual(second_values["status"], "已保存")
+            self.assertEqual(archiver.calls[0][1], "wik_contacts")
             self.assertFalse(staged_path.exists())
-            self.assertIn("已归档附件：1 个", self.channel.replies[-1][1]["text"])
+            self.assertIn("已保存到对应模块的附件：1 个", self.channel.replies[-1][1]["text"])
 
-    def test_media_only_message_can_still_be_saved_to_archive(self) -> None:
+    def test_media_only_message_requires_an_explicit_module_before_save(self) -> None:
         api = MediaOnlyArchiveApi()
         archiver = FakeMediaArchiver()
         with tempfile.TemporaryDirectory() as directory:
@@ -785,16 +796,25 @@ class FeishuBotTests(unittest.TestCase):
                 )
             )
             asyncio.run(bot.on_message(Message("保存吧", message_id="om_save_media")))
+            self.assertIn("尚未确定对应模块", self.channel.replies[-1][1]["text"])
+            self.assertFalse([payload for path, payload in api.calls if path == "/v1/profile/commit"])
+            asyncio.run(
+                bot.on_message(
+                    Message("附件归到门店档案", message_id="om_route_media")
+                )
+            )
+            asyncio.run(bot.on_message(Message("保存吧", message_id="om_save_media_2")))
 
         commits = [payload for path, payload in api.calls if path == "/v1/profile/commit"]
         self.assertEqual(len(commits), 2)
         self.assertTrue(
             all(
-                item["field_path"].startswith("documents.media_")
+                item["field_path"].startswith("stores.evidence.media_")
                 for item in commits[0]["updates"]
             )
         )
-        self.assertIn("已归档附件：1 个", self.channel.replies[-1][1]["text"])
+        self.assertEqual(archiver.calls[0][1], "wik_store")
+        self.assertIn("已保存到对应模块的附件：1 个", self.channel.replies[-1][1]["text"])
 
     def test_pdf_file_uses_the_same_document_archive_flow(self) -> None:
         api = MediaOnlyArchiveApi()
@@ -829,7 +849,8 @@ class FeishuBotTests(unittest.TestCase):
             asyncio.run(bot.on_message(Message("保存吧", message_id="om_save_pdf")))
 
         self.assertEqual(archiver.calls[0][0]["file_name"], "NAB_Statement.pdf")
-        self.assertIn("已归档附件：1 个", self.channel.replies[-1][1]["text"])
+        self.assertEqual(archiver.calls[0][1], "wik_package")
+        self.assertIn("已保存到对应模块的附件：1 个", self.channel.replies[-1][1]["text"])
 
     def test_image_key_can_be_recovered_from_raw_feishu_body(self) -> None:
         message = Message(

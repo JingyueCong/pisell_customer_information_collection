@@ -21,6 +21,7 @@ from .media_archive import (
     MediaArchiveError,
     MediaStagingStore,
 )
+from .validation import document_for_field
 
 
 LOGGER = logging.getLogger("merchant_profile_agent.feishu_bot")
@@ -133,6 +134,42 @@ DOCUMENT_LABELS = {
     "content-settings": "内容设置注意事项",
     "credential-records": "账号与密码",
 }
+MEDIA_FIELD_PREFIXES = {
+    "business-contacts": "business",
+    "menu-content": "menu",
+    "system-configuration": "system",
+    "hardware-installation": "hardware",
+    "risk-compliance": "risk",
+    "commercial-information": "commercial",
+    "store-profile": "stores",
+    "project-progress": "project",
+    "data-collection": "collection",
+    "package-commercial": "package",
+    "hardware-records": "hardware_record",
+    "card-terminal": "card_terminal",
+    "special-matters": "special",
+    "menu-collection": "menu_collection",
+    "communication-profile": "communication",
+    "content-settings": "content_setup",
+    "credential-records": "credentials",
+}
+MEDIA_ROUTE_PRIORITY = tuple(MEDIA_FIELD_PREFIXES)
+MEDIA_ROUTE_KEYWORDS = (
+    ("credential-records", ("账号", "帐号", "密码", "登录", "登陆", "后台", "username", "password", "login")),
+    ("menu-collection", ("菜单文件", "菜单照片", "菜单截图", "菜品照片", "菜品图片", "menu file", "menu photo")),
+    ("card-terminal", ("刷卡机", "eftpos", "surcharge")),
+    ("hardware-records", ("打印机", "pos机", "pos 机", "设备清单", "硬件设备", "机器视频", "printer")),
+    ("hardware-installation", ("安装", "布线", "接线", "网络设备")),
+    ("project-progress", ("项目进度", "项目链接", "上线进度")),
+    ("package-commercial", ("套餐", "付款方式", "扣款", "账单", "statement")),
+    ("risk-compliance", ("风控", "合规", "证件", "abn", "合同")),
+    ("store-profile", ("门店照片", "店铺照片", "门店地址", "店铺地址", "店面")),
+    ("business-contacts", ("联系人", "联系电话", "联系邮箱", "名片")),
+    ("content-settings", ("内容设置", "页面设置", "图片设置")),
+    ("system-configuration", ("系统配置", "报错截图", "故障视频", "点餐流程", "操作视频")),
+    ("commercial-information", ("商务", "报价", "佣金", "费用")),
+    ("data-collection", ("商家信息表", "资料表", "申请表")),
+)
 FIELD_LABELS = {
     "project.feishu_link": "飞书项目链接",
     "project.status": "项目进度",
@@ -255,7 +292,7 @@ class Session:
     last_documents: list[dict[str, str]] = field(default_factory=list)
     pending_media: list[dict[str, Any]] = field(default_factory=list)
     media_failures: list[dict[str, str]] = field(default_factory=list)
-    media_archive_node_token: str | None = None
+    media_module_node_tokens: dict[str, str] = field(default_factory=dict)
     # Group collection is long-running by default. It only writes after an
     # explicit @bot save command; this flag is the user's persisted pause state.
     group_summary_enabled: bool = True
@@ -279,7 +316,7 @@ class Session:
         self.preview = None
         self.pending_media.clear()
         self.media_failures.clear()
-        self.media_archive_node_token = None
+        self.media_module_node_tokens.clear()
         self.group_followup_pending = False
         self.group_save_pending = False
         self.touched_at = time.time()
@@ -310,7 +347,7 @@ class SessionStore:
         "last_documents",
         "pending_media",
         "media_failures",
-        "media_archive_node_token",
+        "media_module_node_tokens",
         "group_summary_enabled",
         "group_buffer",
         "group_pending_count",
@@ -1266,12 +1303,24 @@ def _image_file_name(message: Any, ordinal: int, media_type: str) -> str:
 def _media_preview_suffix(items: Sequence[Mapping[str, Any]]) -> str:
     if not items:
         return ""
-    names = [str(item.get("file_name") or "附件") for item in items[:5]]
-    remainder = len(items) - len(names)
-    line = "待归档附件：" + "、".join(names)
-    if remainder > 0:
-        line += f"，另有 {remainder} 个"
-    return f"\n\n{line}\n回复“保存吧”后会上传到 15｜资料归档。"
+    routed: list[str] = []
+    unresolved: list[str] = []
+    for item in items[:5]:
+        name = str(item.get("file_name") or "附件")
+        document_type = str(item.get("target_document_type") or "")
+        if document_type in MEDIA_FIELD_PREFIXES:
+            routed.append(f"- {name} → {DOCUMENT_LABELS[document_type]}")
+        else:
+            unresolved.append(name)
+    lines = ["待保存附件：", *routed]
+    if unresolved:
+        lines.append("- 待确认模块：" + "、".join(unresolved))
+        lines.append("请回复“附件归到菜单/硬件设备/账号与密码”等明确模块后再保存。")
+    else:
+        lines.append("回复“保存吧”后会上传到上面的对应模块。")
+    if len(items) > 5:
+        lines.append(f"另有 {len(items) - 5} 个附件。")
+    return "\n\n" + "\n".join(lines)
 
 
 def _media_failure_suffix(items: Sequence[Mapping[str, Any]]) -> str:
@@ -1297,16 +1346,113 @@ def _current_profile_values(session: Session) -> dict[str, Any]:
     return values
 
 
+def _media_field_base(item: Mapping[str, Any]) -> str | None:
+    archive_id = str(item.get("archive_id") or "")
+    document_type = str(item.get("target_document_type") or "")
+    prefix = MEDIA_FIELD_PREFIXES.get(document_type)
+    if not prefix or not re.fullmatch(r"media_[a-f0-9]{16}", archive_id):
+        return None
+    return f"{prefix}.evidence.{archive_id}"
+
+
+def _document_type_for_update(item: Mapping[str, Any]) -> str | None:
+    document_type = str(item.get("document_type") or "")
+    if document_type in MEDIA_FIELD_PREFIXES:
+        return document_type
+    field_path = item.get("field_path")
+    if not isinstance(field_path, str):
+        return None
+    try:
+        document_type = document_for_field(field_path)
+    except (ValueError, TypeError):
+        return None
+    return document_type if document_type in MEDIA_FIELD_PREFIXES else None
+
+
+def _infer_media_module_from_text(text: str) -> str | None:
+    normalized = text.casefold()
+    matches = [
+        document_type
+        for document_type, keywords in MEDIA_ROUTE_KEYWORDS
+        if any(keyword in normalized for keyword in keywords)
+    ]
+    return matches[0] if len(set(matches)) == 1 else None
+
+
+def _explicit_media_module(text: str) -> str | None:
+    normalized = _normalize_intent_text(text)
+    if not any(term in normalized for term in ("归到", "放到", "存到", "存进", "属于", "这是")):
+        return None
+    aliases = {
+        "菜单与内容": "menu-content",
+        "菜单": "menu-collection",
+        "系统配置": "system-configuration",
+        "硬件与安装": "hardware-installation",
+        "硬件设备": "hardware-records",
+        "刷卡机": "card-terminal",
+        "风控合规": "risk-compliance",
+        "商务信息": "commercial-information",
+        "门店档案": "store-profile",
+        "项目进度": "project-progress",
+        "资料收集": "data-collection",
+        "套餐商务": "package-commercial",
+        "特殊事项": "special-matters",
+        "沟通特点": "communication-profile",
+        "内容设置": "content-settings",
+        "账号与密码": "credential-records",
+        "账号密码": "credential-records",
+        "联系人": "business-contacts",
+    }
+    for label in sorted(aliases, key=len, reverse=True):
+        if label in normalized:
+            return aliases[label]
+    return None
+
+
+def _assign_media_modules(session: Session) -> None:
+    updates = (session.preview or {}).get("profile_updates")
+    update_items = updates if isinstance(updates, list) else []
+    messages = {
+        str(item.get("source_ref") or ""): str(item.get("content") or "")
+        for item in session.messages
+        if isinstance(item, Mapping)
+    }
+    priority = {name: index for index, name in enumerate(MEDIA_ROUTE_PRIORITY)}
+    for media in session.pending_media:
+        if str(media.get("target_document_type") or "") in MEDIA_FIELD_PREFIXES:
+            continue
+        source_ref = str(media.get("source_ref") or "")
+        candidates = [
+            candidate
+            for update in update_items
+            if isinstance(update, Mapping)
+            and str(update.get("source_ref") or "") == source_ref
+            and (candidate := _document_type_for_update(update)) is not None
+        ]
+        if candidates:
+            counts = {candidate: candidates.count(candidate) for candidate in set(candidates)}
+            media["target_document_type"] = min(
+                counts,
+                key=lambda candidate: (-counts[candidate], priority.get(candidate, 999)),
+            )
+            continue
+        inferred = _infer_media_module_from_text(messages.get(source_ref, ""))
+        if inferred:
+            media["target_document_type"] = inferred
+
+
+def _unresolved_media(session: Session) -> list[dict[str, Any]]:
+    return [item for item in session.pending_media if _media_field_base(item) is None]
+
+
 def _pending_media_updates(session: Session) -> list[dict[str, Any]]:
     current = _current_profile_values(session)
     updates: list[dict[str, Any]] = []
     seen: set[str] = set()
     for item in session.pending_media:
         archive_id = str(item.get("archive_id") or "")
-        if (
-            not re.fullmatch(r"media_[a-f0-9]{16}", archive_id)
-            or archive_id in seen
-        ):
+        field_base = _media_field_base(item)
+        if field_base is None or archive_id in seen:
             continue
         seen.add(archive_id)
         source_ref = str(item.get("source_ref") or "feishu://unknown")
@@ -1316,10 +1462,10 @@ def _pending_media_updates(session: Session) -> list[dict[str, Any]]:
             "size_bytes": str(item.get("size_bytes") or "0"),
             "sha256": str(item.get("sha256") or ""),
             "source_ref": source_ref,
-            "status": "待上传",
+            "status": "待保存",
         }
         for suffix, value in values.items():
-            field_path = f"documents.{archive_id}.{suffix}"
+            field_path = f"{field_base}.{suffix}"
             if field_path in current:
                 continue
             updates.append(
@@ -1338,15 +1484,18 @@ def _archived_media_updates(
     item: Mapping[str, Any], uploaded: Mapping[str, Any]
 ) -> list[dict[str, Any]]:
     archive_id = str(item["archive_id"])
+    field_base = _media_field_base(item)
+    if field_base is None:
+        raise MediaArchiveError("附件尚未确定所属模块。")
     source_ref = str(item.get("source_ref") or "feishu://unknown")
     values = {
         "url": str(uploaded["url"]),
         "file_token": str(uploaded["file_token"]),
-        "status": "已归档",
+        "status": "已保存",
     }
     return [
         {
-            "field_path": f"documents.{archive_id}.{suffix}",
+            "field_path": f"{field_base}.{suffix}",
             "value": value,
             "source_ref": source_ref,
             "replace_confirmed": suffix == "status",
@@ -1356,18 +1505,19 @@ def _archived_media_updates(
     ]
 
 
-def _archive_wiki_token(store_result: Mapping[str, Any]) -> str | None:
+def _document_node_tokens(store_result: Mapping[str, Any]) -> dict[str, str]:
     documents = store_result.get("documents")
     if not isinstance(documents, list):
-        return None
+        return {}
+    result: dict[str, str] = {}
     for item in documents:
-        if (
-            isinstance(item, Mapping)
-            and item.get("document_type") == "document-archive"
-            and isinstance(item.get("node_token"), str)
-        ):
-            return str(item["node_token"])
-    return None
+        if not isinstance(item, Mapping):
+            continue
+        document_type = str(item.get("document_type") or "")
+        node_token = item.get("node_token")
+        if document_type in MEDIA_FIELD_PREFIXES and isinstance(node_token, str) and node_token:
+            result[document_type] = node_token
+    return result
 
 
 def _image_data_url_bytes(value: Any) -> int:
@@ -1884,6 +2034,17 @@ class FeishuBotController:
         if _is_link_request(text):
             await self._reply(message, _links_text(session.last_documents))
             return
+        explicit_module = _explicit_media_module(text)
+        if explicit_module and session.pending_media:
+            unresolved = _unresolved_media(session)
+            for item in unresolved:
+                item["target_document_type"] = explicit_module
+            await self._reply(
+                message,
+                f"已将 {len(unresolved)} 个待确认附件归到“{DOCUMENT_LABELS[explicit_module]}”。"
+                "回复“保存吧”即可写入。",
+            )
+            return
         if _is_save_confirmation(text):
             await self._save(message, session, "结束并保存")
             return
@@ -1909,6 +2070,7 @@ class FeishuBotController:
                 self._append_pending_media(
                     session, self._stage_downloaded_media(downloaded_media)
                 )
+                _assign_media_modules(session)
             reply_text = _preview_text(preview) + _media_preview_suffix(session.pending_media)
             await self._reply(message, reply_text)
         except MediaArchiveError as exc:
@@ -2068,6 +2230,18 @@ class FeishuBotController:
         key = _session_key(message)
         session = self.sessions.get(key)
         mentioned = bool(getattr(message, "mentioned_bot", False))
+
+        explicit_module = _explicit_media_module(text) if mentioned else None
+        if explicit_module and session.pending_media:
+            unresolved = _unresolved_media(session)
+            for item in unresolved:
+                item["target_document_type"] = explicit_module
+            await self._reply(
+                message,
+                f"已将 {len(unresolved)} 个待确认附件归到“{DOCUMENT_LABELS[explicit_module]}”。"
+                "需要写入时请 @机器人 回复“保存吧”。",
+            )
+            return
 
         if mentioned and _is_group_pause_intent(text):
             session.group_summary_enabled = False
@@ -2290,6 +2464,7 @@ class FeishuBotController:
             LOGGER.exception("group summary API request failed")
             await self._reply(message, "本段总结失败，消息仍保留，将稍后重试。")
             return False
+        _assign_media_modules(session)
         session.clear_group_buffer()
         if reply_on_success or session.group_followup_pending:
             await self._reply(
@@ -2327,6 +2502,7 @@ class FeishuBotController:
             LOGGER.exception("group follow-up analysis failed")
             await self._reply(message, "补充信息处理失败，消息仍保留，请稍后重试。")
             return False
+        _assign_media_modules(session)
         session.clear_group_buffer()
         updates = preview.get("profile_updates")
         session.group_followup_pending = not (
@@ -2376,6 +2552,17 @@ class FeishuBotController:
                 LOGGER.exception("CRM refresh before save failed")
                 await self._reply(message, "CRM 查询暂不可用，草稿已保留，请稍后重试。")
                 return
+        _assign_media_modules(session)
+        unresolved_media = _unresolved_media(session)
+        if unresolved_media:
+            names = "、".join(str(item.get("file_name") or "附件") for item in unresolved_media[:5])
+            await self._reply(
+                message,
+                "附件尚未确定对应模块，暂未写入："
+                + names
+                + "。请 @机器人 回复“附件归到菜单/硬件设备/账号与密码”等明确模块。",
+            )
+            return
         preview = session.preview or {}
         merchant = session.merchant
         raw_updates = preview.get("profile_updates")
@@ -2476,9 +2663,7 @@ class FeishuBotController:
                 await self._reply(message, "提交未完成，草稿已保留。")
                 return
             documents = _document_links(first_store)
-            session.media_archive_node_token = (
-                _archive_wiki_token(first_store) or session.media_archive_node_token
-            )
+            session.media_module_node_tokens.update(_document_node_tokens(first_store))
 
         archived_count = 0
         if session.pending_media:
@@ -2486,16 +2671,26 @@ class FeishuBotController:
             outstanding = [
                 item
                 for item in session.pending_media
-                if not current.get(f"documents.{item.get('archive_id')}.url")
+                if not current.get(f"{_media_field_base(item)}.url")
             ]
             archived_count = len(session.pending_media) - len(outstanding)
             if outstanding:
-                if self.media_archiver is None or not session.media_archive_node_token:
+                missing_modules = sorted(
+                    {
+                        str(item.get("target_document_type") or "")
+                        for item in outstanding
+                        if not session.media_module_node_tokens.get(
+                            str(item.get("target_document_type") or "")
+                        )
+                    }
+                )
+                if self.media_archiver is None or missing_modules:
                     session.current_profile_loaded = False
                     session.preview = None
                     await self._reply(
                         message,
-                        "文字资料已写入，但附件尚未归档；草稿和原文件已保留，请稍后再次回复“保存吧”。",
+                        "文字资料已写入，但未找到附件对应模块页面；"
+                        "草稿和原文件已保留，请稍后再次回复“保存吧”。",
                     )
                     return
                 uploaded_updates: list[dict[str, Any]] = []
@@ -2506,7 +2701,9 @@ class FeishuBotController:
                             uploaded = await asyncio.to_thread(
                                 self.media_archiver.archive,
                                 item,
-                                wiki_token=session.media_archive_node_token,
+                                wiki_token=session.media_module_node_tokens[
+                                    str(item["target_document_type"])
+                                ],
                             )
                             item["uploaded"] = dict(uploaded)
                         uploaded_updates.extend(_archived_media_updates(item, uploaded))
@@ -2536,7 +2733,7 @@ class FeishuBotController:
                     session.preview = None
                     await self._reply(
                         message,
-                        "附件已上传，但资料归档链接写入失败；草稿已保留，可再次回复“保存吧”重试。",
+                        "附件已上传，但对应模块的链接写入失败；草稿已保留，可再次回复“保存吧”重试。",
                     )
                     return
                 media_store = (
@@ -2568,7 +2765,7 @@ class FeishuBotController:
         else:
             reply_text = f"已写入知识库。{duplicate}"
         if archived_count:
-            reply_text += f"\n- 已归档附件：{archived_count} 个"
+            reply_text += f"\n- 已保存到对应模块的附件：{archived_count} 个"
         self._discard_pending_media(session)
         await self._reply(message, reply_text)
         session.reset_draft(preserve_merchant=_is_group_message(message))
