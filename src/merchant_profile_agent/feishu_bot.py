@@ -11,9 +11,14 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Mapping, Protocol
+from typing import Any, Mapping, Protocol, Sequence
 
 from .api_client import MerchantApiClient, MerchantApiError
+from .codex_dialogue import (
+    CodexDialogueError,
+    DialogueDecision,
+    DialogueRouter,
+)
 from .video import VideoEvidence, VideoProcessingError
 from .media_archive import (
     DownloadedMedia,
@@ -299,6 +304,7 @@ class Session:
     pending_media: list[dict[str, Any]] = field(default_factory=list)
     media_failures: list[dict[str, str]] = field(default_factory=list)
     media_module_node_tokens: dict[str, str] = field(default_factory=dict)
+    codex_dialogue_session_id: str | None = None
     # Group collection is long-running by default. It only writes after an
     # explicit @bot save command; this flag is the user's persisted pause state.
     group_summary_enabled: bool = True
@@ -323,6 +329,7 @@ class Session:
         self.pending_media.clear()
         self.media_failures.clear()
         self.media_module_node_tokens.clear()
+        self.codex_dialogue_session_id = None
         self.group_followup_pending = False
         self.group_save_pending = False
         self.touched_at = time.time()
@@ -354,6 +361,7 @@ class SessionStore:
         "pending_media",
         "media_failures",
         "media_module_node_tokens",
+        "codex_dialogue_session_id",
         "group_summary_enabled",
         "group_buffer",
         "group_pending_count",
@@ -408,7 +416,7 @@ class SessionStore:
         if self.state_path is None:
             return
         payload = {
-            "version": 2,
+            "version": 3,
             "sessions": {
                 key: {
                     name: getattr(session, name)
@@ -1873,6 +1881,7 @@ class FeishuBotController:
         maximum_video_duration_seconds: int = 300,
         media_staging: MediaStagingStore | None = None,
         media_archiver: FeishuDriveArchiver | None = None,
+        dialogue_router: DialogueRouter | None = None,
     ) -> None:
         self.api = api
         self.channel = channel
@@ -1885,6 +1894,7 @@ class FeishuBotController:
         self.maximum_video_duration_seconds = maximum_video_duration_seconds
         self.media_staging = media_staging
         self.media_archiver = media_archiver
+        self.dialogue_router = dialogue_router
 
     async def _post(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
         return await asyncio.to_thread(self.api.post, path, payload)
@@ -1893,6 +1903,59 @@ class FeishuBotController:
         # Plain text prevents user-supplied values from becoming active markdown,
         # links, or mentions when a preview is echoed into a group chat.
         await self.channel.reply(message, {"text": text})
+
+    @staticmethod
+    def _dialogue_context(session: Session, *, is_group: bool) -> dict[str, Any]:
+        preview = session.preview if isinstance(session.preview, Mapping) else {}
+        merchant = session.merchant if isinstance(session.merchant, Mapping) else {}
+        return {
+            "channel": "group" if is_group else "direct",
+            "merchant_name": str(merchant.get("name") or ""),
+            "draft_message_count": len(session.messages),
+            "group_buffer_count": len(session.group_buffer),
+            "has_unsaved_preview": bool(preview),
+            "save_readiness": str(preview.get("save_readiness") or "unknown"),
+            "next_question": str(preview.get("next_question") or ""),
+            "pending_attachment_names": [
+                str(item.get("file_name") or "附件")
+                for item in session.pending_media[:10]
+            ],
+            "media_failures": [
+                str(item.get("reason") or "读取失败")
+                for item in session.media_failures[:10]
+            ],
+            "last_saved_pages": [
+                str(item.get("label") or "知识库页面")
+                for item in session.last_documents[:10]
+            ],
+            "group_recording_enabled": session.group_summary_enabled,
+            "awaiting_followup": session.group_followup_pending,
+        }
+
+    async def _decide_dialogue(
+        self,
+        session: Session,
+        text: str,
+        *,
+        is_group: bool,
+    ) -> DialogueDecision | None:
+        if self.dialogue_router is None or not text.strip():
+            return None
+        try:
+            turn = await asyncio.to_thread(
+                self.dialogue_router.route,
+                text=text,
+                context=self._dialogue_context(session, is_group=is_group),
+                session_id=session.codex_dialogue_session_id,
+            )
+        except CodexDialogueError:
+            LOGGER.exception("Codex dialogue routing failed; using local fallback")
+            return None
+        except Exception:
+            LOGGER.exception("unexpected Codex dialogue routing failure; using local fallback")
+            return None
+        session.codex_dialogue_session_id = turn.session_id
+        return turn.decision
 
     async def _start_processing_status(self, message: Any) -> str | None:
         method = getattr(self.channel, "add_typing_reaction", None)
@@ -2121,6 +2184,160 @@ class FeishuBotController:
             + _media_preview_suffix(session.pending_media)
             + _media_failure_suffix(session.media_failures),
         )
+
+    async def _handle_group_dialogue_action(
+        self,
+        session: Session,
+        message: Any,
+        decision: DialogueDecision,
+    ) -> bool:
+        """Execute one Codex-selected action through existing guarded paths."""
+
+        action = decision.action
+        if action == "record":
+            return False
+        if action == "reply":
+            await self._reply(
+                message,
+                decision.reply or "你可以补充商户资料，或让我总结、重试、保存当前草稿。",
+            )
+            return True
+        if action == "summarize":
+            if session.group_followup_pending:
+                save_pending = session.group_save_pending
+                analyzed = await self._summarize_group_followup(
+                    session,
+                    message,
+                    reply_on_success=not save_pending,
+                )
+                if analyzed and save_pending and not session.group_followup_pending:
+                    await self._save(message, session, "结束并保存")
+            else:
+                await self._summarize_group(session, message)
+            return True
+        if action == "retry":
+            await self._retry_group_work(session, message)
+            return True
+        if action == "media_status":
+            if session.media_failures:
+                await self._reply(message, _media_failure_suffix(session.media_failures).strip())
+            else:
+                await self._reply(message, "当前草稿没有图片或附件读取失败记录。")
+            return True
+        if action == "help":
+            await self._reply(
+                message,
+                "本群会静默收集商户资料；@我后可以自然地说“帮我总结一下”、"
+                "“刚才哪个附件没读到”、“你再试一次”或“把文字和图片保存”。"
+                "只有明确要求保存时才会写知识库。",
+            )
+            return True
+        if action == "links":
+            await self._reply(message, _links_text(session.last_documents))
+            return True
+        if action == "pause":
+            session.group_summary_enabled = False
+            session.clear_group_buffer()
+            await self._reply(message, "静默记录已暂停；需要恢复时直接 @我说继续记录。")
+            return True
+        if action == "resume":
+            session.group_summary_enabled = True
+            await self._reply(message, "本群已恢复静默记录；需要查看时直接 @我让我总结。")
+            return True
+        if action == "discard":
+            self._discard_pending_media(session)
+            session.reset_draft()
+            session.clear_group_buffer()
+            await self._reply(message, "已放弃当前摘要草稿，静默记录仍开启。")
+            return True
+        if action in {"save", "save_text_only"}:
+            if action == "save_text_only":
+                session.media_failures.clear()
+            if session.group_buffer:
+                if session.group_followup_pending:
+                    ready = await self._summarize_group_followup(
+                        session, message, reply_on_success=False
+                    )
+                else:
+                    ready = await self._summarize_group(
+                        session, message, reply_on_success=False
+                    )
+                if not ready:
+                    return True
+            await self._save(
+                message,
+                session,
+                "仅保存文字" if action == "save_text_only" else "结束并保存",
+            )
+            return True
+        return False
+
+    async def _handle_direct_dialogue_action(
+        self,
+        *,
+        key: str,
+        session: Session,
+        message: Any,
+        decision: DialogueDecision,
+    ) -> bool:
+        action = decision.action
+        if action == "record":
+            return False
+        if action == "reply":
+            await self._reply(
+                message,
+                decision.reply or "请补充要记录的商户资料，或告诉我想查看、重试还是保存。",
+            )
+            return True
+        if action == "help":
+            await self._reply(
+                message,
+                "直接发送商户名称、文字、截图、视频或文件即可。我会先形成草稿；"
+                "你明确说保存后才会写入知识库。也可以自然地问我当前状态或让我重试。",
+            )
+            return True
+        if action == "links":
+            await self._reply(message, _links_text(session.last_documents))
+            return True
+        if action == "media_status":
+            if session.media_failures:
+                await self._reply(message, _media_failure_suffix(session.media_failures).strip())
+            else:
+                await self._reply(message, "当前草稿没有图片或附件读取失败记录。")
+            return True
+        if action == "discard":
+            self._discard_pending_media(session)
+            self.sessions.discard(key)
+            await self._reply(message, "已放弃，未写入知识库。")
+            return True
+        if action in {"save", "save_text_only"}:
+            if action == "save_text_only":
+                session.media_failures.clear()
+            await self._save(
+                message,
+                session,
+                "仅保存文字" if action == "save_text_only" else "结束并保存",
+            )
+            return True
+        if action in {"summarize", "retry"}:
+            if not session.messages:
+                await self._reply(message, "当前还没有可整理的商户资料。")
+                return True
+            try:
+                preview = await self._analyze_session(session)
+            except (ImageBatchLimitError, MerchantSwitchError, MerchantApiError):
+                LOGGER.exception("direct dialogue re-analysis failed")
+                await self._reply(message, "重新分析暂时失败，草稿仍保留，请稍后再试。")
+                return True
+            await self._reply(
+                message,
+                _preview_text(preview) + _media_preview_suffix(session.pending_media),
+            )
+            return True
+        if action in {"pause", "resume"}:
+            await self._reply(message, "暂停或恢复记录只适用于群聊；私聊会一直保留当前草稿。")
+            return True
+        return False
 
     async def _download_images(
         self, message: Any
@@ -2471,6 +2688,15 @@ class FeishuBotController:
             await self._save(message, session, "结束并保存")
             return
 
+        decision = await self._decide_dialogue(session, text, is_group=False)
+        if decision is not None and await self._handle_direct_dialogue_action(
+            key=key,
+            session=session,
+            message=message,
+            decision=decision,
+        ):
+            return
+
         user_message: dict[str, Any] = {
             "role": "user",
             "content": text,
@@ -2809,6 +3035,14 @@ class FeishuBotController:
                     return
             await self._save(message, session, "仅保存文字")
             return
+        if mentioned:
+            decision = await self._decide_dialogue(session, text, is_group=True)
+            if decision is not None and await self._handle_group_dialogue_action(
+                session,
+                message,
+                decision,
+            ):
+                return
         if not mentioned and (
             _is_group_save_confirmation(text)
             or _matches_command(text, GROUP_ENABLE_COMMANDS)

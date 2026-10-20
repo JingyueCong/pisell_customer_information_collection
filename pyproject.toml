@@ -4,13 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pisell-merchant-profile-agent"
-version = "0.14.1"
+version = "0.15.0"
 description = "A standalone, API-first merchant profile collection agent"
 readme = "README.md"
 requires-python = ">=3.11"
 license = {text = "Proprietary"}
 authors = [{name = "PiSell"}]
-dependencies = []
+dependencies = ["openai>=3.35.1,<4"]
 
 [project.optional-dependencies]
 feishu = ["lark-channel-sdk>=1.4,<2", "imageio-ffmpeg>=0.6,<1"]

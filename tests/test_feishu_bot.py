@@ -25,6 +25,7 @@ from merchant_profile_agent.feishu_bot import (
     _profile_for_analysis,
     _without_video_placeholders,
 )
+from merchant_profile_agent.codex_dialogue import DialogueDecision, DialogueTurn
 from merchant_profile_agent.media_archive import MediaStagingStore
 from merchant_profile_agent.video import VideoEvidence
 
@@ -176,6 +177,26 @@ class FakeApi:
                 },
             }
         raise AssertionError(path)
+
+
+class FakeDialogueRouter:
+    def __init__(self, decisions: list[DialogueDecision]) -> None:
+        self.decisions = list(decisions)
+        self.calls = []
+
+    def route(self, *, text, context, session_id=None):
+        self.calls.append(
+            {
+                "text": text,
+                "context": copy.deepcopy(dict(context)),
+                "session_id": session_id,
+            }
+        )
+        decision = self.decisions.pop(0)
+        return DialogueTurn(
+            session_id=session_id or "asess_test_dialogue",
+            decision=decision,
+        )
 
 
 class FakeMediaArchiver:
@@ -1183,6 +1204,144 @@ class FeishuBotTests(unittest.TestCase):
             [("om_unknown", "reaction_om_unknown")],
         )
         self.assertIn("我没理解这句话", self.channel.replies[-1][1]["text"])
+
+    def test_codex_dialogue_answers_natural_group_question(self) -> None:
+        router = FakeDialogueRouter(
+            [
+                DialogueDecision(
+                    action="reply",
+                    reply="我会先形成草稿；只有你明确要求保存时才写入知识库。",
+                )
+            ]
+        )
+        bot = FeishuBotController(
+            api=self.api,
+            channel=self.channel,
+            sessions=self.sessions,
+            dialogue_router=router,
+        )
+
+        asyncio.run(
+            bot.on_message(
+                Message(
+                    "你现在会怎么处理我刚才发的资料？",
+                    message_id="om_natural_question",
+                    chat_id="oc_dialogue",
+                    chat_type="group",
+                    mentioned_bot=True,
+                )
+            )
+        )
+
+        self.assertEqual(self.api.calls, [])
+        self.assertIn("只有你明确要求保存", self.channel.replies[-1][1]["text"])
+        self.assertEqual(router.calls[0]["context"]["channel"], "group")
+
+    def test_codex_dialogue_can_route_natural_group_fact_to_draft(self) -> None:
+        router = FakeDialogueRouter([DialogueDecision(action="record")])
+        bot = FeishuBotController(
+            api=self.api,
+            channel=self.channel,
+            sessions=self.sessions,
+            dialogue_router=router,
+        )
+
+        asyncio.run(
+            bot.on_message(
+                Message(
+                    "这个客户更喜欢微信沟通，下午联系比较好。",
+                    message_id="om_natural_record",
+                    chat_id="oc_dialogue_record",
+                    sender_name="测试成员",
+                    chat_type="group",
+                    mentioned_bot=True,
+                )
+            )
+        )
+
+        session = self.sessions.get("oc_dialogue_record:group:root")
+        self.assertEqual(len(session.group_buffer), 1)
+        self.assertEqual(self.channel.reactions, [("om_natural_record", "OK")])
+        self.assertEqual(session.codex_dialogue_session_id, "asess_test_dialogue")
+
+    def test_codex_dialogue_session_continues_across_group_turns(self) -> None:
+        router = FakeDialogueRouter(
+            [
+                DialogueDecision(action="reply", reply="第一轮回复"),
+                DialogueDecision(action="reply", reply="第二轮回复"),
+            ]
+        )
+        bot = FeishuBotController(
+            api=self.api,
+            channel=self.channel,
+            sessions=self.sessions,
+            dialogue_router=router,
+        )
+        base = {
+            "chat_id": "oc_dialogue_continue",
+            "chat_type": "group",
+            "mentioned_bot": True,
+        }
+
+        asyncio.run(bot.on_message(Message("第一问", message_id="om_first", **base)))
+        asyncio.run(bot.on_message(Message("那第二问呢", message_id="om_second", **base)))
+
+        self.assertIsNone(router.calls[0]["session_id"])
+        self.assertEqual(router.calls[1]["session_id"], "asess_test_dialogue")
+        self.assertIn("第二轮回复", self.channel.replies[-1][1]["text"])
+
+    def test_codex_dialogue_routes_explicit_natural_save_through_guarded_commit(self) -> None:
+        router = FakeDialogueRouter([DialogueDecision(action="save")])
+        bot = FeishuBotController(
+            api=self.api,
+            channel=self.channel,
+            sessions=self.sessions,
+            dialogue_router=router,
+        )
+        base = {
+            "chat_id": "oc_dialogue_save",
+            "chat_type": "group",
+            "sender_name": "测试成员",
+        }
+        asyncio.run(
+            bot.on_message(
+                Message(
+                    "青禾便当联系人是林经理",
+                    message_id="om_save_fact",
+                    **base,
+                )
+            )
+        )
+        asyncio.run(
+            bot.on_message(
+                Message(
+                    "把前面整理好的文字和附件都写进知识库",
+                    message_id="om_save_natural",
+                    mentioned_bot=True,
+                    **base,
+                )
+            )
+        )
+
+        self.assertIn("已写入", self.channel.replies[-1][1]["text"])
+        self.assertIn("/v1/profile/commit", [path for path, _ in self.api.calls])
+
+    def test_codex_dialogue_answers_direct_question_without_polluting_profile(self) -> None:
+        router = FakeDialogueRouter(
+            [DialogueDecision(action="reply", reply="目前还没有待保存的商户资料。")]
+        )
+        bot = FeishuBotController(
+            api=self.api,
+            channel=self.channel,
+            sessions=self.sessions,
+            dialogue_router=router,
+        )
+
+        asyncio.run(bot.on_message(Message("我刚才有保存成功吗？")))
+
+        self.assertEqual(self.api.calls, [])
+        self.assertIn("还没有待保存", self.channel.replies[-1][1]["text"])
+        self.assertEqual(self.sessions.get("oc_test:ou_test:root").messages, [])
 
     def test_natural_retry_recovers_original_group_image_and_reanalyzes(self) -> None:
         original = Message(

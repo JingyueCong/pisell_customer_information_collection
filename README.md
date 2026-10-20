@@ -16,6 +16,7 @@
 - 信息提取与知识库模块分类分两步完成：独立分类器基于完整语义选择模块并返回置信度，不依赖关键词或单项硬编码；低于阈值时暂停保存，用户可回复“这些资料归到硬件与安装”等完成确认；同一来源的截图、视频和文件跟随该分类结果；
 - 图片会自动分批分析：每批最多 8 张、6 MB，单轮最多处理 40 张、30 MB，所有批次合并为一份摘要和待保存草稿，不会只取前几张；读取失败会立即回复在原消息下，并在保存时列出失败消息编号和原因。支持“哪个图片未读取”“保存吧，文字和图片都要”等自然说法；
 - 群聊中可直接说“你再试一下”“重新读取”或“重新分析”：机器人会按当前草稿自动重取失败的飞书原图，并重新检查链接、CRM 匹配和摘要，不要求用户记忆固定口令；
+- 飞书私聊及明确 `@机器人` 的群聊消息会接入托管 Codex 会话：可以自然询问当前状态、让它解释、总结、重试或保存，不再只依赖固定关键词；Codex 不持有 shell 或知识库写工具，实际写入仍经过本地确认、CRM、冲突和附件校验；
 - 网络拓扑、路由器、网线、LAN、NBN、4G 备份线路和打印机布线统一进入 `04｜硬件与安装`；飞书视频封面仅用于传输预览，不会再作为第二个附件保存；
 - 引用、回复或合并消息中的图片会按可能的原消息 ID 重试下载；群聊图片仍无法读取时会阻止保存并明确提示，不会静默丢失；
 - 只保留用户明确提供的事实，推断不会进入 `profile_updates`；
@@ -241,6 +242,9 @@ MERCHANT_AGENT_API_URL=http://127.0.0.1:8090
 FEISHU_BOT_GROUP_ALLOWLIST=oc_xxx
 FEISHU_BOT_SENDER_ALLOWLIST=
 MERCHANT_AGENT_TRANSCRIPTION_MODEL=gpt-transcribe
+FEISHU_CODEX_DIALOGUE_ENABLED=true
+MERCHANT_AGENT_CODEX_MODEL=gpt-6-astra
+MERCHANT_AGENT_CODEX_TIMEOUT=45
 FEISHU_VIDEO_MAX_BYTES=26214400
 FEISHU_VIDEO_MAX_DURATION_SECONDS=300
 FEISHU_VIDEO_TRANSCRIPTION_TIMEOUT=180
@@ -255,7 +259,7 @@ MERCHANT_AGENT_PYTHON=/absolute/path/to/python3.12 ./scripts/install_feishu_bot_
 
 对话命令：
 
-- 普通消息：分析资料并返回待保存预览，零写入；
+- 普通消息：Codex 先区分普通问答和商户资料；商户资料会进入待保存预览，普通问题直接简短回答，全程零写入；
 - 图片消息：单张不超过 4 MB；一次总结会自动按每批最多 8 张、6 MB 分析，整轮最多 40 张、30 MB，并把全部批次合并为一份结果；
 - 视频消息：下载单个 MP4/MOV/M4V/WebM 视频，限制为 5 分钟且 25 MB，转写音轨并抽取关键帧后生成待保存预览；
 - 文件消息：PDF、Word、Excel、PowerPoint、CSV、TXT、RTF 和 ZIP 原文件进入待归档草稿，不会推断未解析的文件内容；

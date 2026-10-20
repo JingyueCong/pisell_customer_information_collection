@@ -9,6 +9,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from .api_client import MerchantApiClient
+from .codex_dialogue import CodexDialogueError, CodexDialogueRouter
 from .feishu_bot import FeishuBotController, SessionStore
 from .media_archive import FeishuDriveArchiver, MediaStagingStore
 from .settings import ConfigurationError, load_env_file
@@ -31,6 +32,15 @@ def _integer(name: str, default: int, minimum: int, maximum: int) -> int:
     if not minimum <= value <= maximum:
         raise ConfigurationError(f"{name} must be between {minimum} and {maximum}")
     return value
+
+
+def _boolean(name: str, default: bool) -> bool:
+    raw = os.environ.get(name, "true" if default else "false").strip().lower()
+    if raw in {"1", "true", "yes", "on"}:
+        return True
+    if raw in {"0", "false", "no", "off"}:
+        return False
+    raise ConfigurationError(f"{name} must be true or false")
 
 
 def _feishu_origin() -> str:
@@ -149,6 +159,19 @@ def build_channel():
         maximum_bytes=video_max_bytes,
         maximum_duration_seconds=video_max_seconds,
     )
+    dialogue_router = None
+    if _boolean("FEISHU_CODEX_DIALOGUE_ENABLED", True):
+        try:
+            dialogue_router = CodexDialogueRouter(
+                api_key=_required("OPENAI_API_KEY"),
+                model=os.environ.get(
+                    "MERCHANT_AGENT_CODEX_MODEL", "gpt-6-astra"
+                ).strip()
+                or "gpt-6-astra",
+                timeout=float(os.environ.get("MERCHANT_AGENT_CODEX_TIMEOUT", "45")),
+            )
+        except (ValueError, CodexDialogueError) as exc:
+            raise ConfigurationError(str(exc)) from exc
     controller = FeishuBotController(
         api=api,
         channel=channel,
@@ -170,6 +193,7 @@ def build_channel():
         maximum_video_duration_seconds=video_max_seconds,
         media_staging=media_staging,
         media_archiver=media_archiver,
+        dialogue_router=dialogue_router,
     )
     channel.on("message", controller.on_message)
     channel.on("error", lambda error: logging.getLogger(__name__).error("channel error: %s", error))
