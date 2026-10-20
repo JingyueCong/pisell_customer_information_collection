@@ -11,6 +11,7 @@ from pathlib import Path
 
 from merchant_profile_agent.feishu_bot import (
     FeishuBotController,
+    ImageBatchLimitError,
     Session,
     SessionStore,
     _apply_explicit_module_to_preview,
@@ -18,7 +19,8 @@ from merchant_profile_agent.feishu_bot import (
     _is_group_save_confirmation,
     _is_media_status_request,
     _is_group_profile_candidate,
-    _messages_for_analysis,
+    _merge_analysis_previews,
+    _message_batches_for_analysis,
     _preview_text,
     _profile_for_analysis,
     _without_video_placeholders,
@@ -633,13 +635,103 @@ class FeishuBotTests(unittest.TestCase):
             for index in range(3)
         ]
 
-        bounded = _messages_for_analysis(messages)
+        batches = _message_batches_for_analysis(messages)
 
-        self.assertEqual(sum(len(item.get("images", [])) for item in bounded), 8)
-        self.assertEqual(len(bounded[2]["images"]), 3)
-        self.assertEqual(len(bounded[1]["images"]), 3)
-        self.assertEqual(len(bounded[0]["images"]), 2)
+        self.assertEqual(len(batches), 2)
+        self.assertEqual(
+            [sum(len(item.get("images", [])) for item in batch) for batch in batches],
+            [8, 4],
+        )
+        self.assertEqual(
+            sum(
+                len(item.get("images", []))
+                for batch in batches
+                for item in batch
+            ),
+            12,
+        )
         self.assertEqual(len(messages[0]["images"]), 4)
+
+    def test_analysis_image_budget_has_clear_session_limit(self) -> None:
+        png = "data:image/png;base64," + base64.b64encode(b"png").decode("ascii")
+        messages = [
+            {
+                "role": "user",
+                "content": "many images",
+                "source_ref": "feishu://message/many",
+                "images": [png] * 41,
+            }
+        ]
+
+        with self.assertRaisesRegex(ImageBatchLimitError, "单轮最多自动处理 40 张"):
+            _message_batches_for_analysis(messages)
+
+    def test_analysis_batches_merge_into_one_preview(self) -> None:
+        first = {
+            "merchant": {"name": "青禾便当", "id": None},
+            "profile_updates": [
+                {
+                    "field_path": "contacts.primary.name",
+                    "value": "林经理",
+                    "source_ref": "feishu://message/1",
+                    "document_type": "business-contacts",
+                }
+            ],
+            "conflicts": [],
+            "module_classifications": [],
+            "summary_points": ["联系人是林经理"],
+        }
+        second = {
+            "merchant": {"name": "青禾便当", "id": None},
+            "profile_updates": [
+                {
+                    "field_path": "hardware.pos.model",
+                    "value": "P2 Pro",
+                    "source_ref": "feishu://message/2",
+                    "document_type": "hardware-equipment",
+                }
+            ],
+            "conflicts": [],
+            "module_classifications": [],
+            "summary_points": ["POS 型号是 P2 Pro"],
+        }
+
+        merged = _merge_analysis_previews([first, second])
+
+        self.assertEqual(merged["analysis_batches"], 2)
+        self.assertEqual(len(merged["profile_updates"]), 2)
+        self.assertEqual(merged["save_readiness"], "ready")
+        self.assertEqual(
+            merged["affected_modules"],
+            ["business-contacts", "hardware-equipment"],
+        )
+
+    def test_controller_calls_analyzer_for_every_image_batch(self) -> None:
+        png = (
+            "data:image/png;base64,"
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+        )
+        messages = [
+            {
+                "role": "user",
+                "content": "青禾便当的图片资料",
+                "source_ref": "feishu://message/images",
+                "images": [png] * 12,
+            }
+        ]
+
+        preview = asyncio.run(self.bot._analyze_in_batches(messages, {}))
+
+        calls = [payload for path, payload in self.api.calls if path == "/v1/profile/analyze"]
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(
+            [
+                sum(len(item.get("images", [])) for item in payload["messages"])
+                for payload in calls
+            ],
+            [8, 4],
+        )
+        self.assertEqual(preview["analysis_batches"], 2)
 
     def test_html_escaped_video_placeholders_are_removed(self) -> None:
         text = (

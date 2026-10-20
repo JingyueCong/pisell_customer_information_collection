@@ -25,9 +25,12 @@ from .validation import document_for_field, reroute_field_path, validate_update_
 
 
 LOGGER = logging.getLogger("merchant_profile_agent.feishu_bot")
-MAX_IMAGES_PER_MESSAGE = 8
+MAX_IMAGES_PER_MESSAGE = 40
+MAX_IMAGES_PER_MODEL_BATCH = 8
+MAX_IMAGES_PER_ANALYSIS = 40
 MAX_IMAGE_BYTES = 4 * 1024 * 1024
-MAX_TOTAL_IMAGE_BYTES = 6 * 1024 * 1024
+MAX_IMAGE_BYTES_PER_MODEL_BATCH = 6 * 1024 * 1024
+MAX_TOTAL_IMAGE_BYTES_PER_ANALYSIS = 30 * 1024 * 1024
 MAX_ARCHIVE_FILE_BYTES = 25 * 1024 * 1024
 ARCHIVE_FILE_EXTENSIONS = {
     ".pdf",
@@ -925,6 +928,9 @@ def _url_evidence_lines(result: dict[str, Any]) -> list[str]:
 
 def _preview_text(result: dict[str, Any]) -> str:
     lines: list[str] = []
+    analysis_batches = int(result.get("analysis_batches") or 1)
+    if analysis_batches > 1:
+        lines.append(f"已自动分 {analysis_batches} 批完成全部图片分析。")
     updates = result.get("profile_updates")
     if isinstance(updates, list) and updates:
         lines.append("待保存：")
@@ -999,6 +1005,10 @@ def _crm_question(resolution: dict[str, Any], merchant_name: str) -> str | None:
 
 def _group_summary_text(result: dict[str, Any]) -> str:
     sections: list[str] = []
+
+    analysis_batches = int(result.get("analysis_batches") or 1)
+    if analysis_batches > 1:
+        sections.append(f"已自动分 {analysis_batches} 批完成全部图片分析。")
 
     merchant = result.get("merchant")
     if isinstance(merchant, dict) and merchant.get("name"):
@@ -1546,7 +1556,7 @@ def _assign_media_modules(session: Session) -> None:
     priority = {name: index for index, name in enumerate(MEDIA_ROUTE_PRIORITY)}
     raw_classifications = (session.preview or {}).get("module_classifications")
     classified_paths: set[str] | None = None
-    if isinstance(raw_classifications, list):
+    if isinstance(raw_classifications, list) and raw_classifications:
         classified_paths = {
             str(item.get("field_path"))
             for item in raw_classifications
@@ -1667,14 +1677,15 @@ def _image_data_url_bytes(value: Any) -> int:
         return 0
 
 
-def _messages_for_analysis(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Copy messages while enforcing the API's conversation-wide image budget.
+class ImageBatchLimitError(RuntimeError):
+    pass
 
-    Group buffers can contain several screenshot or video messages. Allocate the
-    available image slots round-robin from newest to oldest so one older
-    media message cannot make the whole segment fail validation.
-    """
-    copied = [
+
+def _message_batches_for_analysis(
+    messages: list[dict[str, Any]],
+) -> list[list[dict[str, Any]]]:
+    """Split images into bounded model calls while retaining full text context."""
+    base = [
         {
             key: value
             for key, value in message.items()
@@ -1682,38 +1693,136 @@ def _messages_for_analysis(messages: list[dict[str, Any]]) -> list[dict[str, Any
         }
         for message in messages
     ]
-    selected: dict[int, list[str]] = {}
-    image_count = 0
-    image_bytes = 0
-    maximum_ordinal = max(
-        (
-            len(message.get("images", []))
-            for message in messages
-            if isinstance(message.get("images"), list)
-        ),
-        default=0,
-    )
-    for ordinal in range(maximum_ordinal):
-        for index in range(len(messages) - 1, -1, -1):
-            raw_images = messages[index].get("images", [])
-            if not isinstance(raw_images, list) or ordinal >= len(raw_images):
-                continue
-            image = raw_images[ordinal]
+    queued: list[tuple[int, str, int]] = []
+    for message_index, message in enumerate(messages):
+        raw_images = message.get("images", [])
+        if not isinstance(raw_images, list):
+            continue
+        for image in raw_images:
             size = _image_data_url_bytes(image)
             if size <= 0 or size > MAX_IMAGE_BYTES:
                 continue
-            if image_bytes + size > MAX_TOTAL_IMAGE_BYTES:
-                continue
-            selected.setdefault(index, []).append(image)
-            image_count += 1
-            image_bytes += size
-            if image_count >= MAX_IMAGES_PER_MESSAGE:
+            queued.append((message_index, image, size))
+    total_bytes = sum(item[2] for item in queued)
+    if len(queued) > MAX_IMAGES_PER_ANALYSIS:
+        raise ImageBatchLimitError(
+            f"本轮共有 {len(queued)} 张图片，单轮最多自动处理 {MAX_IMAGES_PER_ANALYSIS} 张。"
+            "请先总结并保存这一轮，再继续发送下一轮。"
+        )
+    if total_bytes > MAX_TOTAL_IMAGE_BYTES_PER_ANALYSIS:
+        raise ImageBatchLimitError(
+            f"本轮图片总大小约 {total_bytes / 1024 / 1024:.1f} MB，"
+            f"单轮最多 {MAX_TOTAL_IMAGE_BYTES_PER_ANALYSIS // 1024 // 1024} MB。"
+            "请拆成两轮总结。"
+        )
+    if not queued:
+        return [base]
+
+    batches: list[list[dict[str, Any]]] = []
+    cursor = 0
+    while cursor < len(queued):
+        selected: dict[int, list[str]] = {}
+        batch_bytes = 0
+        batch_count = 0
+        while cursor < len(queued) and batch_count < MAX_IMAGES_PER_MODEL_BATCH:
+            message_index, image, size = queued[cursor]
+            if batch_count and batch_bytes + size > MAX_IMAGE_BYTES_PER_MODEL_BATCH:
                 break
-        if image_count >= MAX_IMAGES_PER_MESSAGE:
-            break
-    for index, images in selected.items():
-        copied[index]["images"] = images
-    return copied
+            selected.setdefault(message_index, []).append(image)
+            batch_bytes += size
+            batch_count += 1
+            cursor += 1
+        copied = copy.deepcopy(base)
+        for message_index, images in selected.items():
+            copied[message_index]["images"] = images
+        batches.append(copied)
+    return batches
+
+
+def _deduplicated(items: Sequence[Any]) -> list[Any]:
+    result: list[Any] = []
+    seen: set[str] = set()
+    for item in items:
+        marker = json.dumps(item, ensure_ascii=False, sort_keys=True, default=str)
+        if marker in seen:
+            continue
+        seen.add(marker)
+        result.append(item)
+    return result
+
+
+def _merge_analysis_previews(previews: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    if not previews:
+        raise MerchantApiError("analysis returned no batches")
+    merged = copy.deepcopy(dict(previews[0]))
+    list_fields = (
+        "profile_updates",
+        "unchanged",
+        "conflicts",
+        "assumptions",
+        "information_gaps",
+        "summary_points",
+        "decisions",
+        "action_items",
+        "url_evidence",
+        "module_classifications",
+    )
+    for field_name in list_fields:
+        combined = [
+            item
+            for preview in previews
+            for item in (
+                preview.get(field_name)
+                if isinstance(preview.get(field_name), list)
+                else []
+            )
+        ]
+        merged[field_name] = _deduplicated(combined)
+    accepted = merged.get("profile_updates")
+    conflicts = merged.get("conflicts")
+    classifications = merged.get("module_classifications")
+    accepted_items = accepted if isinstance(accepted, list) else []
+    conflict_items = conflicts if isinstance(conflicts, list) else []
+    classification_items = classifications if isinstance(classifications, list) else []
+    modules = [
+        str(item.get("document_type"))
+        for item in accepted_items
+        if isinstance(item, Mapping) and item.get("document_type")
+    ]
+    merged["affected_modules"] = list(dict.fromkeys(modules))
+    for index, item in enumerate(classification_items):
+        if isinstance(item, dict):
+            item["update_index"] = index
+    review_required = any(
+        isinstance(item, Mapping) and item.get("status") == "needs_confirmation"
+        for item in classification_items
+    )
+    merged["classification_review_required"] = review_required
+    named_merchants = [
+        preview.get("merchant")
+        for preview in previews
+        if isinstance(preview.get("merchant"), Mapping)
+        and preview.get("merchant", {}).get("name")
+    ]
+    if named_merchants:
+        merged["merchant"] = copy.deepcopy(named_merchants[0])
+    merchant = merged.get("merchant")
+    has_merchant = isinstance(merchant, Mapping) and bool(merchant.get("name"))
+    if conflict_items or review_required:
+        merged["save_readiness"] = "needs_confirmation"
+    elif accepted_items and has_merchant:
+        merged["save_readiness"] = "ready"
+    elif not accepted_items:
+        merged["save_readiness"] = "needs_input"
+    questions = [
+        str(preview.get("next_question"))
+        for preview in previews
+        if preview.get("next_question")
+    ]
+    merged["next_question"] = questions[0] if questions else None
+    merged["analysis_batches"] = len(previews)
+    merged["write_performed"] = False
+    return merged
 
 
 class MerchantSwitchError(RuntimeError):
@@ -1915,8 +2024,11 @@ class FeishuBotController:
             if len(data) > MAX_IMAGE_BYTES:
                 raise ImageInputError("单张图片不能超过 4 MB。")
             total_bytes += len(data)
-            if total_bytes > MAX_TOTAL_IMAGE_BYTES:
-                raise ImageInputError("本条消息中的图片总大小不能超过 6 MB。")
+            if total_bytes > MAX_TOTAL_IMAGE_BYTES_PER_ANALYSIS:
+                raise ImageInputError(
+                    "本条消息中的图片总大小不能超过 "
+                    f"{MAX_TOTAL_IMAGE_BYTES_PER_ANALYSIS // 1024 // 1024} MB。"
+                )
             mime_type = _image_mime_type(data)
             if mime_type is None:
                 raise ImageInputError("仅支持 PNG、JPEG 或 WEBP 图片。")
@@ -2234,6 +2346,9 @@ class FeishuBotController:
         except MediaArchiveError as exc:
             session.messages.pop()
             await self._reply(message, f"附件暂存失败：{exc}")
+        except ImageBatchLimitError as exc:
+            session.messages.pop()
+            await self._reply(message, str(exc))
         except MerchantSwitchError:
             session.messages.pop()
             await self._reply(
@@ -2267,13 +2382,7 @@ class FeishuBotController:
             identity = dict(existing_identity) if isinstance(existing_identity, dict) else {}
             identity.update(session.merchant)
             analysis_profile["merchant"] = identity
-        preview = await self._post(
-            "/v1/profile/analyze",
-            {
-                "messages": _messages_for_analysis(session.messages),
-                "current_profile": analysis_profile,
-            },
-        )
+        preview = await self._analyze_in_batches(session.messages, analysis_profile)
         merchant = preview.get("merchant")
         if isinstance(merchant, dict) and merchant.get("name"):
             previous_name = session.merchant.get("name") if session.merchant else None
@@ -2325,14 +2434,11 @@ class FeishuBotController:
                 self._apply_crm_resolution(session, read.get("crm"))
                 session.current_profile_loaded = True
                 if session.current_profile.get("fields"):
-                    preview = await self._post(
-                        "/v1/profile/analyze",
+                    preview = await self._analyze_in_batches(
+                        session.messages,
                         {
-                            "messages": _messages_for_analysis(session.messages),
-                            "current_profile": {
-                                **session.current_profile,
-                                "merchant": dict(session.merchant),
-                            },
+                            **session.current_profile,
+                            "merchant": dict(session.merchant),
                         },
                     )
         if session.merchant:
@@ -2340,6 +2446,47 @@ class FeishuBotController:
         self._apply_crm_gate(session, preview)
         session.preview = preview
         return preview
+
+    async def _analyze_in_batches(
+        self,
+        messages: list[dict[str, Any]],
+        current_profile: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Analyze every image in bounded calls and merge one coherent preview."""
+        batches = _message_batches_for_analysis(messages)
+        working_profile = copy.deepcopy(dict(current_profile))
+        working_fields = working_profile.get("fields")
+        if not isinstance(working_fields, dict):
+            working_fields = {}
+            working_profile["fields"] = working_fields
+        previews: list[dict[str, Any]] = []
+        for batch in batches:
+            preview = await self._post(
+                "/v1/profile/analyze",
+                {
+                    "messages": batch,
+                    "current_profile": working_profile,
+                },
+            )
+            previews.append(preview)
+            merchant = preview.get("merchant")
+            if isinstance(merchant, Mapping) and merchant.get("name"):
+                working_profile["merchant"] = copy.deepcopy(dict(merchant))
+            updates = preview.get("profile_updates")
+            if not isinstance(updates, list):
+                continue
+            for update in updates:
+                if not isinstance(update, Mapping):
+                    continue
+                field_path = update.get("field_path")
+                value = update.get("value")
+                if (
+                    isinstance(field_path, str)
+                    and value is not None
+                    and not _is_password_field(field_path)
+                ):
+                    working_fields[field_path] = {"value": value}
+        return _merge_analysis_previews(previews)
 
     @staticmethod
     def _apply_crm_resolution(session: Session, raw: Any) -> None:
@@ -2641,6 +2788,9 @@ class FeishuBotController:
         session.messages = segment
         try:
             preview = await self._analyze_session(session)
+        except ImageBatchLimitError as exc:
+            await self._reply(message, str(exc))
+            return False
         except MerchantSwitchError:
             await self._reply(
                 message,
@@ -2677,6 +2827,10 @@ class FeishuBotController:
         session.messages = [*previous_messages, *session.group_buffer]
         try:
             preview = await self._analyze_session(session)
+        except ImageBatchLimitError as exc:
+            session.messages = previous_messages
+            await self._reply(message, str(exc))
+            return False
         except MerchantSwitchError:
             session.messages = previous_messages
             await self._reply(
@@ -2730,6 +2884,9 @@ class FeishuBotController:
                 session.current_profile_loaded = False
             try:
                 await self._analyze_session(session)
+            except ImageBatchLimitError as exc:
+                await self._reply(message, str(exc))
+                return
             except MerchantSwitchError:
                 await self._reply(
                     message,
