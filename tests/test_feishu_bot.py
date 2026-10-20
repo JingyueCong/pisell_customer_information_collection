@@ -47,9 +47,24 @@ class FakeChannel:
     def __init__(self) -> None:
         self.replies = []
         self.downloads = []
+        self.reactions = []
+        self.typing_started = []
+        self.typing_stopped = []
 
     async def reply(self, message, content, opts=None):
         self.replies.append((message, content, opts))
+
+    async def add_reaction(self, message_id, emoji_type):
+        self.reactions.append((message_id, emoji_type))
+        return {"success": True}
+
+    async def add_typing_reaction(self, message_id):
+        self.typing_started.append(message_id)
+        return f"reaction_{message_id}"
+
+    async def remove_typing_reaction(self, message_id, reaction_id):
+        self.typing_stopped.append((message_id, reaction_id))
+        return True
 
     async def download_resource(self, file_key, resource_type="image", message_id=None):
         self.downloads.append((file_key, resource_type, message_id))
@@ -930,7 +945,29 @@ class FeishuBotTests(unittest.TestCase):
 
         self.assertEqual(self.api.calls, [])
         self.assertEqual(channel.replies, [])
+        self.assertEqual(channel.reactions, [])
         self.assertEqual(sessions.get("oc_support:group:root").group_buffer, [])
+
+    def test_group_profile_message_gets_processing_and_accepted_status(self) -> None:
+        self.run_group("青禾便当联系人是林经理", message_id="om_status")
+
+        self.assertEqual(self.channel.typing_started, ["om_status"])
+        self.assertEqual(
+            self.channel.typing_stopped,
+            [("om_status", "reaction_om_status")],
+        )
+        self.assertEqual(self.channel.reactions, [("om_status", "OK")])
+        self.assertEqual(self.channel.replies, [])
+
+    def test_unrecognized_mentioned_command_returns_help_instead_of_silence(self) -> None:
+        self.run_group("芝麻开门", mentioned=True, message_id="om_unknown")
+
+        self.assertEqual(self.channel.typing_started, ["om_unknown"])
+        self.assertEqual(
+            self.channel.typing_stopped,
+            [("om_unknown", "reaction_om_unknown")],
+        )
+        self.assertIn("有效口令", self.channel.replies[-1][1]["text"])
 
     def test_group_broken_merchant_image_blocks_save_until_user_chooses_text_only(self) -> None:
         channel = MissingImageChannel()

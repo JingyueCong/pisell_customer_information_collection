@@ -204,6 +204,14 @@ FIELD_SUFFIX_LABELS = {
 class ReplyChannel(Protocol):
     async def reply(self, message: Any, content: Any, opts: Any = None) -> Any: ...
 
+    async def add_reaction(self, message_id: str, emoji_type: str) -> Any: ...
+
+    async def add_typing_reaction(self, message_id: str) -> str | None: ...
+
+    async def remove_typing_reaction(
+        self, message_id: str, reaction_id: str
+    ) -> bool: ...
+
     async def download_resource(
         self,
         file_key: str,
@@ -1460,6 +1468,48 @@ class FeishuBotController:
         # links, or mentions when a preview is echoed into a group chat.
         await self.channel.reply(message, {"text": text})
 
+    async def _start_processing_status(self, message: Any) -> str | None:
+        method = getattr(self.channel, "add_typing_reaction", None)
+        message_id = str(getattr(message, "message_id", "") or "")
+        if not callable(method) or not message_id:
+            return None
+        try:
+            result = await method(message_id)
+        except Exception:
+            LOGGER.warning("could not add processing reaction to message=%s", message_id)
+            return None
+        return str(result) if result else None
+
+    async def _stop_processing_status(
+        self, message: Any, reaction_id: str | None
+    ) -> None:
+        if not reaction_id:
+            return
+        method = getattr(self.channel, "remove_typing_reaction", None)
+        message_id = str(getattr(message, "message_id", "") or "")
+        if not callable(method) or not message_id:
+            return
+        try:
+            await method(message_id, reaction_id)
+        except Exception:
+            LOGGER.warning("could not remove processing reaction from message=%s", message_id)
+
+    async def _acknowledge_group_message(self, message: Any) -> None:
+        """Confirm a silent group message was accepted into the current draft."""
+
+        method = getattr(self.channel, "add_reaction", None)
+        message_id = str(getattr(message, "message_id", "") or "")
+        if callable(method) and message_id:
+            try:
+                await method(message_id, "OK")
+                return
+            except Exception:
+                LOGGER.warning("could not acknowledge group message=%s", message_id)
+        await self._reply(
+            message,
+            "已接收并加入草稿。需要查看或保存时请 @机器人 回复“总结吧”或“保存吧”。",
+        )
+
     def _discard_pending_media(self, session: Session) -> None:
         if self.media_staging is not None:
             self.media_staging.discard(session.pending_media)
@@ -1689,6 +1739,7 @@ class FeishuBotController:
         image_keys = _image_resource_keys(message)
         if not raw_text and not image_keys and not has_video and not has_archive_file:
             return
+        processing_reaction_id: str | None = None
         try:
             if _is_group_message(message) and (image_keys or has_video or has_archive_file):
                 group_session = self.sessions.get(_session_key(message))
@@ -1699,6 +1750,16 @@ class FeishuBotController:
                             "本群记录已暂停。请 @机器人 回复“继续记录”恢复。",
                         )
                     return
+            should_show_processing = bool(
+                not _is_group_message(message)
+                or getattr(message, "mentioned_bot", False)
+                or _is_group_profile_candidate(
+                    text,
+                    has_media=bool(image_keys or has_video or has_archive_file),
+                )
+            )
+            if should_show_processing:
+                processing_reaction_id = await self._start_processing_status(message)
             media_failure: str | None = None
             try:
                 images, downloaded_media = await self._download_images(message)
@@ -1787,6 +1848,7 @@ class FeishuBotController:
                 return
             await self._on_direct_message(message, text, images, downloaded_media)
         finally:
+            await self._stop_processing_status(message, processing_reaction_id)
             try:
                 self.sessions.persist()
             except OSError:
@@ -2106,6 +2168,11 @@ class FeishuBotController:
             )
         )
         if not _is_effective_group_message(text) and not failed_profile_media:
+            if mentioned:
+                await self._reply(
+                    message,
+                    "没有识别到可记录资料或有效口令。可用：总结吧、保存吧、帮助。",
+                )
             return
         if not (session.group_followup_pending and mentioned) and not (
             _is_group_profile_candidate(
@@ -2113,6 +2180,11 @@ class FeishuBotController:
             )
             or failed_profile_media
         ):
+            if mentioned:
+                await self._reply(
+                    message,
+                    "没有识别到可记录资料或有效口令。可用：总结吧、保存吧、帮助。",
+                )
             return
 
         sender_name = str(getattr(message, "sender_name", "") or "").strip()
@@ -2151,6 +2223,7 @@ class FeishuBotController:
         session.group_pending_count += 1
         session.group_generation += 1
         session.group_last_message = message
+        await self._acknowledge_group_message(message)
         if mentioned:
             session.cancel_idle_task()
             if failed_profile_media:
