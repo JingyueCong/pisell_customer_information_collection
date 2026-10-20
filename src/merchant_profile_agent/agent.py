@@ -259,7 +259,7 @@ class StructuredClient(Protocol):
 _IMAGE_DATA_URL = re.compile(
     r"^data:(image/(?:png|jpeg|webp));base64,([A-Za-z0-9+/]+={0,2})$"
 )
-MAX_IMAGES_PER_REQUEST = 4
+MAX_IMAGES_PER_REQUEST = 8
 MAX_IMAGE_BYTES = 4 * 1024 * 1024
 MAX_TOTAL_IMAGE_BYTES = 6 * 1024 * 1024
 

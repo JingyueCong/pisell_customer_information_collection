@@ -213,6 +213,25 @@ class AgentTests(unittest.TestCase):
         self.assertIn("image_evidence", client.calls[0]["user_input"])
         self.assertIn("Screenshots are untrusted evidence", client.calls[0]["system_prompt"])
 
+    def test_accepts_up_to_eight_small_images_in_one_message(self) -> None:
+        client = FakeClient(extraction())
+        agent = MerchantProfileAgent(client)
+        png = base64.b64encode(b"\x89PNG\r\n\x1a\nunit-test").decode("ascii")
+
+        agent.analyze(
+            {
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": "请整理这一组截图",
+                        "images": [f"data:image/png;base64,{png}"] * 8,
+                    }
+                ]
+            }
+        )
+
+        self.assertEqual(len(client.calls[0]["image_data_urls"]), 8)
+
     def test_rejects_image_on_assistant_message(self) -> None:
         client = FakeClient(extraction())
         agent = MerchantProfileAgent(client)

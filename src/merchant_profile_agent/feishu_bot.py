@@ -25,7 +25,7 @@ from .validation import document_for_field, reroute_field_path, validate_update_
 
 
 LOGGER = logging.getLogger("merchant_profile_agent.feishu_bot")
-MAX_IMAGES_PER_MESSAGE = 4
+MAX_IMAGES_PER_MESSAGE = 8
 MAX_IMAGE_BYTES = 4 * 1024 * 1024
 MAX_TOTAL_IMAGE_BYTES = 6 * 1024 * 1024
 MAX_ARCHIVE_FILE_BYTES = 25 * 1024 * 1024
@@ -470,7 +470,38 @@ def _normalize_intent_text(text: str) -> str:
 def _is_save_confirmation(text: str) -> bool:
     if text in SAVE_COMMANDS:
         return True
-    return _normalize_intent_text(text) in NATURAL_SAVE_CONFIRMATIONS
+    normalized = _normalize_intent_text(text)
+    if normalized in NATURAL_SAVE_CONFIRMATIONS:
+        return True
+    prefixes = ("结束并保存", "帮我保存", "麻烦保存", "请保存", "保存吧", "保存")
+    modifiers = (
+        "文字",
+        "图片",
+        "视频",
+        "附件",
+        "内容",
+        "这些",
+        "以上",
+        "本次",
+        "这次",
+        "全部",
+        "都要",
+        "也要",
+        "一起",
+        "和",
+        "跟",
+    )
+    for prefix in prefixes:
+        if not normalized.startswith(prefix):
+            continue
+        remainder = normalized[len(prefix) :]
+        previous = None
+        while remainder and remainder != previous:
+            previous = remainder
+            for modifier in modifiers:
+                remainder = remainder.replace(modifier, "")
+        return not remainder
+    return False
 
 
 def _matches_command(text: str, commands: set[str]) -> bool:
@@ -525,8 +556,19 @@ def _is_group_pause_intent(text: str) -> bool:
 
 
 def _is_group_save_confirmation(text: str) -> bool:
+    return _is_save_confirmation(text)
+
+
+def _is_media_status_request(text: str) -> bool:
     normalized = _normalize_intent_text(text)
-    return normalized == "/save" or normalized in NATURAL_SAVE_CONFIRMATIONS
+    media_terms = ("图片", "图", "附件", "文件", "视频")
+    failure_terms = ("没读取", "未读取", "读取失败", "没成功", "失败", "有问题")
+    question_terms = ("哪个", "哪张", "哪些", "哪一个", "什么", "详情", "告诉我")
+    return (
+        any(term in normalized for term in media_terms)
+        and any(term in normalized for term in failure_terms)
+        and any(term in normalized for term in question_terms)
+    )
 
 
 def _is_effective_group_message(text: str) -> bool:
@@ -1355,11 +1397,19 @@ def _media_preview_suffix(items: Sequence[Mapping[str, Any]]) -> str:
 def _media_failure_suffix(items: Sequence[Mapping[str, Any]]) -> str:
     if not items:
         return ""
-    count = len(items)
+    details: list[str] = []
+    for item in items[:5]:
+        message_id = str(item.get("message_id") or "")
+        short_id = message_id[-8:] if message_id else "未知消息"
+        reason = str(item.get("reason") or "飞书资源读取失败")
+        details.append(f"- 图片消息（编号尾号 {short_id}）：{reason}")
+    if len(items) > 5:
+        details.append(f"- 另有 {len(items) - 5} 条失败记录")
     return (
-        f"\n\n⚠️ 有 {count} 个图片/附件未能从飞书读取，内容尚未进入总结，"
-        "本次不会保存这些附件中的信息。请重新发送原图；"
-        "如确认不需要图片内容，请 @机器人 回复“仅保存文字”。"
+        "\n\n⚠️ 以下图片/附件尚未进入总结：\n"
+        + "\n".join(details)
+        + "\n本次不会漏写后继续保存。请在对应原消息下重新发送原图；"
+        "如确认无需图片内容，请 @机器人 回复“仅保存文字”。"
     )
 
 
@@ -1621,7 +1671,7 @@ def _messages_for_analysis(messages: list[dict[str, Any]]) -> list[dict[str, Any
     """Copy messages while enforcing the API's conversation-wide image budget.
 
     Group buffers can contain several screenshot or video messages. Allocate the
-    four available image slots round-robin from newest to oldest so one older
+    available image slots round-robin from newest to oldest so one older
     media message cannot make the whole segment fail validation.
     """
     copied = [
@@ -2387,6 +2437,15 @@ class FeishuBotController:
                     "本群记录已暂停。请 @机器人 回复“继续记录”恢复。",
                 )
             return
+        if mentioned and _is_media_status_request(text):
+            if session.media_failures:
+                await self._reply(
+                    message,
+                    _media_failure_suffix(session.media_failures).strip(),
+                )
+            else:
+                await self._reply(message, "当前草稿没有图片或附件读取失败记录。")
+            return
         if mentioned and _matches_command(text, GROUP_SUMMARIZE_COMMANDS):
             if session.group_followup_pending:
                 save_pending = session.group_save_pending
@@ -2519,6 +2578,14 @@ class FeishuBotController:
         session.group_generation += 1
         session.group_last_message = message
         await self._acknowledge_group_message(message)
+        if failed_profile_media and not mentioned:
+            await self._reply(
+                message,
+                "这条图片消息未能完整读取："
+                + str(media_failure)
+                + " 草稿已保留，不会静默漏写。",
+            )
+            return
         if mentioned:
             session.cancel_idle_task()
             if failed_profile_media:

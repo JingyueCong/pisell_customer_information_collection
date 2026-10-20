@@ -15,6 +15,8 @@ from merchant_profile_agent.feishu_bot import (
     SessionStore,
     _apply_explicit_module_to_preview,
     _group_summary_text,
+    _is_group_save_confirmation,
+    _is_media_status_request,
     _is_group_profile_candidate,
     _messages_for_analysis,
     _preview_text,
@@ -517,6 +519,16 @@ class UnanchoredSwitchApi(FakeApi):
 
 
 class FeishuBotTests(unittest.TestCase):
+    def test_natural_save_command_can_explicitly_include_text_and_images(self) -> None:
+        self.assertTrue(_is_group_save_confirmation("保存吧 文字和图片都要"))
+        self.assertTrue(_is_group_save_confirmation("请保存以上文字、图片和附件"))
+        self.assertFalse(_is_group_save_confirmation("商户希望保存会员手机号"))
+
+    def test_media_failure_detail_question_is_recognized(self) -> None:
+        self.assertTrue(_is_media_status_request("哪个图片未读取"))
+        self.assertTrue(_is_media_status_request("告诉我哪些附件读取失败"))
+        self.assertFalse(_is_media_status_request("图片里是什么"))
+
     def test_user_can_confirm_a_low_confidence_fact_module(self) -> None:
         session = Session(
             preview={
@@ -623,10 +635,10 @@ class FeishuBotTests(unittest.TestCase):
 
         bounded = _messages_for_analysis(messages)
 
-        self.assertEqual(sum(len(item.get("images", [])) for item in bounded), 4)
-        self.assertEqual(len(bounded[2]["images"]), 2)
-        self.assertEqual(len(bounded[1]["images"]), 1)
-        self.assertEqual(len(bounded[0]["images"]), 1)
+        self.assertEqual(sum(len(item.get("images", [])) for item in bounded), 8)
+        self.assertEqual(len(bounded[2]["images"]), 3)
+        self.assertEqual(len(bounded[1]["images"]), 3)
+        self.assertEqual(len(bounded[0]["images"]), 2)
         self.assertEqual(len(messages[0]["images"]), 4)
 
     def test_html_escaped_video_placeholders_are_removed(self) -> None:
@@ -1091,7 +1103,7 @@ class FeishuBotTests(unittest.TestCase):
         )
         session = sessions.get("oc_failed_media:group:root")
         self.assertEqual(len(session.media_failures), 1)
-        self.assertEqual(channel.replies, [])
+        self.assertIn("这条图片消息未能完整读取", channel.replies[-1][1]["text"])
 
         asyncio.run(
             bot.on_message(
@@ -1105,7 +1117,8 @@ class FeishuBotTests(unittest.TestCase):
         )
 
         self.assertNotIn("/v1/profile/commit", [path for path, _ in self.api.calls])
-        self.assertIn("未能从飞书读取", channel.replies[-1][1]["text"])
+        self.assertIn("尚未进入总结", channel.replies[-1][1]["text"])
+        self.assertIn("om_failed_media"[-8:], channel.replies[-1][1]["text"])
 
         asyncio.run(
             bot.on_message(
