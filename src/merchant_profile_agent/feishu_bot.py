@@ -74,6 +74,20 @@ GROUP_PAUSE_COMMANDS = {
     "不要开始记录",
 }
 GROUP_SUMMARIZE_COMMANDS = {"立即总结", "现在总结", "总结本段", "总结吧", "帮我总结"}
+RETRY_COMMANDS = {
+    "重试",
+    "重试一下",
+    "再试",
+    "再试一下",
+    "你再试一下",
+    "麻烦再试一下",
+    "重新试一下",
+    "重新读取",
+    "重新读取一下",
+    "再读取一次",
+    "重新分析",
+    "重新分析一下",
+}
 NATURAL_SAVE_CONFIRMATIONS = {
     "结束并保存",
     "保存",
@@ -245,6 +259,8 @@ class ReplyChannel(Protocol):
         resource_type: str = "image",
         message_id: str | None = None,
     ) -> bytes | None: ...
+
+    async def fetch_inbound_message(self, message_id: str) -> Any: ...
 
 
 class VideoProcessor(Protocol):
@@ -571,6 +587,19 @@ def _is_media_status_request(text: str) -> bool:
         any(term in normalized for term in media_terms)
         and any(term in normalized for term in failure_terms)
         and any(term in normalized for term in question_terms)
+    )
+
+
+def _is_retry_request(text: str) -> bool:
+    normalized = _normalize_intent_text(text)
+    if normalized in RETRY_COMMANDS:
+        return True
+    if not normalized or len(normalized) > 24:
+        return False
+    retry_terms = ("重试", "再试", "重新读取", "再读取", "重新分析", "再分析")
+    request_terms = ("请", "你", "帮我", "帮忙", "麻烦", "一下", "一次", "看看")
+    return any(term in normalized for term in retry_terms) and any(
+        term in normalized for term in request_terms
     )
 
 
@@ -1970,6 +1999,129 @@ class FeishuBotController:
             if str(item.get("sender_id") or "") != sender_id
         ]
 
+    @staticmethod
+    def _attach_recovered_images(
+        session: Session,
+        source_ref: str,
+        images: Sequence[str],
+    ) -> None:
+        for collection in (session.messages, session.group_buffer):
+            for item in collection:
+                if str(item.get("source_ref") or "") != source_ref:
+                    continue
+                existing = item.get("images")
+                current = list(existing) if isinstance(existing, list) else []
+                item["images"] = list(dict.fromkeys([*current, *images]))
+                item["has_media"] = True
+                item.pop("media_failed", None)
+
+    async def _retry_group_work(self, session: Session, message: Any) -> None:
+        failures = list(session.media_failures)
+        recovered_images = 0
+        fetch_message = getattr(self.channel, "fetch_inbound_message", None)
+        for failure in failures:
+            message_id = str(failure.get("message_id") or "")
+            source_ref = str(failure.get("source_ref") or "")
+            if not message_id or not callable(fetch_message):
+                failure["reason"] = "当前飞书连接无法重新获取原消息，请重新发送原图。"
+                continue
+            try:
+                original = await fetch_message(message_id)
+                if original is None:
+                    failure["reason"] = "飞书未返回原消息，请重新发送原图。"
+                    continue
+                images, downloaded = await self._download_images(original)
+                if not images:
+                    failure["reason"] = "原消息中没有可重新读取的图片，请重新发送原图。"
+                    continue
+                staged = self._stage_downloaded_media(downloaded)
+                self._append_pending_media(session, staged)
+                self._attach_recovered_images(session, source_ref, images)
+            except (ImageInputError, MediaArchiveError) as exc:
+                failure["reason"] = str(exc)
+                continue
+            except Exception as exc:
+                LOGGER.warning(
+                    "could not retry group image message=%s: %s", message_id, exc
+                )
+                failure["reason"] = "重新读取时飞书接口暂时失败，请稍后再试。"
+                continue
+            recovered_images += len(images)
+            session.media_failures = [
+                item
+                for item in session.media_failures
+                if str(item.get("source_ref") or "") != source_ref
+            ]
+
+        if session.group_buffer:
+            candidates = [
+                item
+                for item in session.group_buffer
+                if _is_group_profile_candidate(
+                    str(item.get("content") or ""),
+                    has_media=bool(item.get("images") or item.get("has_media")),
+                )
+            ]
+            if session.group_followup_pending:
+                existing_sources = {
+                    str(item.get("source_ref") or "") for item in session.messages
+                }
+                session.messages = [
+                    *session.messages,
+                    *[
+                        item
+                        for item in candidates
+                        if str(item.get("source_ref") or "") not in existing_sources
+                    ],
+                ]
+            else:
+                session.messages = candidates
+        if not session.messages:
+            await self._reply(message, "当前没有可重新处理的商户资料。")
+            return
+
+        # Retrying means all transient dependencies get another chance: Feishu
+        # media, URL reading and the unresolved CRM lookup.
+        if isinstance(session.crm_resolution, dict) and session.crm_resolution.get(
+            "status"
+        ) in {"not_found", "ambiguous"}:
+            session.current_profile_loaded = False
+        try:
+            preview = await self._analyze_session(session)
+        except ImageBatchLimitError as exc:
+            await self._reply(message, str(exc))
+            return
+        except MerchantSwitchError:
+            await self._reply(message, "重新分析识别到了不同商户，请先确认商户名称。")
+            return
+        except MerchantApiError:
+            LOGGER.exception("retry group analysis failed")
+            await self._reply(message, "已经重新尝试，但分析服务暂不可用；草稿仍保留。")
+            return
+        _assign_media_modules(session)
+        session.clear_group_buffer()
+        updates = preview.get("profile_updates")
+        session.group_followup_pending = not (
+            session.merchant
+            and preview.get("save_readiness") == "ready"
+            and isinstance(updates, list)
+            and updates
+        )
+        if recovered_images:
+            status = f"已重新读取 {recovered_images} 张图片，并重新检查链接、CRM 和摘要。"
+        elif failures:
+            status = "已重新请求原消息，并重新检查链接、CRM 和摘要。"
+        else:
+            status = "已重新检查链接、CRM 和摘要。"
+        await self._reply(
+            message,
+            status
+            + "\n\n"
+            + _group_summary_text(preview)
+            + _media_preview_suffix(session.pending_media)
+            + _media_failure_suffix(session.media_failures),
+        )
+
     async def _download_images(
         self, message: Any
     ) -> tuple[list[str], list[DownloadedMedia]]:
@@ -2593,6 +2745,9 @@ class FeishuBotController:
             else:
                 await self._reply(message, "当前草稿没有图片或附件读取失败记录。")
             return
+        if mentioned and _is_retry_request(text):
+            await self._retry_group_work(session, message)
+            return
         if mentioned and _matches_command(text, GROUP_SUMMARIZE_COMMANDS):
             if session.group_followup_pending:
                 save_pending = session.group_save_pending
@@ -2611,7 +2766,8 @@ class FeishuBotController:
                 message,
                 "本群默认静默记录，普通消息只进入草稿且不会自动发言。可用："
                 "@机器人 总结吧、@机器人 暂停记录、@机器人 保存吧、"
-                "@机器人 /discard。图片读取失败时可重新发原图，或回复"
+                "@机器人 再试一下、@机器人 /discard。图片读取失败时可让机器人重试、"
+                "重新发原图，或回复"
                 "“仅保存文字”。只有保存吧才会写知识库。",
             )
             return
@@ -2672,7 +2828,7 @@ class FeishuBotController:
             if mentioned:
                 await self._reply(
                     message,
-                    "没有识别到可记录资料或有效口令。可用：总结吧、保存吧、帮助。",
+                    "我没理解这句话。可以说：总结吧、保存吧、再试一下，或帮助。",
                 )
             return
         if not (session.group_followup_pending and mentioned) and not (
@@ -2684,7 +2840,7 @@ class FeishuBotController:
             if mentioned:
                 await self._reply(
                     message,
-                    "没有识别到可记录资料或有效口令。可用：总结吧、保存吧、帮助。",
+                    "我没理解这句话。可以说：总结吧、保存吧、再试一下，或帮助。",
                 )
             return
 

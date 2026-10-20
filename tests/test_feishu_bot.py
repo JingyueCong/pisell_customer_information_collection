@@ -85,6 +85,22 @@ class MissingImageChannel(FakeChannel):
         return None
 
 
+class RetriableImageChannel(MissingImageChannel):
+    def __init__(self, original: Message) -> None:
+        super().__init__()
+        self.original = original
+        self.retrying = False
+
+    async def fetch_inbound_message(self, message_id):
+        self.retrying = True
+        return self.original if message_id == self.original.message_id else None
+
+    async def download_resource(self, file_key, resource_type="image", message_id=None):
+        if not self.retrying:
+            return await super().download_resource(file_key, resource_type, message_id)
+        return await FakeChannel.download_resource(self, file_key, resource_type, message_id)
+
+
 class ReferencedImageChannel(FakeChannel):
     async def download_resource(self, file_key, resource_type="image", message_id=None):
         self.downloads.append((file_key, resource_type, message_id))
@@ -1166,7 +1182,49 @@ class FeishuBotTests(unittest.TestCase):
             self.channel.typing_stopped,
             [("om_unknown", "reaction_om_unknown")],
         )
-        self.assertIn("有效口令", self.channel.replies[-1][1]["text"])
+        self.assertIn("我没理解这句话", self.channel.replies[-1][1]["text"])
+
+    def test_natural_retry_recovers_original_group_image_and_reanalyzes(self) -> None:
+        original = Message(
+            "青禾便当现场截图",
+            message_id="om_retry_original",
+            chat_id="oc_retry",
+            sender_id="ou_retry",
+            sender_name="测试成员",
+            chat_type="group",
+            content={"kind": "image", "image_key": "img_retry"},
+        )
+        channel = RetriableImageChannel(original)
+        sessions = SessionStore()
+        bot = FeishuBotController(
+            api=self.api,  # type: ignore[arg-type]
+            channel=channel,
+            sessions=sessions,
+        )
+
+        asyncio.run(bot.on_message(original))
+        session = sessions.get("oc_retry:group:root")
+        self.assertEqual(len(session.media_failures), 1)
+
+        asyncio.run(
+            bot.on_message(
+                Message(
+                    "你再试一下",
+                    message_id="om_retry_command",
+                    chat_id="oc_retry",
+                    sender_id="ou_retry",
+                    sender_name="测试成员",
+                    chat_type="group",
+                    mentioned_bot=True,
+                )
+            )
+        )
+
+        self.assertEqual(session.media_failures, [])
+        self.assertEqual(len(session.messages[0]["images"]), 1)
+        self.assertIn("已重新读取 1 张图片", channel.replies[-1][1]["text"])
+        self.assertIn("商户：青禾便当", channel.replies[-1][1]["text"])
+        self.assertIn("/v1/profile/analyze", [path for path, _ in self.api.calls])
 
     def test_group_broken_merchant_image_blocks_save_until_user_chooses_text_only(self) -> None:
         channel = MissingImageChannel()
