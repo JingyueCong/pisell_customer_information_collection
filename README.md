@@ -257,6 +257,14 @@ chmod +x scripts/install_feishu_bot_launchd.sh scripts/lark_cli_wrapper.sh
 MERCHANT_AGENT_PYTHON=/absolute/path/to/python3.12 ./scripts/install_feishu_bot_launchd.sh
 ```
 
+Mac mini 若需在重启后、无人登录桌面时也自动上线，可安装用户 cron 引导器。它只负责把现有两个
+LaunchAgent 加载到用户 launchd 域，服务进程、崩溃重启和日志仍由 launchd 管理：
+
+```bash
+chmod +x scripts/install_reboot_bootstrap.sh scripts/bootstrap_launchagents_at_reboot.sh
+./scripts/install_reboot_bootstrap.sh
+```
+
 对话命令：
 
 - 普通消息：Codex 先区分普通问答和商户资料；商户资料会进入待保存预览，普通问题直接简短回答，全程零写入；
