@@ -1195,6 +1195,49 @@ class FeishuBotTests(unittest.TestCase):
         self.assertEqual(self.channel.reactions, [("om_status", "OK")])
         self.assertEqual(self.channel.replies, [])
 
+    def test_group_image_only_gets_ok_after_extracting_recordable_facts(self) -> None:
+        message = Message(
+            "青禾便当现场配置截图",
+            message_id="om_recordable_image",
+            chat_id="oc_recordable_image",
+            chat_type="group",
+            content={"kind": "image", "image_key": "img_recordable"},
+        )
+
+        asyncio.run(self.bot.on_message(message))
+
+        self.assertEqual(self.channel.reactions, [("om_recordable_image", "OK")])
+        self.assertIn("/v1/profile/analyze", [path for path, _ in self.api.calls])
+        self.assertEqual(
+            len(self.sessions.get("oc_recordable_image:group:root").group_buffer),
+            1,
+        )
+
+    def test_group_image_without_extractable_facts_is_retained_silently(self) -> None:
+        api = MediaOnlyArchiveApi()
+        sessions = SessionStore()
+        bot = FeishuBotController(
+            api=api,  # type: ignore[arg-type]
+            channel=self.channel,
+            sessions=sessions,
+        )
+        message = Message(
+            "@Macaw",
+            message_id="om_empty_image",
+            chat_id="oc_empty_image",
+            chat_type="group",
+            content={"kind": "image", "image_key": "img_empty"},
+        )
+
+        asyncio.run(bot.on_message(message))
+
+        self.assertEqual(self.channel.reactions, [])
+        self.assertEqual(self.channel.replies, [])
+        self.assertEqual(
+            len(sessions.get("oc_empty_image:group:root").group_buffer),
+            1,
+        )
+
     def test_unrecognized_mentioned_command_returns_help_instead_of_silence(self) -> None:
         self.run_group("芝麻开门", mentioned=True, message_id="om_unknown")
 
