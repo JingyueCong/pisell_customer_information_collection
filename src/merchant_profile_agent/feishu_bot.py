@@ -1908,6 +1908,19 @@ class FeishuBotController:
     def _dialogue_context(session: Session, *, is_group: bool) -> dict[str, Any]:
         preview = session.preview if isinstance(session.preview, Mapping) else {}
         merchant = session.merchant if isinstance(session.merchant, Mapping) else {}
+        raw_classifications = preview.get("module_classifications")
+        unresolved_modules = []
+        if isinstance(raw_classifications, list):
+            unresolved_modules = [
+                {
+                    "fact": _field_label(item.get("field_path")),
+                    "suggested_document_type": str(item.get("document_type") or ""),
+                    "reason": str(item.get("reason") or ""),
+                }
+                for item in raw_classifications[:10]
+                if isinstance(item, Mapping)
+                and item.get("status") == "needs_confirmation"
+            ]
         return {
             "channel": "group" if is_group else "direct",
             "merchant_name": str(merchant.get("name") or ""),
@@ -1916,6 +1929,7 @@ class FeishuBotController:
             "has_unsaved_preview": bool(preview),
             "save_readiness": str(preview.get("save_readiness") or "unknown"),
             "next_question": str(preview.get("next_question") or ""),
+            "unresolved_module_classifications": unresolved_modules,
             "pending_attachment_names": [
                 str(item.get("file_name") or "附件")
                 for item in session.pending_media[:10]
@@ -2180,6 +2194,39 @@ class FeishuBotController:
         action = decision.action
         if action == "record":
             return False
+        if action == "route_module":
+            document_type = decision.document_type
+            if document_type not in DOCUMENT_LABELS:
+                await self._reply(message, "我仍不能确定对应页面，请再说明这是什么业务资料。")
+                return True
+            changed_facts = _apply_explicit_module_to_preview(session, document_type)
+            routable = [
+                item
+                for item in session.pending_media
+                if not isinstance(item.get("uploaded"), Mapping)
+            ]
+            for item in routable:
+                item["target_document_type"] = document_type
+            if not changed_facts and not routable:
+                await self._reply(message, "当前没有等待确认归类的资料。")
+                return True
+            session.group_followup_pending = bool(
+                (session.preview or {}).get("classification_review_required")
+            )
+            if session.group_save_pending and not session.group_followup_pending:
+                await self._save(message, session, "结束并保存")
+                return True
+            details = []
+            if changed_facts:
+                details.append(f"{changed_facts} 条资料")
+            if routable:
+                details.append(f"{len(routable)} 个附件")
+            await self._reply(
+                message,
+                f"已根据你的说明将{'和'.join(details)}归到“{DOCUMENT_LABELS[document_type]}”。"
+                "需要写入时请 @机器人 回复“保存吧”。",
+            )
+            return True
         if action == "reply":
             await self._reply(
                 message,
@@ -2267,6 +2314,33 @@ class FeishuBotController:
         action = decision.action
         if action == "record":
             return False
+        if action == "route_module":
+            document_type = decision.document_type
+            if document_type not in DOCUMENT_LABELS:
+                await self._reply(message, "我仍不能确定对应页面，请再说明这是什么业务资料。")
+                return True
+            changed_facts = _apply_explicit_module_to_preview(session, document_type)
+            routable = [
+                item
+                for item in session.pending_media
+                if not isinstance(item.get("uploaded"), Mapping)
+            ]
+            for item in routable:
+                item["target_document_type"] = document_type
+            if not changed_facts and not routable:
+                await self._reply(message, "当前没有等待确认归类的资料。")
+                return True
+            details = []
+            if changed_facts:
+                details.append(f"{changed_facts} 条资料")
+            if routable:
+                details.append(f"{len(routable)} 个附件")
+            await self._reply(
+                message,
+                f"已根据你的说明将{'和'.join(details)}归到“{DOCUMENT_LABELS[document_type]}”。"
+                "回复“保存吧”即可写入。",
+            )
+            return True
         if action == "reply":
             await self._reply(
                 message,

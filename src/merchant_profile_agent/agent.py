@@ -129,7 +129,8 @@ staff member would retrieve the fact. Use the semantic boundaries below, not key
 
 - business-contacts: business identity, people, roles and contact methods
 - menu-content: menu facts and reusable content assets
-- system-configuration: software behaviour, application settings, user flows and workarounds
+- system-configuration: software behaviour, owned apps or mini-programs, system/integration binding,
+  non-secret interface identifiers, application settings, user flows and workarounds
 - hardware-installation: physical equipment, cabling, connectivity, site installation and topology
 - risk-compliance: compliance, risk evidence and controls
 - commercial-information: general commercial context not covered by package/payment modules
@@ -144,13 +145,16 @@ staff member would retrieve the fact. Use the semantic boundaries below, not key
 - document-archive: documents or links whose business module cannot be determined reliably
 - communication-profile: durable communication preferences and collaboration style
 - content-settings: content-entry requirements and setup instructions
-- credential-records: account login records and passwords
+- credential-records: actual account login records and passwords, not ordinary integration metadata
 
 Distinguish the subject from the medium: a video of a physical installation is still
 hardware-installation; a screenshot of a software option is system-configuration. If two modules
 are plausible, choose the one that best owns the operational subject and lower confidence. Confidence
 must reflect genuine certainty, not a desire to avoid review. Never repeat a password or secret in
-the reason. Return one result for every input update index, with no missing or duplicate indexes."""
+the reason. A document or URL follows its operational subject; use document-archive only when that
+subject genuinely cannot be determined. For example, a mini-program binding result with merchant IDs
+and an integration guide belongs to system-configuration. Return one result for every input update
+index, with no missing or duplicate indexes."""
 
 
 MODULE_ROUTER_SCHEMA: dict[str, Any] = {

@@ -1307,6 +1307,84 @@ class FeishuBotTests(unittest.TestCase):
         self.assertEqual(self.channel.reactions, [])
         self.assertEqual(session.codex_dialogue_session_id, "asess_test_dialogue")
 
+    def test_codex_dialogue_resolves_business_language_module_and_finishes_save(self) -> None:
+        router = FakeDialogueRouter(
+            [
+                DialogueDecision(
+                    action="route_module",
+                    document_type="system-configuration",
+                )
+            ]
+        )
+        bot = FeishuBotController(
+            api=self.api,
+            channel=self.channel,
+            sessions=self.sessions,
+            dialogue_router=router,
+        )
+        session = self.sessions.get("oc_module_language:group:root")
+        session.merchant = {"name": "小熊鲜生", "id": "75288"}
+        session.messages = [
+            {
+                "role": "user",
+                "content": "小熊鲜生小程序绑定成功，包含对接参数和文档。",
+                "source_ref": "feishu://message/module_source",
+            }
+        ]
+        session.preview = {
+            "merchant": dict(session.merchant),
+            "profile_updates": [
+                {
+                    "field_path": "documents.integration_notes",
+                    "value": "小程序已绑定，MID 75288。",
+                    "source_ref": "feishu://message/module_source",
+                    "replace_confirmed": False,
+                    "state": "explicit",
+                    "document_type": "document-archive",
+                }
+            ],
+            "conflicts": [],
+            "module_classifications": [
+                {
+                    "field_path": "documents.integration_notes",
+                    "document_type": "document-archive",
+                    "confidence": 0.55,
+                    "reason": "需要确认业务主题",
+                    "status": "needs_confirmation",
+                }
+            ],
+            "classification_review_required": True,
+            "save_readiness": "needs_confirmation",
+            "next_question": "这些资料应归入哪个模块？",
+        }
+        session.group_followup_pending = True
+        session.group_save_pending = True
+
+        asyncio.run(
+            bot.on_message(
+                Message(
+                    "这是我们自己的小程序",
+                    message_id="om_module_language",
+                    chat_id="oc_module_language",
+                    chat_type="group",
+                    mentioned_bot=True,
+                )
+            )
+        )
+
+        self.assertEqual(
+            router.calls[0]["context"]["unresolved_module_classifications"],
+            [
+                {
+                    "fact": "integration notes",
+                    "suggested_document_type": "document-archive",
+                    "reason": "需要确认业务主题",
+                }
+            ],
+        )
+        self.assertIn("/v1/profile/commit", [path for path, _ in self.api.calls])
+        self.assertIn("已写入", self.channel.replies[-1][1]["text"])
+
     def test_codex_dialogue_session_continues_across_group_turns(self) -> None:
         router = FakeDialogueRouter(
             [
