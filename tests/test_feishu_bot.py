@@ -1184,7 +1184,7 @@ class FeishuBotTests(unittest.TestCase):
         self.assertEqual(channel.reactions, [])
         self.assertEqual(sessions.get("oc_support:group:root").group_buffer, [])
 
-    def test_group_profile_message_gets_processing_and_accepted_status(self) -> None:
+    def test_group_profile_message_is_buffered_without_ok_reaction(self) -> None:
         self.run_group("青禾便当联系人是林经理", message_id="om_status")
 
         self.assertEqual(self.channel.typing_started, ["om_status"])
@@ -1192,10 +1192,10 @@ class FeishuBotTests(unittest.TestCase):
             self.channel.typing_stopped,
             [("om_status", "reaction_om_status")],
         )
-        self.assertEqual(self.channel.reactions, [("om_status", "OK")])
+        self.assertEqual(self.channel.reactions, [])
         self.assertEqual(self.channel.replies, [])
 
-    def test_group_image_only_gets_ok_after_extracting_recordable_facts(self) -> None:
+    def test_group_image_is_retained_without_ok_or_preflight_analysis(self) -> None:
         message = Message(
             "青禾便当现场配置截图",
             message_id="om_recordable_image",
@@ -1206,8 +1206,8 @@ class FeishuBotTests(unittest.TestCase):
 
         asyncio.run(self.bot.on_message(message))
 
-        self.assertEqual(self.channel.reactions, [("om_recordable_image", "OK")])
-        self.assertIn("/v1/profile/analyze", [path for path, _ in self.api.calls])
+        self.assertEqual(self.channel.reactions, [])
+        self.assertNotIn("/v1/profile/analyze", [path for path, _ in self.api.calls])
         self.assertEqual(
             len(self.sessions.get("oc_recordable_image:group:root").group_buffer),
             1,
@@ -1304,7 +1304,7 @@ class FeishuBotTests(unittest.TestCase):
 
         session = self.sessions.get("oc_dialogue_record:group:root")
         self.assertEqual(len(session.group_buffer), 1)
-        self.assertEqual(self.channel.reactions, [("om_natural_record", "OK")])
+        self.assertEqual(self.channel.reactions, [])
         self.assertEqual(session.codex_dialogue_session_id, "asess_test_dialogue")
 
     def test_codex_dialogue_session_continues_across_group_turns(self) -> None:

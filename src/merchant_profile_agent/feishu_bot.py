@@ -1983,61 +1983,6 @@ class FeishuBotController:
         except Exception:
             LOGGER.warning("could not remove processing reaction from message=%s", message_id)
 
-    async def _acknowledge_group_message(self, message: Any) -> None:
-        """Confirm a silent group message was accepted into the current draft."""
-
-        method = getattr(self.channel, "add_reaction", None)
-        message_id = str(getattr(message, "message_id", "") or "")
-        if callable(method) and message_id:
-            try:
-                await method(message_id, "OK")
-                return
-            except Exception:
-                LOGGER.warning("could not acknowledge group message=%s", message_id)
-        await self._reply(
-            message,
-            "已接收并加入草稿。需要查看或保存时请 @机器人 回复“总结吧”或“保存吧”。",
-        )
-
-    async def _group_media_has_recordable_facts(
-        self,
-        session: Session,
-        user_message: dict[str, Any],
-    ) -> bool:
-        """Gate the OK reaction on facts the analyzer can actually extract.
-
-        Media is still retained in the draft when this returns false. That keeps
-        evidence available for a later explicit summary without telling users an
-        otherwise empty screenshot has already produced a record.
-        """
-
-        analysis_profile = _profile_for_analysis(session.current_profile)
-        if session.merchant:
-            existing_identity = analysis_profile.get("merchant")
-            identity = (
-                dict(existing_identity)
-                if isinstance(existing_identity, Mapping)
-                else {}
-            )
-            identity.update(session.merchant)
-            analysis_profile["merchant"] = identity
-        try:
-            preview = await self._analyze_in_batches(
-                [user_message],
-                analysis_profile,
-            )
-        except (ImageBatchLimitError, MerchantApiError):
-            LOGGER.exception(
-                "group media acknowledgement preflight failed; retaining silently"
-            )
-            return False
-        updates = preview.get("profile_updates")
-        conflicts = preview.get("conflicts")
-        return bool(
-            (isinstance(updates, list) and updates)
-            or (isinstance(conflicts, list) and conflicts)
-        )
-
     def _discard_pending_media(self, session: Session) -> None:
         if self.media_staging is not None:
             self.media_staging.discard(session.pending_media)
@@ -3137,12 +3082,6 @@ class FeishuBotController:
             user_message["has_media"] = True
             user_message["media_failed"] = True
             self._record_media_failure(session, message, str(media_failure))
-        should_acknowledge = not failed_profile_media
-        if images:
-            should_acknowledge = await self._group_media_has_recordable_facts(
-                session,
-                user_message,
-            )
         if downloaded_media:
             try:
                 self._append_pending_media(
@@ -3159,8 +3098,6 @@ class FeishuBotController:
         session.group_pending_count += 1
         session.group_generation += 1
         session.group_last_message = message
-        if should_acknowledge:
-            await self._acknowledge_group_message(message)
         if failed_profile_media and not mentioned:
             await self._reply(
                 message,
