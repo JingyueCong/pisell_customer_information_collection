@@ -267,6 +267,8 @@ class ReplyChannel(Protocol):
 
     async def fetch_inbound_message(self, message_id: str) -> Any: ...
 
+    async def get_chat_info(self, chat_id: str) -> Any: ...
+
 
 class VideoProcessor(Protocol):
     def process(
@@ -314,6 +316,9 @@ class Session:
     group_last_message: Any = None
     group_followup_pending: bool = False
     group_save_pending: bool = False
+    group_name: str | None = None
+    group_merchant_hint: str | None = None
+    group_name_lookup_attempted: bool = field(default=False, repr=False)
     group_idle_task: asyncio.Task[Any] | None = field(default=None, repr=False)
     touched_at: float = field(default_factory=time.time)
 
@@ -368,6 +373,8 @@ class SessionStore:
         "group_generation",
         "group_followup_pending",
         "group_save_pending",
+        "group_name",
+        "group_merchant_hint",
         "touched_at",
     )
 
@@ -584,6 +591,39 @@ def _is_group_pause_intent(text: str) -> bool:
 
 def _is_group_save_confirmation(text: str) -> bool:
     return _is_save_confirmation(text)
+
+
+def _merchant_hint_from_group_name(group_name: str) -> str | None:
+    """Extract a conservative CRM lookup hint from a Feishu group title."""
+
+    value = re.sub(r"\s+", " ", group_name).strip()
+    if not value:
+        return None
+    value = re.split(
+        r"\s*[-–—|｜]?\s*[\[【（(]?\s*(?:客户管理\s*)?CRM(?:\s*group|\s*同步群|\s*群)?",
+        value,
+        maxsplit=1,
+        flags=re.IGNORECASE,
+    )[0]
+    value = re.sub(
+        r"\s*[-–—|｜]?\s*(?:\d{1,2}[./-]\d{1,2}|\d{1,2}月\d{1,2}日?)\s*开业.*$",
+        "",
+        value,
+        flags=re.IGNORECASE,
+    )
+    value = value.strip(" \t\r\n-–—|｜_[]【】()（）")
+    compact = _normalize_intent_text(value)
+    generic_names = {
+        "客户信息录入测试群",
+        "客户资料录入测试群",
+        "商户资料收集群",
+        "客户管理群",
+        "crm同步群",
+        "测试群",
+    }
+    if len(compact) < 2 or compact in generic_names:
+        return None
+    return value
 
 
 def _save_request_evidence(text: str) -> str | None:
@@ -2042,6 +2082,64 @@ class FeishuBotController:
             ),
         )
 
+    async def _ensure_group_identity(self, session: Session, message: Any) -> None:
+        """Resolve a new group's title to CRM without overriding explicit evidence."""
+
+        if session.merchant or session.group_name_lookup_attempted:
+            return
+        session.group_name_lookup_attempted = True
+        hint = str(session.group_merchant_hint or "").strip()
+        if not hint:
+            get_chat_info = getattr(self.channel, "get_chat_info", None)
+            chat_id = str(getattr(message, "chat_id", "") or "").strip()
+            if not callable(get_chat_info) or not chat_id:
+                return
+            try:
+                chat_info = await get_chat_info(chat_id)
+            except Exception:
+                LOGGER.exception("could not read Feishu group metadata chat=%s", chat_id)
+                return
+            group_name = str(getattr(chat_info, "name", "") or "").strip()
+            if not group_name:
+                return
+            session.group_name = group_name
+            hint = _merchant_hint_from_group_name(group_name) or ""
+            session.group_merchant_hint = hint or None
+        if not hint:
+            return
+        try:
+            result = await self._post(
+                "/v1/profile/crm/resolve",
+                {"merchant_name": hint, "merchant_id": None},
+            )
+        except MerchantApiError:
+            LOGGER.warning(
+                "CRM lookup from Feishu group name failed group=%s",
+                session.group_name,
+            )
+            return
+        resolution = result.get("crm")
+        if not isinstance(resolution, dict):
+            return
+        session.crm_resolution = resolution
+        candidates = resolution.get("candidates")
+        candidate = (
+            candidates[0]
+            if resolution.get("status") == "unique"
+            and isinstance(candidates, list)
+            and len(candidates) == 1
+            and isinstance(candidates[0], Mapping)
+            else None
+        )
+        if not candidate:
+            return
+        name = str(candidate.get("name") or "").strip()
+        merchant_id = str(candidate.get("work_item_id") or "").strip()
+        if not name or not merchant_id:
+            return
+        session.merchant = {"name": name, "id": merchant_id}
+        session.current_profile_loaded = False
+
     @staticmethod
     def _dialogue_context(session: Session, *, is_group: bool) -> dict[str, Any]:
         preview = session.preview if isinstance(session.preview, Mapping) else {}
@@ -3109,6 +3207,7 @@ class FeishuBotController:
         key = _session_key(message)
         session = self.sessions.get(key)
         mentioned = bool(getattr(message, "mentioned_bot", False))
+        await self._ensure_group_identity(session, message)
         save_request_evidence = _save_request_evidence(text) if mentioned else None
 
         explicit_module = _explicit_media_module(text) if mentioned else None
@@ -3554,10 +3653,26 @@ class FeishuBotController:
                         ),
                     )
                 elif not merchant:
-                    await self._reply(
-                        message,
-                        "未识别到商户名称，暂未写入。请 @机器人 补充商户名称。",
-                    )
+                    group_hint = str(session.group_merchant_hint or "").strip()
+                    group_resolution = session.crm_resolution or {}
+                    group_status = group_resolution.get("status")
+                    if group_hint and group_status == "ambiguous":
+                        await self._reply(
+                            message,
+                            f"已从群名识别到“{group_hint}”，但 CRM 匹配到多个客户，"
+                            "暂未写入。请 @机器人 补充准确商户名称或店铺 ID。",
+                        )
+                    elif group_hint and group_status == "not_found":
+                        await self._reply(
+                            message,
+                            f"已从群名识别到“{group_hint}”，但 CRM 未找到对应客户，"
+                            "暂未写入。请 @机器人 补充准确商户名称或店铺 ID。",
+                        )
+                    else:
+                        await self._reply(
+                            message,
+                            "未识别到商户名称，暂未写入。请 @机器人 补充商户名称。",
+                        )
                 elif not updates and not session.pending_media:
                     session.group_followup_pending = False
                     session.group_save_pending = False

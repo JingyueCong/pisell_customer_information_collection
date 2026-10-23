@@ -21,6 +21,7 @@ from merchant_profile_agent.feishu_bot import (
     _is_group_profile_candidate,
     _merge_analysis_previews,
     _message_batches_for_analysis,
+    _merchant_hint_from_group_name,
     _preview_text,
     _profile_for_analysis,
     _save_request_evidence,
@@ -51,6 +52,11 @@ class Message:
     conversation: Conversation = field(default_factory=Conversation)
 
 
+@dataclass
+class ChatInfo:
+    name: str | None = None
+
+
 class FakeChannel:
     def __init__(self) -> None:
         self.replies = []
@@ -58,6 +64,8 @@ class FakeChannel:
         self.reactions = []
         self.typing_started = []
         self.typing_stopped = []
+        self.chat_info: ChatInfo | None = None
+        self.chat_info_calls: list[str] = []
 
     async def reply(self, message, content, opts=None):
         self.replies.append((message, content, opts))
@@ -73,6 +81,10 @@ class FakeChannel:
     async def remove_typing_reaction(self, message_id, reaction_id):
         self.typing_stopped.append((message_id, reaction_id))
         return True
+
+    async def get_chat_info(self, chat_id):
+        self.chat_info_calls.append(chat_id)
+        return self.chat_info
 
     async def download_resource(self, file_key, resource_type="image", message_id=None):
         self.downloads.append((file_key, resource_type, message_id))
@@ -178,6 +190,39 @@ class FakeApi:
                 },
             }
         raise AssertionError(path)
+
+
+class GroupNameCrmApi:
+    def __init__(self, *, status: str = "unique") -> None:
+        self.status = status
+        self.calls = []
+
+    def post(self, path, payload):
+        self.calls.append((path, copy.deepcopy(payload)))
+        if path != "/v1/profile/crm/resolve":
+            raise AssertionError(path)
+        candidates = []
+        if self.status == "unique":
+            candidates = [
+                {
+                    "work_item_id": "7140000123",
+                    "name": "Little Amigos Fountain Gate",
+                }
+            ]
+        elif self.status == "ambiguous":
+            candidates = [
+                {"work_item_id": "7140000123", "name": "Little Amigos Fountain Gate"},
+                {"work_item_id": "7140000456", "name": "Little Amigos"},
+            ]
+        return {
+            "crm": {
+                "status": self.status,
+                "query": {"merchant_name": payload["merchant_name"]},
+                "candidates": candidates,
+                "read_only": True,
+            },
+            "write_performed": False,
+        }
 
 
 class LiveDocumentApi(FakeApi):
@@ -634,6 +679,19 @@ class UnanchoredSwitchApi(FakeApi):
 
 
 class FeishuBotTests(unittest.TestCase):
+    def test_group_name_is_cleaned_for_crm_lookup(self) -> None:
+        self.assertEqual(
+            _merchant_hint_from_group_name(
+                "Fluffy Soufflé Newtown-[客户管理CRM group] 10.26开业"
+            ),
+            "Fluffy Soufflé Newtown",
+        )
+        self.assertEqual(
+            _merchant_hint_from_group_name("Little Amigos Fountain Gate"),
+            "Little Amigos Fountain Gate",
+        )
+        self.assertIsNone(_merchant_hint_from_group_name("客户信息录入测试群"))
+
     def test_natural_save_command_can_explicitly_include_text_and_images(self) -> None:
         self.assertTrue(_is_group_save_confirmation("保存吧 文字和图片都要"))
         self.assertTrue(_is_group_save_confirmation("请保存以上文字、图片和附件"))
@@ -650,6 +708,66 @@ class FeishuBotTests(unittest.TestCase):
         )
         self.assertIsNone(_save_request_evidence("保存吧 文字和图片都要"))
         self.assertIsNone(_save_request_evidence("商户希望保存会员手机号"))
+
+    def test_group_name_unique_crm_match_binds_merchant_once(self) -> None:
+        api = GroupNameCrmApi()
+        self.channel.chat_info = ChatInfo(
+            "Little Amigos Fountain Gate-[客户管理CRM group] 10.26开业"
+        )
+        sessions = SessionStore()
+        bot = FeishuBotController(
+            api=api,  # type: ignore[arg-type]
+            channel=self.channel,
+            sessions=sessions,
+        )
+
+        async def scenario() -> None:
+            base = {
+                "chat_id": "oc_named_group",
+                "chat_type": "group",
+                "mentioned_bot": True,
+            }
+            await bot.on_message(Message("帮助", message_id="om_help_one", **base))
+            await bot.on_message(Message("帮助", message_id="om_help_two", **base))
+
+        asyncio.run(scenario())
+
+        session = sessions.get("oc_named_group:group:root")
+        self.assertEqual(
+            session.merchant,
+            {"name": "Little Amigos Fountain Gate", "id": "7140000123"},
+        )
+        self.assertEqual(session.group_name, self.channel.chat_info.name)
+        self.assertEqual(session.group_merchant_hint, "Little Amigos Fountain Gate")
+        self.assertEqual(self.channel.chat_info_calls, ["oc_named_group"])
+        self.assertEqual(len(api.calls), 1)
+        self.assertEqual(api.calls[0][1]["merchant_name"], "Little Amigos Fountain Gate")
+
+    def test_ambiguous_group_name_does_not_bind_merchant(self) -> None:
+        api = GroupNameCrmApi(status="ambiguous")
+        self.channel.chat_info = ChatInfo("Little Amigos Fountain Gate CRM group")
+        sessions = SessionStore()
+        bot = FeishuBotController(
+            api=api,  # type: ignore[arg-type]
+            channel=self.channel,
+            sessions=sessions,
+        )
+
+        asyncio.run(
+            bot.on_message(
+                Message(
+                    "保存吧",
+                    message_id="om_ambiguous_save",
+                    chat_id="oc_ambiguous_group",
+                    chat_type="group",
+                    mentioned_bot=True,
+                )
+            )
+        )
+
+        session = sessions.get("oc_ambiguous_group:group:root")
+        self.assertIsNone(session.merchant)
+        self.assertIn("CRM 匹配到多个客户", self.channel.replies[-1][1]["text"])
 
     def test_media_failure_detail_question_is_recognized(self) -> None:
         self.assertTrue(_is_media_status_request("哪个图片未读取"))
@@ -1863,6 +1981,8 @@ class FeishuBotTests(unittest.TestCase):
                 }
             )
             session.group_pending_count = 1
+            session.group_name = "Little Amigos Fountain Gate CRM group"
+            session.group_merchant_hint = "Little Amigos Fountain Gate"
             store.persist()
 
             restored = SessionStore(state_path=state_path).get("oc_group:group:root")
@@ -1870,6 +1990,11 @@ class FeishuBotTests(unittest.TestCase):
             self.assertTrue(restored.group_summary_enabled)
             self.assertEqual(restored.group_pending_count, 1)
             self.assertEqual(len(restored.group_buffer), 1)
+            self.assertEqual(restored.group_name, "Little Amigos Fountain Gate CRM group")
+            self.assertEqual(
+                restored.group_merchant_hint,
+                "Little Amigos Fountain Gate",
+            )
 
     def test_session_store_migrates_old_groups_to_default_on(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
