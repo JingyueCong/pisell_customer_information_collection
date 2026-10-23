@@ -1472,6 +1472,40 @@ def _current_profile_values(session: Session) -> dict[str, Any]:
     return values
 
 
+def _commit_acknowledged(result: Mapping[str, Any]) -> bool:
+    store = result.get("result")
+    store_result = store if isinstance(store, Mapping) else {}
+    return bool(
+        result.get("write_performed")
+        or store_result.get("duplicate")
+        or store_result.get("store_status") == "duplicate"
+    )
+
+
+def _profile_contains_updates(
+    profile: Mapping[str, Any], updates: Sequence[Mapping[str, Any]]
+) -> bool:
+    fields = profile.get("fields")
+    if not isinstance(fields, Mapping) or not updates:
+        return False
+    for update in updates:
+        path = update.get("field_path")
+        if not isinstance(path, str) or path not in fields:
+            return False
+        raw = fields[path]
+        actual = raw.get("value") if isinstance(raw, Mapping) else raw
+        expected = update.get("value")
+        if actual == expected:
+            continue
+        if isinstance(actual, (str, int, float, bool)) and isinstance(
+            expected, (str, int, float, bool)
+        ):
+            if str(actual).strip() == str(expected).strip():
+                continue
+        return False
+    return True
+
+
 def _apply_explicit_module_to_preview(session: Session, document_type: str) -> int:
     preview = session.preview
     if not isinstance(preview, dict):
@@ -3437,9 +3471,40 @@ class FeishuBotController:
             }
             for item in session.messages
         ]
+
+        async def verify_updates_present(
+            submitted_updates: Sequence[Mapping[str, Any]],
+        ) -> bool:
+            try:
+                readback = await self._post(
+                    "/v1/profile/read",
+                    {
+                        "merchant_name": merchant["name"],
+                        "merchant_id": merchant.get("id"),
+                    },
+                )
+            except MerchantApiError:
+                LOGGER.warning(
+                    "merchant profile commit readback unavailable",
+                    exc_info=True,
+                )
+                session.current_profile_loaded = False
+                return False
+            profile = readback.get("profile")
+            if not isinstance(profile, dict) or not _profile_contains_updates(
+                profile, submitted_updates
+            ):
+                session.current_profile_loaded = False
+                return False
+            session.current_profile = profile
+            self._apply_crm_resolution(session, readback.get("crm"))
+            session.current_profile_loaded = True
+            return True
+
         combined_updates = [*updates, *media_updates]
         first_result: dict[str, Any] | None = None
         first_store: dict[str, Any] = {}
+        first_verified_by_readback = False
         documents: list[dict[str, str]] = []
         if combined_updates:
             try:
@@ -3462,18 +3527,28 @@ class FeishuBotController:
                         "请重新发送“保存”，我会再次核对同一客户。",
                     )
                 else:
-                    await self._reply(message, "保存失败，草稿已保留，请稍后重试。")
+                    await self._reply(
+                        message,
+                        "保存失败，草稿和原文件已保留。请稍后 @机器人 回复“保存吧”重试；"
+                        "无需重新发送资料或附件。",
+                    )
                 return
             first_store = (
                 first_result.get("result")
                 if isinstance(first_result.get("result"), dict)
                 else {}
             )
-            if not (first_result.get("write_performed") or first_store.get("duplicate")):
-                await self._reply(message, "提交未完成，草稿已保留。")
-                return
             documents = _document_links(first_store)
             session.media_module_node_tokens.update(_document_node_tokens(first_store))
+            if not _commit_acknowledged(first_result):
+                first_verified_by_readback = await verify_updates_present(combined_updates)
+                if not first_verified_by_readback:
+                    await self._reply(
+                        message,
+                        "知识库写入未完成，草稿和原文件已保留。"
+                        "请稍后 @机器人 回复“保存吧”重试；无需重新发送资料或附件。",
+                    )
+                    return
 
         archived_count = 0
         if session.pending_media:
@@ -3551,11 +3626,17 @@ class FeishuBotController:
                     if isinstance(media_result.get("result"), dict)
                     else {}
                 )
-                if not (media_result.get("write_performed") or media_store.get("duplicate")):
-                    session.current_profile_loaded = False
-                    session.preview = None
-                    await self._reply(message, "附件链接提交未完成，草稿已保留。")
-                    return
+                if not _commit_acknowledged(media_result):
+                    if not await verify_updates_present(uploaded_updates):
+                        session.current_profile_loaded = False
+                        session.preview = None
+                        await self._reply(
+                            message,
+                            "附件已经上传，但链接尚未写入对应模块。"
+                            "草稿和原文件已保留，请稍后 @机器人 回复“保存吧”重试；"
+                            "无需重新上传附件。",
+                        )
+                        return
                 archived_count += len(outstanding)
                 media_documents = _document_links(media_store)
                 if media_documents:
@@ -3565,7 +3646,8 @@ class FeishuBotController:
             session.last_documents = documents
         duplicate = (
             "（此前已保存，本次未重复写入）"
-            if first_store.get("duplicate") and not archived_count
+            if (first_store.get("duplicate") or first_verified_by_readback)
+            and not archived_count
             else ""
         )
         if documents:

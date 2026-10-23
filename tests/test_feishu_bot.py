@@ -253,6 +253,52 @@ class ArchiveApi(FakeApi):
         }
 
 
+class ReadbackVerifiedArchiveApi(ArchiveApi):
+    def __init__(self) -> None:
+        super().__init__()
+        self.fields: dict[str, dict[str, object]] = {}
+
+    def post(self, path, payload):
+        if path == "/v1/profile/read":
+            self.calls.append((path, copy.deepcopy(payload)))
+            return {
+                "profile": {
+                    "fields": copy.deepcopy(self.fields),
+                    "event_count": 1 if self.fields else 0,
+                }
+            }
+        if path != "/v1/profile/commit":
+            return super().post(path, payload)
+        result = super().post(path, payload)
+        for update in payload["updates"]:
+            self.fields[update["field_path"]] = {"value": copy.deepcopy(update["value"])}
+        result["write_performed"] = False
+        result["result"].update(
+            {
+                "store_status": "partial_failure",
+                "duplicate": False,
+                "records_written": 1,
+            }
+        )
+        return result
+
+
+class UnverifiedIncompleteApi(FakeApi):
+    def post(self, path, payload):
+        if path != "/v1/profile/commit":
+            return super().post(path, payload)
+        self.calls.append((path, copy.deepcopy(payload)))
+        return {
+            "write_performed": False,
+            "result": {
+                "store_status": "partial_failure",
+                "duplicate": False,
+                "records_written": 1,
+                "documents": [],
+            },
+        }
+
+
 class MediaOnlyArchiveApi(ArchiveApi):
     def post(self, path, payload):
         if path == "/v1/profile/analyze":
@@ -960,6 +1006,52 @@ class FeishuBotTests(unittest.TestCase):
             self.assertEqual(archiver.calls[0][1], "wik_contacts")
             self.assertFalse(staged_path.exists())
             self.assertIn("已保存到对应模块的附件：1 个", self.channel.replies[-1][1]["text"])
+
+    def test_incomplete_commit_with_verified_readback_continues_media_save(self) -> None:
+        api = ReadbackVerifiedArchiveApi()
+        archiver = FakeMediaArchiver()
+        with tempfile.TemporaryDirectory() as directory:
+            bot = FeishuBotController(
+                api=api,  # type: ignore[arg-type]
+                channel=self.channel,
+                sessions=SessionStore(),
+                media_staging=MediaStagingStore(Path(directory)),
+                media_archiver=archiver,  # type: ignore[arg-type]
+            )
+            asyncio.run(
+                bot.on_message(
+                    Message(
+                        "<image />",
+                        message_id="om_readback_image",
+                        content={"kind": "image", "image_key": "img_readback"},
+                    )
+                )
+            )
+            session = bot.sessions.get("oc_test:ou_test:root")
+
+            asyncio.run(bot.on_message(Message("保存吧", message_id="om_readback_save")))
+
+            commits = [payload for path, payload in api.calls if path == "/v1/profile/commit"]
+            self.assertEqual(len(commits), 2)
+            self.assertEqual(len(archiver.calls), 1)
+            self.assertEqual(session.pending_media, [])
+            self.assertNotIn("提交未完成", self.channel.replies[-1][1]["text"])
+            self.assertIn("已保存到对应模块的附件：1 个", self.channel.replies[-1][1]["text"])
+
+    def test_unverified_incomplete_commit_gives_an_actionable_retry(self) -> None:
+        api = UnverifiedIncompleteApi()
+        bot = FeishuBotController(
+            api=api,  # type: ignore[arg-type]
+            channel=self.channel,
+            sessions=SessionStore(),
+        )
+
+        asyncio.run(bot.on_message(Message("青禾便当的联系人是林经理")))
+        asyncio.run(bot.on_message(Message("保存吧", message_id="om_incomplete_save")))
+
+        reply = self.channel.replies[-1][1]["text"]
+        self.assertIn("请稍后 @机器人 回复“保存吧”重试", reply)
+        self.assertIn("无需重新发送资料或附件", reply)
 
     def test_media_only_message_falls_back_to_document_archive(self) -> None:
         api = MediaOnlyArchiveApi()
