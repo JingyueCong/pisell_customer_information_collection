@@ -4,6 +4,7 @@ import importlib
 import sys
 from pathlib import Path
 from typing import Any, Mapping, Protocol
+from urllib.parse import urlsplit
 
 from .agent import validate_messages
 from .settings import Settings
@@ -118,9 +119,103 @@ class P1KnowledgeStore:
                 merchant_name=merchant_name,
                 merchant_id=merchant_id,
             )
+            documents = self._read_merchant_documents(
+                merchant_name=merchant_name,
+                merchant_id=merchant_id,
+            )
         except Exception as exc:
             raise KnowledgeStoreError("could not read the merchant profile") from exc
+        profile = dict(profile)
+        profile["documents"] = documents
         return {"profile": profile, "write_performed": False, "knowledge_store": self.name}
+
+    def _read_merchant_documents(
+        self, *, merchant_name: str, merchant_id: str | None
+    ) -> list[dict[str, str]]:
+        """List the current merchant Wiki directory and its managed pages read-only."""
+        route = self.committer.routes.resolve_canonical_document_route(
+            str(self.agent["department"]), str(self.agent["id"])
+        )
+        identity = self.committer.routes.resolve_business_object_identity(
+            str(self.agent["department"]),
+            str(self.agent["id"]),
+            merchant_name,
+            object_id=merchant_id,
+            object_kind="merchant",
+        )
+        space_id = self.committer._space_id(route)
+        parent = str(route["root_parent_node_token"])
+        for level in route.get("path_template", []):
+            if level.get("kind") == "category":
+                title = str(level.get("title") or level.get("key") or "")
+            elif level.get("kind") == "object" and level.get("object_kind") == "merchant":
+                title = str(identity["object_name"])
+            else:
+                return []
+            existing = self.committer._exact_child(
+                self.committer.client.wiki_children(space_id, parent), title
+            )
+            if existing is None:
+                return []
+            parent = str(existing["node_token"])
+
+        origin = "https://www.feishu.cn"
+        projection = self.committer.config.knowledge_projection or {}
+        profiles = projection.get("routing_profiles")
+        if isinstance(profiles, Mapping):
+            root_token = str(route["root_parent_node_token"])
+            candidates = [
+                profile
+                for profile in profiles.values()
+                if isinstance(profile, Mapping)
+                and profile.get("node_token") == root_token
+                and isinstance(profile.get("root_url"), str)
+            ]
+            if not candidates:
+                candidates = [
+                    profile
+                    for profile in profiles.values()
+                    if isinstance(profile, Mapping)
+                    and isinstance(profile.get("root_url"), str)
+                ]
+            if candidates:
+                parsed = urlsplit(str(candidates[0]["root_url"]))
+                if parsed.scheme == "https" and parsed.netloc:
+                    origin = f"{parsed.scheme}://{parsed.netloc}"
+
+        documents = [
+            {
+                "document_type": "merchant-directory",
+                "label": "商户资料目录",
+                "title": str(identity["object_name"]),
+                "node_token": parent,
+                "url": f"{origin}/wiki/{parent}",
+            }
+        ]
+        children = self.committer.client.wiki_children(space_id, parent)
+        for definition in route.get("documents", []):
+            if not isinstance(definition, Mapping):
+                continue
+            title = str(definition.get("title") or "")
+            document_type = str(definition.get("document_type") or "")
+            if not title or not document_type:
+                continue
+            existing = self.committer._exact_child(children, title)
+            if existing is None:
+                continue
+            node_token = str(existing.get("node_token") or "")
+            if not node_token:
+                continue
+            documents.append(
+                {
+                    "document_type": document_type,
+                    "label": title,
+                    "title": title,
+                    "node_token": node_token,
+                    "url": f"{origin}/wiki/{node_token}",
+                }
+            )
+        return documents
 
     def commit_profile(self, request: Mapping[str, Any]) -> dict[str, Any]:
         allowed = {"confirmation", "conversation_id", "merchant", "messages", "updates"}

@@ -179,6 +179,35 @@ class FakeApi:
         raise AssertionError(path)
 
 
+class LiveDocumentApi(FakeApi):
+    def post(self, path, payload):
+        if path != "/v1/profile/read":
+            return super().post(path, payload)
+        self.calls.append((path, copy.deepcopy(payload)))
+        return {
+            "profile": {
+                "merchant": {
+                    "name": payload["merchant_name"],
+                    "id": payload.get("merchant_id"),
+                },
+                "fields": {},
+                "event_count": 2,
+                "documents": [
+                    {
+                        "document_type": "merchant-directory",
+                        "label": "商户资料目录",
+                        "url": "https://example.feishu.cn/wiki/merchant",
+                    },
+                    {
+                        "document_type": "business-contacts",
+                        "label": "01｜业务与联系人",
+                        "url": "https://example.feishu.cn/wiki/contacts-live",
+                    },
+                ],
+            }
+        }
+
+
 class FakeDialogueRouter:
     def __init__(self, decisions: list[DialogueDecision]) -> None:
         self.decisions = list(decisions)
@@ -1886,6 +1915,44 @@ class FeishuBotTests(unittest.TestCase):
         reply = self.channel.replies[-1][1]["text"]
         self.assertIn("商户概况", reply)
         self.assertIn("https://example.feishu.cn/wiki/overview", reply)
+
+    def test_group_link_request_without_repeat_mention_reads_current_pages(self) -> None:
+        api = LiveDocumentApi()
+        sessions = SessionStore()
+        session = sessions.get("oc_live_links:group:root")
+        session.merchant = {"name": "青禾便当", "id": "crm-1"}
+        session.last_documents = [
+            {
+                "label": "旧链接",
+                "url": "https://example.feishu.cn/wiki/stale",
+            }
+        ]
+        bot = FeishuBotController(
+            api=api,  # type: ignore[arg-type]
+            channel=self.channel,
+            sessions=sessions,
+        )
+
+        asyncio.run(
+            bot.on_message(
+                Message(
+                    "给我这个商户的资料文档链接",
+                    message_id="om_live_links",
+                    chat_id="oc_live_links",
+                    chat_type="group",
+                    mentioned_bot=False,
+                )
+            )
+        )
+
+        self.assertEqual(api.calls[-1][0], "/v1/profile/read")
+        self.assertEqual(api.calls[-1][1]["merchant_id"], "crm-1")
+        reply = self.channel.replies[-1][1]["text"]
+        self.assertIn("实时查询", reply)
+        self.assertIn("商户资料目录", reply)
+        self.assertIn("https://example.feishu.cn/wiki/contacts-live", reply)
+        self.assertNotIn("/wiki/stale", reply)
+        self.assertEqual(session.group_buffer, [])
 
     def test_merchant_sentence_containing_save_is_not_confirmation(self) -> None:
         self.run_message("青禾便当的资料保存周期是每周一次")

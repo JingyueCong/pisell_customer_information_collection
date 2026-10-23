@@ -1,3 +1,3 @@
 """PiSell merchant profile collection agent."""
 
-__version__ = "0.15.6"
+__version__ = "0.15.7"

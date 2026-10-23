@@ -858,9 +858,16 @@ def _document_links(store_result: dict[str, Any]) -> list[dict[str, str]]:
         if not isinstance(url, str) or not url.startswith("https://"):
             continue
         document_type = str(item.get("document_type") or "")
+        explicit_label = item.get("label") or item.get("title")
         links.append(
             {
-                "label": DOCUMENT_LABELS.get(document_type, document_type or "知识库页面"),
+                "label": (
+                    str(explicit_label)
+                    if isinstance(explicit_label, str) and explicit_label.strip()
+                    else DOCUMENT_LABELS.get(
+                        document_type, document_type or "知识库页面"
+                    )
+                ),
                 "url": url,
             }
         )
@@ -1938,6 +1945,76 @@ class FeishuBotController:
         # links, or mentions when a preview is echoed into a group chat.
         await self.channel.reply(message, {"text": text})
 
+    async def _reply_current_profile_links(
+        self, message: Any, session: Session
+    ) -> None:
+        merchant = session.merchant if isinstance(session.merchant, Mapping) else {}
+        merchant_name = str(merchant.get("name") or "").strip()
+        if not merchant_name:
+            if session.last_documents:
+                await self._reply(message, _links_text(session.last_documents))
+            else:
+                await self._reply(
+                    message,
+                    "当前还没有确认商户。请先说明商户名称，再让我查询资料链接。",
+                )
+            return
+        try:
+            readback = await self._post(
+                "/v1/profile/read",
+                {
+                    "merchant_name": merchant_name,
+                    "merchant_id": merchant.get("id"),
+                },
+            )
+        except MerchantApiError:
+            LOGGER.exception("real-time merchant document lookup failed")
+            if session.last_documents:
+                await self._reply(
+                    message,
+                    "实时查询暂时失败，以下是本会话最近一次保存返回的链接：\n"
+                    + "\n".join(
+                        f"- {item['label']}：{item['url']}"
+                        for item in session.last_documents
+                    ),
+                )
+            else:
+                await self._reply(message, "资料页面实时查询失败，请稍后再试。")
+            return
+        profile = readback.get("profile")
+        if not isinstance(profile, dict):
+            await self._reply(message, "知识库没有返回有效的商户资料页面。")
+            return
+        session.current_profile = profile
+        session.current_profile_loaded = True
+        self._apply_crm_resolution(session, readback.get("crm"))
+        documents = _document_links(profile)
+        if not documents:
+            if session.last_documents:
+                await self._reply(
+                    message,
+                    f"知识库暂未返回“{merchant_name}”的实时目录；"
+                    "以下是本会话最近一次保存返回的链接：\n"
+                    + "\n".join(
+                        f"- {item['label']}：{item['url']}"
+                        for item in session.last_documents
+                    ),
+                )
+            else:
+                await self._reply(
+                    message,
+                    f"知识库中尚未找到“{merchant_name}”的资料页面。",
+                )
+            return
+        session.last_documents = documents
+        await self._reply(
+            message,
+            f"{merchant_name} 的资料页面（实时查询）：\n"
+            + "\n".join(
+                f"- {item['label']}：{item['url']}" for item in documents
+            ),
+        )
+
     @staticmethod
     def _dialogue_context(session: Session, *, is_group: bool) -> dict[str, Any]:
         preview = session.preview if isinstance(session.preview, Mapping) else {}
@@ -2298,7 +2375,7 @@ class FeishuBotController:
             )
             return True
         if action == "links":
-            await self._reply(message, _links_text(session.last_documents))
+            await self._reply_current_profile_links(message, session)
             return True
         if action == "pause":
             session.group_summary_enabled = False
@@ -2389,7 +2466,7 @@ class FeishuBotController:
             )
             return True
         if action == "links":
-            await self._reply(message, _links_text(session.last_documents))
+            await self._reply_current_profile_links(message, session)
             return True
         if action == "media_status":
             if session.media_failures:
@@ -2750,7 +2827,7 @@ class FeishuBotController:
 
         session = self.sessions.get(key)
         if _is_link_request(text):
-            await self._reply(message, _links_text(session.last_documents))
+            await self._reply_current_profile_links(message, session)
             return
         explicit_module = _explicit_media_module(text)
         if explicit_module and (
@@ -3095,8 +3172,8 @@ class FeishuBotController:
             session.clear_group_buffer()
             await self._reply(message, "已放弃当前摘要草稿，静默记录仍开启。")
             return
-        if mentioned and _is_link_request(text):
-            await self._reply(message, _links_text(session.last_documents))
+        if _is_link_request(text):
+            await self._reply_current_profile_links(message, session)
             return
         if mentioned and _is_group_save_confirmation(text):
             if session.group_buffer:
