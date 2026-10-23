@@ -27,6 +27,7 @@ from merchant_profile_agent.feishu_bot import (
     _save_request_evidence,
     _without_video_placeholders,
 )
+from merchant_profile_agent.api_client import MerchantApiError
 from merchant_profile_agent.codex_dialogue import DialogueDecision, DialogueTurn
 from merchant_profile_agent.media_archive import MediaStagingStore
 from merchant_profile_agent.video import VideoEvidence
@@ -223,6 +224,15 @@ class GroupNameCrmApi:
             },
             "write_performed": False,
         }
+
+
+class RetryGroupNameCrmApi(GroupNameCrmApi):
+    def post(self, path, payload):
+        self.calls.append((path, copy.deepcopy(payload)))
+        if len(self.calls) == 1:
+            raise MerchantApiError("CRM temporarily unavailable")
+        self.calls.pop()
+        return super().post(path, payload)
 
 
 class LiveDocumentApi(FakeApi):
@@ -748,6 +758,35 @@ class FeishuBotTests(unittest.TestCase):
         self.assertEqual(self.channel.chat_info_calls, ["oc_named_group"])
         self.assertEqual(len(api.calls), 1)
         self.assertEqual(api.calls[0][1]["merchant_name"], "Little Amigos Fountain Gate")
+
+    def test_temporary_group_name_crm_failure_is_retried(self) -> None:
+        api = RetryGroupNameCrmApi()
+        self.channel.chat_info = ChatInfo("Little Amigos Fountain Gate CRM group")
+        sessions = SessionStore()
+        bot = FeishuBotController(
+            api=api,  # type: ignore[arg-type]
+            channel=self.channel,
+            sessions=sessions,
+        )
+
+        async def scenario() -> None:
+            base = {
+                "chat_id": "oc_retry_named_group",
+                "chat_type": "group",
+                "mentioned_bot": True,
+            }
+            await bot.on_message(Message("帮助", message_id="om_retry_one", **base))
+            await bot.on_message(Message("帮助", message_id="om_retry_two", **base))
+
+        asyncio.run(scenario())
+
+        session = sessions.get("oc_retry_named_group:group:root")
+        self.assertEqual(len(api.calls), 2)
+        self.assertEqual(self.channel.chat_info_calls, ["oc_retry_named_group"])
+        self.assertEqual(
+            session.merchant,
+            {"name": "Little Amigos Fountain Gate", "id": "7140000123"},
+        )
 
     def test_ambiguous_group_name_does_not_bind_merchant(self) -> None:
         api = GroupNameCrmApi(status="ambiguous")

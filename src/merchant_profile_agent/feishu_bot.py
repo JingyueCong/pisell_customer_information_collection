@@ -2089,7 +2089,6 @@ class FeishuBotController:
 
         if session.merchant or session.group_name_lookup_attempted:
             return
-        session.group_name_lookup_attempted = True
         hint = str(session.group_merchant_hint or "").strip()
         if not hint:
             get_chat_info = getattr(self.channel, "get_chat_info", None)
@@ -2108,6 +2107,9 @@ class FeishuBotController:
             hint = _merchant_hint_from_group_name(group_name) or ""
             session.group_merchant_hint = hint or None
         if not hint:
+            # A readable but generic group name is a stable negative result. Do not
+            # request the same group metadata for every subsequent message.
+            session.group_name_lookup_attempted = True
             return
         try:
             result = await self._post(
@@ -2123,6 +2125,9 @@ class FeishuBotController:
         resolution = result.get("crm")
         if not isinstance(resolution, dict):
             return
+        # Only cache a completed CRM lookup. Temporary API/auth/network failures
+        # must remain retryable on the next mentioned command.
+        session.group_name_lookup_attempted = True
         session.crm_resolution = resolution
         candidates = resolution.get("candidates")
         candidate = (
