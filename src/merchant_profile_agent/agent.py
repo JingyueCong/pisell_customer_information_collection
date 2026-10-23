@@ -467,6 +467,34 @@ class MerchantProfileAgent:
             )
         return classifications
 
+    @staticmethod
+    def _deduplicate_exact_updates(
+        updates: Sequence[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Remove repeated model facts before invoking the module classifier."""
+
+        positions: dict[tuple[str, str], int] = {}
+        deduplicated: list[dict[str, Any]] = []
+        for update in updates:
+            raw_path = update.get("field_path")
+            raw_value = update.get("value")
+            if not isinstance(raw_path, str) or not isinstance(raw_value, str):
+                deduplicated.append(update)
+                continue
+            key = (canonical_field_path(raw_path), raw_value.strip())
+            position = positions.get(key)
+            if position is None:
+                positions[key] = len(deduplicated)
+                deduplicated.append(update)
+                continue
+            previous = deduplicated[position]
+            replacement = dict(update)
+            replacement["replace_confirmed"] = bool(
+                previous.get("replace_confirmed") or update.get("replace_confirmed")
+            )
+            deduplicated[position] = replacement
+        return deduplicated
+
     def analyze(self, request: Mapping[str, Any]) -> dict[str, Any]:
         extra = set(request) - {"messages", "current_profile"}
         if extra:
@@ -529,6 +557,7 @@ class MerchantProfileAgent:
                 }
             )
 
+        raw_updates = self._deduplicate_exact_updates(raw_updates)
         module_classifications = self._classify_updates(messages, raw_updates)
         for item in raw_updates:
             item.pop("source_message_index", None)
@@ -536,6 +565,14 @@ class MerchantProfileAgent:
         validated = validate_update_set(
             extracted.get("merchant_name"), raw_updates, current_profile
         )
+        accepted_paths = {
+            item["field_path"] for item in validated["profile_updates"]
+        }
+        module_classifications = [
+            item
+            for item in module_classifications
+            if item["field_path"] in accepted_paths
+        ]
         next_question = extracted.get("next_question")
         if next_question is not None and (
             not isinstance(next_question, str) or not next_question.strip()

@@ -71,6 +71,60 @@ def extraction(**overrides):
 
 
 class AgentTests(unittest.TestCase):
+    def test_duplicate_extracted_fact_is_collapsed_before_validation(self) -> None:
+        duplicate = {
+            "field_path": "stores.primary.name",
+            "value": "小熊鲜生",
+            "source_message_index": 0,
+            "replace_confirmed": False,
+        }
+        agent = MerchantProfileAgent(
+            FakeClient(extraction(updates=[duplicate, dict(duplicate)]))
+        )
+
+        result = agent.analyze(
+            {"messages": [{"role": "user", "content": "客户是小熊鲜生"}]}
+        )
+
+        self.assertEqual(len(result["profile_updates"]), 1)
+        self.assertEqual(result["profile_updates"][0]["field_path"], "stores.primary.name")
+        self.assertEqual(result["save_readiness"], "ready")
+
+    def test_different_values_for_one_extracted_field_become_conflict(self) -> None:
+        agent = MerchantProfileAgent(
+            FakeClient(
+                extraction(
+                    updates=[
+                        {
+                            "field_path": "contacts.primary.name",
+                            "value": "林经理",
+                            "source_message_index": 0,
+                            "replace_confirmed": False,
+                        },
+                        {
+                            "field_path": "contacts.primary.name",
+                            "value": "王经理",
+                            "source_message_index": 1,
+                            "replace_confirmed": False,
+                        },
+                    ]
+                )
+            )
+        )
+
+        result = agent.analyze(
+            {
+                "messages": [
+                    {"role": "user", "content": "联系人是林经理"},
+                    {"role": "user", "content": "联系人是王经理"},
+                ]
+            }
+        )
+
+        self.assertEqual(result["profile_updates"], [])
+        self.assertEqual(result["save_readiness"], "needs_confirmation")
+        self.assertEqual(result["conflicts"][0]["proposed_value"], "王经理")
+
     def test_independent_classifier_routes_by_semantics(self) -> None:
         extractor = FakeClient(
             extraction(

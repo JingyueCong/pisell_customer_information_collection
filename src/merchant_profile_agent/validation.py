@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import re
-from collections import Counter, OrderedDict
+from collections import OrderedDict
 from typing import Any, Mapping, Sequence
 
 
@@ -176,24 +176,65 @@ def _current_fields(profile: Mapping[str, Any] | None) -> dict[str, Any]:
     return fields
 
 
+def _display_conflict_value(field_path: str, value: Any) -> Any:
+    if PLAINTEXT_PASSWORD_FIELD.fullmatch(field_path):
+        return "••••••（已隐藏）"
+    return value
+
+
+def _coalesce_updates(
+    updates: Sequence[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Collapse repeated facts and surface contradictory batch values safely."""
+
+    by_path: "OrderedDict[str, list[dict[str, Any]]]" = OrderedDict()
+    for update in updates:
+        by_path.setdefault(update["field_path"], []).append(update)
+
+    coalesced: list[dict[str, Any]] = []
+    conflicts: list[dict[str, Any]] = []
+    for field_path, candidates in by_path.items():
+        by_value: "OrderedDict[str, dict[str, Any]]" = OrderedDict()
+        for candidate in candidates:
+            value = candidate["value"]
+            previous = by_value.get(value)
+            merged = dict(candidate)
+            if previous is not None:
+                # Prefer the latest source while preserving any explicit replace
+                # confirmation present in an earlier duplicate occurrence.
+                merged["replace_confirmed"] = bool(
+                    previous["replace_confirmed"] or candidate["replace_confirmed"]
+                )
+            by_value[value] = merged
+        if len(by_value) == 1:
+            coalesced.append(next(iter(by_value.values())))
+            continue
+        values = list(by_value)
+        conflicts.append(
+            {
+                "field_path": field_path,
+                "current_value": _display_conflict_value(field_path, values[0]),
+                "proposed_value": _display_conflict_value(field_path, values[-1]),
+                "reason": "同一批资料包含不同值",
+            }
+        )
+    return coalesced, conflicts
+
+
 def validate_update_set(
     merchant_name: str | None,
     raw_updates: Sequence[Mapping[str, Any]],
     current_profile: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     normalized_name = merchant_name.strip() if isinstance(merchant_name, str) else ""
-    updates = [validate_update(item) for item in raw_updates]
-    counts = Counter(item["field_path"] for item in updates)
-    duplicates = sorted(path for path, count in counts.items() if count > 1)
-    if duplicates:
-        raise ProfileValidationError(
-            "profile updates contain duplicate field paths: " + ", ".join(duplicates)
-        )
+    updates, batch_conflicts = _coalesce_updates(
+        [validate_update(item) for item in raw_updates]
+    )
 
     current_fields = _current_fields(current_profile)
     accepted: list[dict[str, Any]] = []
     unchanged: list[dict[str, Any]] = []
-    conflicts: list[dict[str, Any]] = []
+    conflicts: list[dict[str, Any]] = list(batch_conflicts)
     for update in updates:
         current_value = current_fields.get(update["field_path"])
         if update["field_path"] not in current_fields:

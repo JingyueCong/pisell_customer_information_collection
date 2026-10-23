@@ -166,9 +166,25 @@ class ValidationTests(unittest.TestCase):
         self.assertEqual(result["conflicts"][0]["current_value"], "••••••（已隐藏）")
         self.assertEqual(result["conflicts"][0]["proposed_value"], "••••••（已隐藏）")
 
-    def test_duplicate_path_is_rejected(self) -> None:
-        with self.assertRaisesRegex(ProfileValidationError, "duplicate field paths"):
-            validate_update_set("青禾便当", [update(), update()], {})
+    def test_duplicate_path_with_same_value_is_collapsed(self) -> None:
+        result = validate_update_set("青禾便当", [update(), update()], {})
+
+        self.assertEqual(len(result["profile_updates"]), 1)
+        self.assertEqual(result["conflicts"], [])
+        self.assertEqual(result["save_readiness"], "ready")
+
+    def test_duplicate_path_with_different_values_requires_confirmation(self) -> None:
+        result = validate_update_set(
+            "青禾便当",
+            [update(value="林经理"), update(value="王经理")],
+            {},
+        )
+
+        self.assertEqual(result["profile_updates"], [])
+        self.assertEqual(result["save_readiness"], "needs_confirmation")
+        self.assertEqual(result["conflicts"][0]["field_path"], "contacts.primary.name")
+        self.assertEqual(result["conflicts"][0]["current_value"], "林经理")
+        self.assertEqual(result["conflicts"][0]["proposed_value"], "王经理")
 
 
 if __name__ == "__main__":
