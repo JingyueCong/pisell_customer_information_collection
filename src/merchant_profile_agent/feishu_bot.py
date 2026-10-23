@@ -1531,8 +1531,20 @@ def _media_failure_suffix(items: Sequence[Mapping[str, Any]]) -> str:
     return (
         "\n\n⚠️ 以下图片/附件尚未进入总结：\n"
         + "\n".join(details)
-        + "\n本次不会漏写后继续保存。请在对应原消息下重新发送原图；"
-        "如确认无需图片内容，请 @机器人 回复“仅保存文字”。"
+        + "\n这些失败项不会阻止其他已识别资料保存，保存后仍会保留为待重试项。"
+        "请 @机器人 回复“再试一下”，或在对应原消息下重新发送原图；"
+        "如确认无需图片内容，可回复“仅保存文字”。"
+    )
+
+
+def _partial_save_media_failure_suffix(items: Sequence[Mapping[str, Any]]) -> str:
+    if not items:
+        return ""
+    count = len(items)
+    return (
+        f"\n\n⚠️ 已先保存可用内容；仍有 {count} 条图片/附件未能读取，"
+        "失败记录和原消息位置已保留。"
+        "请 @机器人 回复“再试一下”，或重新发送原图，成功后可再次保存补充内容。"
     )
 
 
@@ -3418,7 +3430,7 @@ class FeishuBotController:
                 )
                 # A successful image from the same sender resolves that sender's
                 # unavailable-image state. Failures belonging to other members
-                # remain blocking, so unrelated uploads cannot hide them.
+                # stay visible as independent retry items.
                 self._resolve_media_failures_for_sender(session, message)
             except MediaArchiveError as exc:
                 await self._reply(message, f"附件暂存失败：{exc}")
@@ -3565,12 +3577,22 @@ class FeishuBotController:
         return True
 
     async def _save(self, message: Any, session: Session, confirmation: str) -> None:
-        if session.media_failures:
-            await self._reply(
-                message,
-                _media_failure_suffix(session.media_failures).strip(),
-            )
-            return
+        # Failed Feishu media must not silently disappear, but it also should
+        # not hold already usable text and successfully downloaded attachments
+        # hostage. Preserve both the failure records and their source messages
+        # across a successful partial save so a later "再试一下" can
+        # fetch, analyze, and append the missing evidence.
+        deferred_media_failures = copy.deepcopy(session.media_failures)
+        deferred_source_refs = {
+            str(item.get("source_ref") or "")
+            for item in deferred_media_failures
+            if item.get("source_ref")
+        }
+        deferred_retry_messages = [
+            copy.deepcopy(item)
+            for item in [*session.messages, *session.group_buffer]
+            if str(item.get("source_ref") or "") in deferred_source_refs
+        ]
         resolution = session.crm_resolution
         preview_updates = (session.preview or {}).get("profile_updates")
         unresolved_crm = (
@@ -3895,6 +3917,11 @@ class FeishuBotController:
             reply_text = f"已写入知识库。{duplicate}"
         if archived_count:
             reply_text += f"\n- 已保存到对应模块的附件：{archived_count} 个"
+        if deferred_media_failures:
+            reply_text += _partial_save_media_failure_suffix(deferred_media_failures)
         self._discard_pending_media(session)
         await self._reply(message, reply_text)
         session.reset_draft(preserve_merchant=_is_group_message(message))
+        if deferred_media_failures:
+            session.media_failures = deferred_media_failures
+            session.messages = deferred_retry_messages

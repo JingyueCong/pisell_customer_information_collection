@@ -1809,7 +1809,7 @@ class FeishuBotTests(unittest.TestCase):
         self.assertIn("商户：青禾便当", channel.replies[-1][1]["text"])
         self.assertIn("/v1/profile/analyze", [path for path, _ in self.api.calls])
 
-    def test_group_broken_merchant_image_blocks_save_until_user_chooses_text_only(self) -> None:
+    def test_group_broken_merchant_image_saves_text_and_keeps_image_for_retry(self) -> None:
         channel = MissingImageChannel()
         sessions = SessionStore()
         bot = FeishuBotController(
@@ -1842,22 +1842,7 @@ class FeishuBotTests(unittest.TestCase):
             bot.on_message(
                 Message(
                     "保存吧",
-                    message_id="om_blocked_save",
-                    mentioned_bot=True,
-                    **base,
-                )
-            )
-        )
-
-        self.assertNotIn("/v1/profile/commit", [path for path, _ in self.api.calls])
-        self.assertIn("尚未进入总结", channel.replies[-1][1]["text"])
-        self.assertIn("om_failed_media"[-8:], channel.replies[-1][1]["text"])
-
-        asyncio.run(
-            bot.on_message(
-                Message(
-                    "仅保存文字",
-                    message_id="om_text_only_save",
+                    message_id="om_partial_save",
                     mentioned_bot=True,
                     **base,
                 )
@@ -1865,7 +1850,69 @@ class FeishuBotTests(unittest.TestCase):
         )
 
         self.assertIn("/v1/profile/commit", [path for path, _ in self.api.calls])
+        self.assertIn("已先保存可用内容", channel.replies[-1][1]["text"])
+        self.assertIn("再试一下", channel.replies[-1][1]["text"])
+        self.assertEqual(len(session.media_failures), 1)
+        self.assertEqual(len(session.messages), 1)
+        self.assertEqual(
+            session.messages[0]["source_ref"],
+            "feishu://chat/oc_failed_media/message/om_failed_media",
+        )
+
+    def test_group_retry_after_partial_save_recovers_the_deferred_image(self) -> None:
+        original = Message(
+            "青禾便当的联系人是林经理\n![image](img_missing)",
+            message_id="om_partial_retry",
+            chat_id="oc_partial_retry",
+            sender_id="ou_partial_retry",
+            sender_name="测试成员",
+            chat_type="group",
+            content={"kind": "post"},
+            resources=[{"type": "image", "file_key": "img_missing"}],
+        )
+        channel = RetriableImageChannel(original)
+        sessions = SessionStore()
+        bot = FeishuBotController(
+            api=self.api,  # type: ignore[arg-type]
+            channel=channel,
+            sessions=sessions,
+        )
+
+        asyncio.run(bot.on_message(original))
+        asyncio.run(
+            bot.on_message(
+                Message(
+                    "保存吧",
+                    message_id="om_save_before_retry",
+                    chat_id="oc_partial_retry",
+                    sender_id="ou_partial_retry",
+                    sender_name="测试成员",
+                    chat_type="group",
+                    mentioned_bot=True,
+                )
+            )
+        )
+        session = sessions.get("oc_partial_retry:group:root")
+        self.assertEqual(len(session.media_failures), 1)
+        self.assertEqual(len(session.messages), 1)
+
+        asyncio.run(
+            bot.on_message(
+                Message(
+                    "再试一下",
+                    message_id="om_retry_after_save",
+                    chat_id="oc_partial_retry",
+                    sender_id="ou_partial_retry",
+                    sender_name="测试成员",
+                    chat_type="group",
+                    mentioned_bot=True,
+                )
+            )
+        )
+
         self.assertEqual(session.media_failures, [])
+        self.assertEqual(len(session.messages[0]["images"]), 1)
+        self.assertIn("已重新读取 1 张图片", channel.replies[-1][1]["text"])
 
     def test_successful_group_image_resend_clears_failed_media_state(self) -> None:
         channel = MissingImageChannel()
