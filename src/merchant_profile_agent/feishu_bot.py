@@ -606,7 +606,9 @@ def _merchant_hint_from_group_name(group_name: str) -> str | None:
         flags=re.IGNORECASE,
     )[0]
     value = re.sub(
-        r"\s*[-–—|｜]?\s*(?:\d{1,2}[./-]\d{1,2}|\d{1,2}月\d{1,2}日?)\s*开业.*$",
+        r"\s*[-–—|｜]?\s*(?:预计|计划)?\s*"
+        r"(?:\d{1,2}[./-]\d{1,2}(?:日|号)?|\d{1,2}月\d{1,2}日?)\s*"
+        r"(?:开业|上线|开店).*$",
         "",
         value,
         flags=re.IGNORECASE,

@@ -690,6 +690,12 @@ class FeishuBotTests(unittest.TestCase):
             _merchant_hint_from_group_name("Little Amigos Fountain Gate"),
             "Little Amigos Fountain Gate",
         )
+        self.assertEqual(
+            _merchant_hint_from_group_name(
+                "Little amigos Fountain Gate 预计11.7开业"
+            ),
+            "Little amigos Fountain Gate",
+        )
         self.assertIsNone(_merchant_hint_from_group_name("客户信息录入测试群"))
 
     def test_natural_save_command_can_explicitly_include_text_and_images(self) -> None:
