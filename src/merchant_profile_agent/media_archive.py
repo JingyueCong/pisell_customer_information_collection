@@ -111,7 +111,7 @@ class MediaStagingStore:
 
 
 class FeishuDriveArchiver:
-    """Upload staged media below its resolved merchant module Wiki node."""
+    """Insert staged media into its resolved merchant module document."""
 
     def __init__(
         self,
@@ -124,30 +124,36 @@ class FeishuDriveArchiver:
         self.origin = origin.rstrip("/")
         self.timeout_seconds = timeout_seconds
 
-    def archive(self, item: Mapping[str, Any], *, wiki_token: str) -> dict[str, str]:
+    def archive(
+        self, item: Mapping[str, Any], *, document_token: str
+    ) -> dict[str, str]:
         path = Path(str(item.get("local_path") or "")).expanduser().resolve()
         if not path.is_file():
             raise MediaArchiveError("待保存附件已不存在，请重新发送原文件。")
-        if not wiki_token:
+        if not document_token:
             raise MediaArchiveError("未找到附件对应的知识库模块，附件尚未上传。")
         name = _safe_file_name(
             str(item.get("file_name") or path.name), fallback="attachment.bin"
         )
+        media_type = str(item.get("media_type") or "application/octet-stream").lower()
         command = [
             self.executable,
-            "drive",
-            "+upload",
+            "docs",
+            "+media-insert",
+            "--doc",
+            document_token,
             "--file",
             str(path),
-            "--name",
-            name,
-            "--wiki-token",
-            wiki_token,
             "--as",
             "user",
             "--format",
             "json",
         ]
+        if media_type.startswith("image/"):
+            command.extend(["--type", "image", "--width", "720", "--caption", name])
+        else:
+            view = "preview" if media_type.startswith(("video/", "audio/")) else "card"
+            command.extend(["--type", "file", "--file-view", view])
         try:
             result = subprocess.run(
                 command,
@@ -179,6 +185,7 @@ class FeishuDriveArchiver:
                 raise MediaArchiveError("飞书附件上传返回了无效结果。")
         file_token = ""
         file_url = ""
+        block_id = ""
         for value in _walk(payload):
             if not isinstance(value, Mapping):
                 continue
@@ -188,10 +195,18 @@ class FeishuDriveArchiver:
             candidate_url = value.get("url") or value.get("file_url")
             if isinstance(candidate_url, str) and candidate_url.startswith("https://"):
                 file_url = candidate_url
+            candidate_block = value.get("block_id")
+            if isinstance(candidate_block, str) and candidate_block:
+                block_id = candidate_block
             if file_token and file_url:
                 break
         if not file_token:
             raise MediaArchiveError("飞书附件上传成功但未返回文件标识。")
         if not file_url:
             file_url = f"{self.origin}/file/{file_token}"
-        return {"file_token": file_token, "url": file_url, "name": name}
+        return {
+            "file_token": file_token,
+            "url": file_url,
+            "name": name,
+            "block_id": block_id,
+        }

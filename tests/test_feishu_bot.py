@@ -288,12 +288,13 @@ class FakeMediaArchiver:
     def __init__(self) -> None:
         self.calls = []
 
-    def archive(self, item, *, wiki_token):
-        self.calls.append((copy.deepcopy(item), wiki_token))
+    def archive(self, item, *, document_token):
+        self.calls.append((copy.deepcopy(item), document_token))
         return {
             "file_token": "file_archived_123",
             "url": "https://example.feishu.cn/file/file_archived_123",
             "name": item["file_name"],
+            "block_id": "block_archived_123",
         }
 
 
@@ -311,26 +312,31 @@ class ArchiveApi(FakeApi):
                     {
                         "document_type": "merchant-overview",
                         "node_token": "wik_overview",
+                        "obj_token": "doc_overview",
                         "url": "https://example.feishu.cn/wiki/overview",
                     },
                     {
                         "document_type": "business-contacts",
                         "node_token": "wik_contacts",
+                        "obj_token": "doc_contacts",
                         "url": "https://example.feishu.cn/wiki/contacts",
                     },
                     {
                         "document_type": "store-profile",
                         "node_token": "wik_store",
+                        "obj_token": "doc_store",
                         "url": "https://example.feishu.cn/wiki/store",
                     },
                     {
                         "document_type": "package-commercial",
                         "node_token": "wik_package",
+                        "obj_token": "doc_package",
                         "url": "https://example.feishu.cn/wiki/package",
                     },
                     {
                         "document_type": "document-archive",
                         "node_token": "wik_archive",
+                        "obj_token": "doc_archive",
                         "url": "https://example.feishu.cn/wiki/archive",
                     },
                 ],
@@ -1208,7 +1214,7 @@ class FeishuBotTests(unittest.TestCase):
             }
             self.assertEqual(second_values["url"], "https://example.feishu.cn/file/file_archived_123")
             self.assertEqual(second_values["status"], "已保存")
-            self.assertEqual(archiver.calls[0][1], "wik_contacts")
+            self.assertEqual(archiver.calls[0][1], "doc_contacts")
             self.assertFalse(staged_path.exists())
             self.assertIn("已保存到对应模块的附件：1 个", self.channel.replies[-1][1]["text"])
 
@@ -1288,7 +1294,7 @@ class FeishuBotTests(unittest.TestCase):
                 for item in commits[0]["updates"]
             )
         )
-        self.assertEqual(archiver.calls[0][1], "wik_archive")
+        self.assertEqual(archiver.calls[0][1], "doc_archive")
         self.assertIn("已保存到对应模块的附件：1 个", self.channel.replies[-1][1]["text"])
 
     def test_user_can_override_fallback_archive_before_save(self) -> None:
@@ -1326,7 +1332,7 @@ class FeishuBotTests(unittest.TestCase):
                 for item in commits[0]["updates"]
             )
         )
-        self.assertEqual(archiver.calls[0][1], "wik_store")
+        self.assertEqual(archiver.calls[0][1], "doc_store")
 
     def test_pdf_file_uses_the_same_document_archive_flow(self) -> None:
         api = MediaOnlyArchiveApi()
@@ -1361,7 +1367,7 @@ class FeishuBotTests(unittest.TestCase):
             asyncio.run(bot.on_message(Message("保存吧", message_id="om_save_pdf")))
 
         self.assertEqual(archiver.calls[0][0]["file_name"], "NAB_Statement.pdf")
-        self.assertEqual(archiver.calls[0][1], "wik_archive")
+        self.assertEqual(archiver.calls[0][1], "doc_archive")
         self.assertIn("已保存到对应模块的附件：1 个", self.channel.replies[-1][1]["text"])
 
     def test_image_key_can_be_recovered_from_raw_feishu_body(self) -> None:

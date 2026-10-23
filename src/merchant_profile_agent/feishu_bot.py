@@ -1788,6 +1788,8 @@ def _archived_media_updates(
         "file_token": str(uploaded["file_token"]),
         "status": "已保存",
     }
+    if uploaded.get("block_id"):
+        values["block_id"] = str(uploaded["block_id"])
     return [
         {
             "field_path": f"{field_base}.{suffix}",
@@ -1809,9 +1811,9 @@ def _document_node_tokens(store_result: Mapping[str, Any]) -> dict[str, str]:
         if not isinstance(item, Mapping):
             continue
         document_type = str(item.get("document_type") or "")
-        node_token = item.get("node_token")
-        if document_type in MEDIA_FIELD_PREFIXES and isinstance(node_token, str) and node_token:
-            result[document_type] = node_token
+        obj_token = item.get("obj_token")
+        if document_type in MEDIA_FIELD_PREFIXES and isinstance(obj_token, str) and obj_token:
+            result[document_type] = obj_token
     return result
 
 
@@ -3821,7 +3823,7 @@ class FeishuBotController:
                             uploaded = await asyncio.to_thread(
                                 self.media_archiver.archive,
                                 item,
-                                wiki_token=session.media_module_node_tokens[
+                                document_token=session.media_module_node_tokens[
                                     str(item["target_document_type"])
                                 ],
                             )
