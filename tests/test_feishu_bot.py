@@ -23,6 +23,7 @@ from merchant_profile_agent.feishu_bot import (
     _message_batches_for_analysis,
     _preview_text,
     _profile_for_analysis,
+    _save_request_evidence,
     _without_video_placeholders,
 )
 from merchant_profile_agent.codex_dialogue import DialogueDecision, DialogueTurn
@@ -637,6 +638,18 @@ class FeishuBotTests(unittest.TestCase):
         self.assertTrue(_is_group_save_confirmation("保存吧 文字和图片都要"))
         self.assertTrue(_is_group_save_confirmation("请保存以上文字、图片和附件"))
         self.assertFalse(_is_group_save_confirmation("商户希望保存会员手机号"))
+
+    def test_trailing_save_command_preserves_preceding_evidence(self) -> None:
+        self.assertEqual(
+            _save_request_evidence("Little Amigos Fountain Gate 保存吧"),
+            "Little Amigos Fountain Gate",
+        )
+        self.assertEqual(
+            _save_request_evidence("Little Amigos Fountain Gate 保存吧 文字和图片都要"),
+            "Little Amigos Fountain Gate",
+        )
+        self.assertIsNone(_save_request_evidence("保存吧 文字和图片都要"))
+        self.assertIsNone(_save_request_evidence("商户希望保存会员手机号"))
 
     def test_media_failure_detail_question_is_recognized(self) -> None:
         self.assertTrue(_is_media_status_request("哪个图片未读取"))
@@ -2209,6 +2222,27 @@ class FeishuBotTests(unittest.TestCase):
         self.assertEqual(self.api.calls, [])
         self.assertIn("未识别到商户名称", self.channel.replies[-1][1]["text"])
 
+    def test_group_merchant_name_and_save_in_one_message_is_analyzed_then_saved(self) -> None:
+        self.run_group(
+            "Little Amigos Fountain Gate 保存吧",
+            mentioned=True,
+            message_id="om_named_save",
+        )
+
+        paths = [path for path, _ in self.api.calls]
+        self.assertEqual(
+            paths,
+            ["/v1/profile/analyze", "/v1/profile/read", "/v1/profile/commit"],
+        )
+        analyze_payload = self.api.calls[0][1]
+        self.assertEqual(len(analyze_payload["messages"]), 1)
+        self.assertIn(
+            "Little Amigos Fountain Gate",
+            analyze_payload["messages"][0]["content"],
+        )
+        self.assertNotIn("保存吧", analyze_payload["messages"][0]["content"])
+        self.assertIn("已写入", self.channel.replies[-1][1]["text"])
+
     def test_group_start_recording_alias_and_save_flush_pending_messages(self) -> None:
         self.bot = FeishuBotController(
             api=self.api,  # type: ignore[arg-type]
@@ -2395,6 +2429,45 @@ class FeishuBotTests(unittest.TestCase):
         self.assertTrue(any("Dandong咖啡厅" in item["content"] for item in corrected_messages))
         commit = next(payload for path, payload in api.calls if path == "/v1/profile/commit")
         self.assertEqual(commit["merchant"]["name"], "Dandong咖啡厅")
+
+    def test_group_missing_merchant_can_be_supplied_with_save_in_same_message(self) -> None:
+        api = MissingMerchantThenCorrectionApi()
+        bot = FeishuBotController(
+            api=api,  # type: ignore[arg-type]
+            channel=self.channel,
+            sessions=SessionStore(),
+        )
+
+        async def scenario() -> None:
+            base = {
+                "chat_id": "oc_combined_correction",
+                "chat_type": "group",
+                "sender_name": "测试成员",
+            }
+            await bot.on_message(Message("主要联系人是林经理", message_id="om_detail", **base))
+            await bot.on_message(
+                Message("保存吧", message_id="om_save_one", mentioned_bot=True, **base)
+            )
+            await bot.on_message(
+                Message(
+                    "Dandong咖啡厅 保存吧",
+                    message_id="om_named_save",
+                    mentioned_bot=True,
+                    **base,
+                )
+            )
+
+        asyncio.run(scenario())
+
+        analyzes = [payload for path, payload in api.calls if path == "/v1/profile/analyze"]
+        corrected_messages = analyzes[-1]["messages"]
+        self.assertTrue(
+            any("Dandong咖啡厅" in item["content"] for item in corrected_messages)
+        )
+        self.assertFalse(any("保存吧" in item["content"] for item in corrected_messages))
+        commit = next(payload for path, payload in api.calls if path == "/v1/profile/commit")
+        self.assertEqual(commit["merchant"]["name"], "Dandong咖啡厅")
+        self.assertIn("已写入", self.channel.replies[-1][1]["text"])
 
     def test_group_pronoun_after_save_reuses_last_merchant(self) -> None:
         api = PronounContinuationApi()

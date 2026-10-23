@@ -586,6 +586,33 @@ def _is_group_save_confirmation(text: str) -> bool:
     return _is_save_confirmation(text)
 
 
+def _save_request_evidence(text: str) -> str | None:
+    """Return useful evidence that precedes a trailing save instruction.
+
+    Staff often combine the final missing detail with the action, for example
+    ``Little Amigos Fountain Gate 保存吧``. Treating that entire sentence as
+    only an action drops the merchant name before analysis. Reuse the strict
+    save-confirmation parser for the suffix so ordinary facts containing the
+    verb "保存" are not accidentally promoted to save requests.
+    """
+
+    stripped = text.strip()
+    if not stripped or _is_save_confirmation(stripped):
+        return None
+    markers = ("结束并保存", "保存吧", "帮我保存", "麻烦保存", "请保存")
+    for marker in markers:
+        marker_index = stripped.rfind(marker)
+        if marker_index <= 0:
+            continue
+        suffix = stripped[marker_index:]
+        if not _is_save_confirmation(suffix):
+            continue
+        evidence = stripped[:marker_index].strip(" \t\r\n，,。.!！?？、:：;；\"'“”‘’")
+        if evidence:
+            return evidence
+    return None
+
+
 def _is_media_status_request(text: str) -> bool:
     normalized = _normalize_intent_text(text)
     media_terms = ("图片", "图", "附件", "文件", "视频")
@@ -3082,6 +3109,7 @@ class FeishuBotController:
         key = _session_key(message)
         session = self.sessions.get(key)
         mentioned = bool(getattr(message, "mentioned_bot", False))
+        save_request_evidence = _save_request_evidence(text) if mentioned else None
 
         explicit_module = _explicit_media_module(text) if mentioned else None
         if explicit_module and (
@@ -3175,6 +3203,14 @@ class FeishuBotController:
         if _is_link_request(text):
             await self._reply_current_profile_links(message, session)
             return
+        if save_request_evidence:
+            # Preserve the content before a trailing save command as evidence.
+            # The normal buffering path below will analyze it together with the
+            # existing draft, retain same-message attachments, and then perform
+            # the guarded save once merchant/CRM checks succeed.
+            text = save_request_evidence
+            session.group_followup_pending = True
+            session.group_save_pending = True
         if mentioned and _is_group_save_confirmation(text):
             if session.group_buffer:
                 if session.group_followup_pending:
@@ -3204,7 +3240,7 @@ class FeishuBotController:
                     return
             await self._save(message, session, "仅保存文字")
             return
-        if mentioned:
+        if mentioned and not save_request_evidence:
             decision = await self._decide_dialogue(session, text, is_group=True)
             if decision is not None and await self._handle_group_dialogue_action(
                 session,
