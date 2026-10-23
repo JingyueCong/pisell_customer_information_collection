@@ -149,7 +149,31 @@ def create_server(
         }
 
     def read_with_crm(request: Mapping[str, Any]) -> dict[str, Any]:
-        resolution = resolve_crm(request)
+        try:
+            resolution = resolve_crm(request)
+        except CrmResolverUnavailable:
+            submitted_name = request.get("merchant_name")
+            submitted_id = request.get("merchant_id")
+            if (
+                not isinstance(submitted_name, str)
+                or not submitted_name.strip()
+                or not isinstance(submitted_id, str)
+                or not submitted_id.strip()
+            ):
+                raise
+            # A previously bound CRM ID is sufficient for a fail-safe read-only
+            # lookup when the CRM bridge is temporarily unavailable. Mutating
+            # commits continue to require a fresh CRM resolution below.
+            resolution = {
+                "status": "bound_id_fallback",
+                "query": {
+                    "merchant_name": submitted_name.strip(),
+                    "merchant_id": submitted_id.strip(),
+                },
+                "candidates": [],
+                "read_only": True,
+                "crm_available": False,
+            }
         identity = canonical_crm_merchant(
             resolution,
             submitted_name=request.get("merchant_name"),

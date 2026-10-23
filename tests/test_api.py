@@ -7,6 +7,7 @@ import urllib.error
 import urllib.request
 
 from merchant_profile_agent.api import create_server
+from merchant_profile_agent.crm import CrmResolverUnavailable
 from merchant_profile_agent.settings import Settings
 
 
@@ -185,6 +186,13 @@ class NotFoundCrm:
         }
 
 
+class UnavailableCrm:
+    name = "meegle"
+
+    def resolve(self, request):
+        raise CrmResolverUnavailable("CRM temporarily unavailable")
+
+
 class ApiCrmTests(unittest.TestCase):
     def setUp(self) -> None:
         settings = Settings(
@@ -230,6 +238,44 @@ class ApiCrmTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(result["crm"]["status"], "unique")
         self.assertEqual(self.store.last_read["merchant_id"], "987654321")
+
+    def test_read_uses_bound_id_when_crm_is_temporarily_unavailable(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=2)
+        settings = Settings(api_key="a" * 24, openai_api_key="test", port=0)
+        self.server = create_server(
+            settings,
+            FakeAgent(),  # type: ignore[arg-type]
+            self.store,  # type: ignore[arg-type]
+            UnavailableCrm(),  # type: ignore[arg-type]
+        )
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        self.base_url = f"http://127.0.0.1:{self.server.server_address[1]}"
+
+        status, result = self.request(
+            "/v1/profile/read",
+            {"merchant_name": "小熊鲜生", "merchant_id": "7128603670"},
+            token="a" * 24,
+        )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(result["crm"]["status"], "bound_id_fallback")
+        self.assertFalse(result["crm"]["crm_available"])
+        self.assertEqual(self.store.last_read["merchant_id"], "7128603670")
+
+        with self.assertRaises(urllib.error.HTTPError) as caught:
+            self.request(
+                "/v1/profile/commit",
+                {
+                    "confirmation": "结束并保存",
+                    "merchant": {"name": "小熊鲜生", "id": "7128603670"},
+                },
+                token="a" * 24,
+            )
+        self.assertEqual(caught.exception.code, 503)
+        caught.exception.close()
 
     def test_commit_rechecks_and_binds_crm_id(self) -> None:
         status, result = self.request(
