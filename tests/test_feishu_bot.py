@@ -39,6 +39,11 @@ class Conversation:
 
 
 @dataclass
+class Reply:
+    message_id: str
+
+
+@dataclass
 class Message:
     body_text: str
     message_id: str = "om_test"
@@ -51,6 +56,7 @@ class Message:
     content: object | None = None
     raw: dict = field(default_factory=dict)
     conversation: Conversation = field(default_factory=Conversation)
+    reply: Reply | None = None
 
 
 @dataclass
@@ -143,7 +149,9 @@ class TransientFileChannel(FakeChannel):
         self.downloads.append((file_key, resource_type, message_id))
         self.attempts += 1
         if self.attempts == 1:
-            raise TimeoutError("Connection to open.feishu.cn timed out")
+            # The production lark-channel SDK logs a ConnectTimeoutError and
+            # converts it to an empty result before returning to the bot.
+            return None
         return b"%PDF-1.7 recovered-after-timeout"
 
 
@@ -1406,14 +1414,7 @@ class FeishuBotTests(unittest.TestCase):
                 "file_key": "file_quoted",
                 "file_name": "quoted.pdf",
             },
-            raw={
-                "event": {
-                    "message": {
-                        "message_id": "om_wrapper",
-                        "parent_id": "om_parent",
-                    }
-                }
-            },
+            reply=Reply(message_id="om_parent"),
         )
 
         downloaded = asyncio.run(bot._download_archive_files(message))
@@ -1421,6 +1422,8 @@ class FeishuBotTests(unittest.TestCase):
         self.assertEqual(
             channel.downloads,
             [
+                ("file_quoted", "file", "om_wrapper"),
+                ("file_quoted", "file", "om_wrapper"),
                 ("file_quoted", "file", "om_wrapper"),
                 ("file_quoted", "file", "om_parent"),
             ],
@@ -1503,6 +1506,8 @@ class FeishuBotTests(unittest.TestCase):
         self.assertEqual(
             channel.downloads,
             [
+                ("img_quoted", "image", "om_wrapper"),
+                ("img_quoted", "image", "om_wrapper"),
                 ("img_quoted", "image", "om_wrapper"),
                 ("img_quoted", "image", "om_parent"),
             ],

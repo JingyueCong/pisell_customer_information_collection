@@ -1342,6 +1342,10 @@ def _resource_message_ids(message: Any) -> list[str]:
             message_ids.append(value)
 
     append(getattr(message, "message_id", None))
+    reply = getattr(message, "reply", None)
+    append(getattr(reply, "message_id", None))
+    for attribute in ("parent_id", "root_id", "upper_message_id"):
+        append(getattr(message, attribute, None))
 
     def collect(value: Any) -> None:
         if isinstance(value, Mapping):
@@ -2750,9 +2754,13 @@ class FeishuBotController:
                             attempt + 1,
                         )
                     return candidate, last_error
-                # The SDK returns no bytes for permanent API rejections such as
-                # File-not-in-message. Try the next plausible owner immediately.
-                break
+                # lark-channel currently converts both transport failures and
+                # permanent Feishu API rejections into ``None``. Since it does
+                # not expose which one occurred, repeat this safe read a bounded
+                # number of times before moving to the next plausible owner.
+                if attempt >= len(RESOURCE_DOWNLOAD_RETRY_DELAYS_SECONDS):
+                    break
+                await asyncio.sleep(RESOURCE_DOWNLOAD_RETRY_DELAYS_SECONDS[attempt])
         return None, last_error
 
     async def _download_images(
