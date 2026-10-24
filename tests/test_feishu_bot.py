@@ -126,6 +126,27 @@ class ReferencedImageChannel(FakeChannel):
         )
 
 
+class ReferencedFileChannel(FakeChannel):
+    async def download_resource(self, file_key, resource_type="image", message_id=None):
+        self.downloads.append((file_key, resource_type, message_id))
+        if message_id != "om_parent":
+            return None
+        return b"%PDF-1.7 referenced-file"
+
+
+class TransientFileChannel(FakeChannel):
+    def __init__(self) -> None:
+        super().__init__()
+        self.attempts = 0
+
+    async def download_resource(self, file_key, resource_type="image", message_id=None):
+        self.downloads.append((file_key, resource_type, message_id))
+        self.attempts += 1
+        if self.attempts == 1:
+            raise TimeoutError("Connection to open.feishu.cn timed out")
+        return b"%PDF-1.7 recovered-after-timeout"
+
+
 class FakeVideoProcessor:
     def __init__(self) -> None:
         self.calls = []
@@ -1369,6 +1390,70 @@ class FeishuBotTests(unittest.TestCase):
         self.assertEqual(archiver.calls[0][0]["file_name"], "NAB_Statement.pdf")
         self.assertEqual(archiver.calls[0][1], "doc_archive")
         self.assertIn("已保存到对应模块的附件：1 个", self.channel.replies[-1][1]["text"])
+
+    def test_file_download_uses_referenced_message_owner(self) -> None:
+        channel = ReferencedFileChannel()
+        bot = FeishuBotController(
+            api=MediaOnlyArchiveApi(),  # type: ignore[arg-type]
+            channel=channel,
+            sessions=SessionStore(),
+        )
+        message = Message(
+            "<file />",
+            message_id="om_wrapper",
+            content={
+                "kind": "file",
+                "file_key": "file_quoted",
+                "file_name": "quoted.pdf",
+            },
+            raw={
+                "event": {
+                    "message": {
+                        "message_id": "om_wrapper",
+                        "parent_id": "om_parent",
+                    }
+                }
+            },
+        )
+
+        downloaded = asyncio.run(bot._download_archive_files(message))
+
+        self.assertEqual(
+            channel.downloads,
+            [
+                ("file_quoted", "file", "om_wrapper"),
+                ("file_quoted", "file", "om_parent"),
+            ],
+        )
+        self.assertEqual(downloaded[0].data, b"%PDF-1.7 referenced-file")
+
+    def test_file_download_retries_transient_connection_timeout(self) -> None:
+        channel = TransientFileChannel()
+        bot = FeishuBotController(
+            api=MediaOnlyArchiveApi(),  # type: ignore[arg-type]
+            channel=channel,
+            sessions=SessionStore(),
+        )
+        message = Message(
+            "<file />",
+            message_id="om_timeout",
+            content={
+                "kind": "file",
+                "file_key": "file_timeout",
+                "file_name": "timeout.pdf",
+            },
+        )
+
+        downloaded = asyncio.run(bot._download_archive_files(message))
+
+        self.assertEqual(
+            channel.downloads,
+            [
+                ("file_timeout", "file", "om_timeout"),
+                ("file_timeout", "file", "om_timeout"),
+            ],
+        )
+        self.assertEqual(downloaded[0].data, b"%PDF-1.7 recovered-after-timeout")
 
     def test_image_key_can_be_recovered_from_raw_feishu_body(self) -> None:
         message = Message(

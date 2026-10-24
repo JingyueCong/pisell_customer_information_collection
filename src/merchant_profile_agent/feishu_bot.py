@@ -37,6 +37,7 @@ MAX_IMAGE_BYTES = 4 * 1024 * 1024
 MAX_IMAGE_BYTES_PER_MODEL_BATCH = 6 * 1024 * 1024
 MAX_TOTAL_IMAGE_BYTES_PER_ANALYSIS = 30 * 1024 * 1024
 MAX_ARCHIVE_FILE_BYTES = 25 * 1024 * 1024
+RESOURCE_DOWNLOAD_RETRY_DELAYS_SECONDS = (0.25, 1.0)
 ARCHIVE_FILE_EXTENSIONS = {
     ".pdf",
     ".doc",
@@ -1366,6 +1367,39 @@ def _resource_message_ids(message: Any) -> list[str]:
     return message_ids[:12]
 
 
+def _is_resource_owner_mismatch(error: Exception) -> bool:
+    """Return whether Feishu says the resource belongs to another message."""
+
+    detail = f"{type(error).__name__}: {error}".lower()
+    return "234003" in detail or "file not in msg" in detail
+
+
+def _is_transient_resource_error(error: Exception) -> bool:
+    """Recognise transport failures for which repeating a read is safe."""
+
+    if isinstance(error, (TimeoutError, ConnectionError)):
+        return True
+    detail = f"{type(error).__name__}: {error}".lower()
+    return any(
+        marker in detail
+        for marker in (
+            "timeout",
+            "timed out",
+            "connecterror",
+            "connection reset",
+            "connection aborted",
+            "temporarily unavailable",
+            "remote protocol error",
+            "too many requests",
+            "http 429",
+            "http 500",
+            "http 502",
+            "http 503",
+            "http 504",
+        )
+    )
+
+
 def _without_image_placeholders(text: str) -> str:
     text = re.sub(r"!\[image\]\([^)]+\)", " ", text)
     text = re.sub(r"<image\b[^>]*?/?>", " ", text, flags=re.IGNORECASE)
@@ -2654,6 +2688,73 @@ class FeishuBotController:
             return True
         return False
 
+    async def _download_resource_from_message_tree(
+        self,
+        message: Any,
+        file_key: str,
+        *,
+        resource_type: str,
+        media_label: str,
+    ) -> tuple[bytes | None, Exception | None]:
+        """Download a resource from its real owner with bounded transport retries.
+
+        Feishu resource keys are scoped to the message that owns them. Replies,
+        rich posts and merged forwards can expose a key on a wrapper message while
+        the downloadable bytes remain attached to a parent/root message. Try all
+        plausible owners, but only repeat an owner when the failure is transient.
+        """
+
+        owner_message_ids: list[str | None] = list(_resource_message_ids(message))
+        if not owner_message_ids:
+            owner_message_ids = [None]
+        last_error: Exception | None = None
+        for owner_index, owner_message_id in enumerate(owner_message_ids):
+            for attempt in range(len(RESOURCE_DOWNLOAD_RETRY_DELAYS_SECONDS) + 1):
+                try:
+                    candidate = await self.channel.download_resource(
+                        file_key,
+                        resource_type=resource_type,
+                        message_id=owner_message_id,
+                    )
+                except Exception as exc:
+                    last_error = exc
+                    LOGGER.warning(
+                        "%s resource download raised for message=%s owner=%s "
+                        "key=%s attempt=%s: %s",
+                        media_label,
+                        str(getattr(message, "message_id", "") or "unknown"),
+                        owner_message_id or "none",
+                        file_key,
+                        attempt + 1,
+                        exc,
+                    )
+                    # 234003 is deterministic for this owner. Move directly to
+                    # the referenced parent/root instead of retrying the same ID.
+                    if _is_resource_owner_mismatch(exc):
+                        break
+                    if not _is_transient_resource_error(exc):
+                        break
+                    if attempt >= len(RESOURCE_DOWNLOAD_RETRY_DELAYS_SECONDS):
+                        break
+                    await asyncio.sleep(
+                        RESOURCE_DOWNLOAD_RETRY_DELAYS_SECONDS[attempt]
+                    )
+                    continue
+                if isinstance(candidate, bytes) and candidate:
+                    if owner_index or attempt:
+                        LOGGER.info(
+                            "%s resource recovered owner=%s key=%s attempt=%s",
+                            media_label,
+                            owner_message_id or "none",
+                            file_key,
+                            attempt + 1,
+                        )
+                    return candidate, last_error
+                # The SDK returns no bytes for permanent API rejections such as
+                # File-not-in-message. Try the next plausible owner immediately.
+                break
+        return None, last_error
+
     async def _download_images(
         self, message: Any
     ) -> tuple[list[str], list[DownloadedMedia]]:
@@ -2665,41 +2766,18 @@ class FeishuBotController:
         image_data_urls: list[str] = []
         downloaded: list[DownloadedMedia] = []
         total_bytes = 0
-        owner_message_ids = _resource_message_ids(message) or [None]
         for ordinal, file_key in enumerate(file_keys):
-            data: bytes | None = None
-            last_error: Exception | None = None
-            for owner_message_id in owner_message_ids:
-                try:
-                    candidate = await self.channel.download_resource(
-                        file_key,
-                        resource_type="image",
-                        message_id=owner_message_id,
-                    )
-                except Exception as exc:
-                    last_error = exc
-                    LOGGER.warning(
-                        "image resource download raised for message=%s owner=%s key=%s: %s",
-                        str(getattr(message, "message_id", "") or "unknown"),
-                        owner_message_id or "none",
-                        file_key,
-                        exc,
-                    )
-                    continue
-                if isinstance(candidate, bytes) and candidate:
-                    data = candidate
-                    if owner_message_id != owner_message_ids[0]:
-                        LOGGER.info(
-                            "image resource recovered from referenced message=%s key=%s",
-                            owner_message_id,
-                            file_key,
-                        )
-                    break
+            data, last_error = await self._download_resource_from_message_tree(
+                message,
+                file_key,
+                resource_type="image",
+                media_label="image",
+            )
             if not isinstance(data, bytes) or not data:
                 LOGGER.warning(
                     "image resource download returned no bytes for message=%s owners=%s key=%s",
                     str(getattr(message, "message_id", "") or "unknown"),
-                    owner_message_ids,
+                    _resource_message_ids(message) or [None],
                     file_key,
                 )
                 if last_error is not None:
@@ -2743,21 +2821,15 @@ class FeishuBotController:
             raise VideoProcessingError(
                 f"视频不能超过 {self.maximum_video_duration_seconds // 60} 分钟。"
             )
-        try:
-            data = await self.channel.download_resource(
-                resource.file_key,
-                resource_type="file",
-                message_id=str(getattr(message, "message_id", "") or "") or None,
-            )
-        except Exception as exc:
-            LOGGER.warning(
-                "video resource download raised for message=%s key=%s: %s",
-                str(getattr(message, "message_id", "") or "unknown"),
-                resource.file_key,
-                exc,
-            )
-            raise VideoProcessingError("视频下载失败，请重新发送。") from exc
+        data, last_error = await self._download_resource_from_message_tree(
+            message,
+            resource.file_key,
+            resource_type="file",
+            media_label="video",
+        )
         if not isinstance(data, bytes) or not data:
+            if last_error is not None:
+                raise VideoProcessingError("视频下载失败，请稍后重试。") from last_error
             raise VideoProcessingError("视频下载失败，请重新发送。")
         if len(data) > self.maximum_video_bytes:
             raise VideoProcessingError(
@@ -2790,15 +2862,15 @@ class FeishuBotController:
     async def _download_archive_files(self, message: Any) -> list[DownloadedMedia]:
         downloaded: list[DownloadedMedia] = []
         for resource in _archive_file_resources(message):
-            try:
-                data = await self.channel.download_resource(
-                    resource.file_key,
-                    resource_type="file",
-                    message_id=str(getattr(message, "message_id", "") or "") or None,
-                )
-            except Exception as exc:
-                raise MediaArchiveError("文件下载失败，请重新发送原文件。") from exc
+            data, last_error = await self._download_resource_from_message_tree(
+                message,
+                resource.file_key,
+                resource_type="file",
+                media_label="file",
+            )
             if not isinstance(data, bytes) or not data:
+                if last_error is not None:
+                    raise MediaArchiveError("文件下载失败，请稍后重试。") from last_error
                 raise MediaArchiveError("文件下载失败，请重新发送原文件。")
             if len(data) > MAX_ARCHIVE_FILE_BYTES:
                 raise MediaArchiveError("单个归档文件不能超过 25 MB。")
