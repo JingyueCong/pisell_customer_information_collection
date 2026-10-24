@@ -155,6 +155,12 @@ class TransientFileChannel(FakeChannel):
         return b"%PDF-1.7 recovered-after-timeout"
 
 
+class FailedFileChannel(FakeChannel):
+    async def download_resource(self, file_key, resource_type="image", message_id=None):
+        self.downloads.append((file_key, resource_type, message_id))
+        raise ValueError("permanent test download failure")
+
+
 class FakeVideoProcessor:
     def __init__(self) -> None:
         self.calls = []
@@ -1580,11 +1586,8 @@ class FeishuBotTests(unittest.TestCase):
     def test_group_profile_message_is_buffered_without_ok_reaction(self) -> None:
         self.run_group("青禾便当联系人是林经理", message_id="om_status")
 
-        self.assertEqual(self.channel.typing_started, ["om_status"])
-        self.assertEqual(
-            self.channel.typing_stopped,
-            [("om_status", "reaction_om_status")],
-        )
+        self.assertEqual(self.channel.typing_started, [])
+        self.assertEqual(self.channel.typing_stopped, [])
         self.assertEqual(self.channel.reactions, [])
         self.assertEqual(self.channel.replies, [])
 
@@ -1926,7 +1929,8 @@ class FeishuBotTests(unittest.TestCase):
         )
         session = sessions.get("oc_failed_media:group:root")
         self.assertEqual(len(session.media_failures), 1)
-        self.assertIn("这条图片消息未能完整读取", channel.replies[-1][1]["text"])
+        self.assertEqual(channel.replies, [])
+        self.assertEqual(channel.typing_started, [])
 
         asyncio.run(
             bot.on_message(
@@ -1948,6 +1952,64 @@ class FeishuBotTests(unittest.TestCase):
             session.messages[0]["source_ref"],
             "feishu://chat/oc_failed_media/message/om_failed_media",
         )
+
+    def test_unmentioned_group_video_failure_is_recorded_without_reply(self) -> None:
+        channel = FakeChannel()
+        sessions = SessionStore()
+        bot = FeishuBotController(
+            api=self.api,  # type: ignore[arg-type]
+            channel=channel,
+            sessions=sessions,
+            video_processor=FakeVideoProcessor(),
+        )
+        message = Message(
+            "<media />",
+            message_id="om_silent_video_failure",
+            chat_id="oc_silent_video",
+            chat_type="group",
+            content={
+                "kind": "media",
+                "file_key": "file_long_video",
+                "file_name": "long.mov",
+                "duration_ms": 301_000,
+            },
+        )
+
+        asyncio.run(bot.on_message(message))
+
+        session = sessions.get("oc_silent_video:group:root")
+        self.assertEqual(channel.replies, [])
+        self.assertEqual(channel.typing_started, [])
+        self.assertEqual(len(session.media_failures), 1)
+        self.assertIn("视频处理失败", session.media_failures[0]["reason"])
+
+    def test_unmentioned_group_file_failure_is_recorded_without_reply(self) -> None:
+        channel = FailedFileChannel()
+        sessions = SessionStore()
+        bot = FeishuBotController(
+            api=self.api,  # type: ignore[arg-type]
+            channel=channel,
+            sessions=sessions,
+        )
+        message = Message(
+            "<file />",
+            message_id="om_silent_file_failure",
+            chat_id="oc_silent_file",
+            chat_type="group",
+            content={
+                "kind": "file",
+                "file_key": "file_broken",
+                "file_name": "broken.pdf",
+            },
+        )
+
+        asyncio.run(bot.on_message(message))
+
+        session = sessions.get("oc_silent_file:group:root")
+        self.assertEqual(channel.replies, [])
+        self.assertEqual(channel.typing_started, [])
+        self.assertEqual(len(session.media_failures), 1)
+        self.assertIn("文件处理失败", session.media_failures[0]["reason"])
 
     def test_group_retry_after_partial_save_recovers_the_deferred_image(self) -> None:
         original = Message(

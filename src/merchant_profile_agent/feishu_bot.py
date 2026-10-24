@@ -2917,10 +2917,6 @@ class FeishuBotController:
             should_show_processing = bool(
                 not _is_group_message(message)
                 or getattr(message, "mentioned_bot", False)
-                or _is_group_profile_candidate(
-                    text,
-                    has_media=bool(image_keys or has_video or has_archive_file),
-                )
             )
             if should_show_processing:
                 processing_reaction_id = await self._start_processing_status(message)
@@ -2961,6 +2957,7 @@ class FeishuBotController:
                     downloaded_media = []
             video = None
             if has_video:
+                video_download = None
                 try:
                     video_download = await self._download_video(message)
                 except VideoProcessingError as exc:
@@ -2969,8 +2966,12 @@ class FeishuBotController:
                         str(getattr(message, "message_id", "") or "unknown"),
                         exc,
                     )
-                    await self._reply(message, f"视频处理失败：{exc}")
-                    return
+                    if not _is_group_message(message):
+                        await self._reply(message, f"视频处理失败：{exc}")
+                        return
+                    media_failure = "；".join(
+                        part for part in (media_failure, f"视频处理失败：{exc}") if part
+                    )
                 if video_download is not None:
                     video, downloaded_video = video_download
                     downloaded_media.append(downloaded_video)
@@ -2978,8 +2979,12 @@ class FeishuBotController:
                 try:
                     downloaded_media.extend(await self._download_archive_files(message))
                 except MediaArchiveError as exc:
-                    await self._reply(message, f"文件处理失败：{exc}")
-                    return
+                    if not _is_group_message(message):
+                        await self._reply(message, f"文件处理失败：{exc}")
+                        return
+                    media_failure = "；".join(
+                        part for part in (media_failure, f"文件处理失败：{exc}") if part
+                    )
             if video is not None:
                 if video.transcript:
                     text = "\n".join(
@@ -3459,7 +3464,8 @@ class FeishuBotController:
         failed_profile_media = bool(
             media_failure
             and (
-                not text
+                media_failure.startswith(("视频处理失败：", "文件处理失败："))
+                or not text
                 or _is_group_profile_candidate(text, has_media=False)
             )
         )
@@ -3488,7 +3494,7 @@ class FeishuBotController:
             sender_id = str(getattr(message, "sender_id", "") or "").strip()
             if sender_id:
                 sender_name = f"成员[{sender_id[-8:]}]"
-        message_text = text or "用户上传了一张未能读取的图片。"
+        message_text = text or "用户上传了未能读取的图片或附件。"
         content = f"{sender_name}：{message_text}" if sender_name else message_text
         user_message: dict[str, Any] = {
             "role": "user",
@@ -3513,20 +3519,14 @@ class FeishuBotController:
                 # stay visible as independent retry items.
                 self._resolve_media_failures_for_sender(session, message)
             except MediaArchiveError as exc:
-                await self._reply(message, f"附件暂存失败：{exc}")
-                return
+                failed_profile_media = True
+                user_message["has_media"] = True
+                user_message["media_failed"] = True
+                self._record_media_failure(session, message, f"附件暂存失败：{exc}")
         session.group_buffer.append(user_message)
         session.group_pending_count += 1
         session.group_generation += 1
         session.group_last_message = message
-        if failed_profile_media and not mentioned:
-            await self._reply(
-                message,
-                "这条图片消息未能完整读取："
-                + str(media_failure)
-                + " 草稿已保留，不会静默漏写。",
-            )
-            return
         if mentioned:
             session.cancel_idle_task()
             if failed_profile_media:
