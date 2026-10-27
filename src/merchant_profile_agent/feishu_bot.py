@@ -3406,6 +3406,12 @@ class FeishuBotController:
             await self._reply(message, "已放弃当前摘要草稿，静默记录仍开启。")
             return
         if _is_link_request(text):
+            # Link lookups are active group commands, not passive evidence.
+            # Require a real Feishu mention so pasted manuals, quotes, and
+            # ordinary discussion containing words such as "资料链接" or
+            # "知识库页面" remain completely silent.
+            if not mentioned:
+                return
             await self._reply_current_profile_links(message, session)
             return
         if save_request_evidence:

@@ -2304,7 +2304,7 @@ class FeishuBotTests(unittest.TestCase):
         self.assertIn("商户概况", reply)
         self.assertIn("https://example.feishu.cn/wiki/overview", reply)
 
-    def test_group_link_request_without_repeat_mention_reads_current_pages(self) -> None:
+    def test_group_link_request_without_mention_stays_silent(self) -> None:
         api = LiveDocumentApi()
         sessions = SessionStore()
         session = sessions.get("oc_live_links:group:root")
@@ -2329,6 +2329,66 @@ class FeishuBotTests(unittest.TestCase):
                     chat_id="oc_live_links",
                     chat_type="group",
                     mentioned_bot=False,
+                )
+            )
+        )
+
+        self.assertEqual(api.calls, [])
+        self.assertEqual(self.channel.replies, [])
+        self.assertEqual(session.group_buffer, [])
+
+    def test_pasted_usage_guide_with_plain_text_mentions_stays_silent(self) -> None:
+        api = LiveDocumentApi()
+        sessions = SessionStore()
+        session = sessions.get("oc_pasted_guide:group:root")
+        bot = FeishuBotController(
+            api=api,  # type: ignore[arg-type]
+            channel=self.channel,
+            sessions=sessions,
+        )
+
+        asyncio.run(
+            bot.on_message(
+                Message(
+                    "# 使用说明与边界\n先发资料，再 @机器人 总结。"
+                    "保存成功后返回知识库页面链接。",
+                    message_id="om_pasted_guide",
+                    chat_id="oc_pasted_guide",
+                    chat_type="group",
+                    mentioned_bot=False,
+                )
+            )
+        )
+
+        self.assertEqual(api.calls, [])
+        self.assertEqual(self.channel.replies, [])
+        self.assertEqual(session.group_buffer, [])
+
+    def test_group_link_request_with_mention_reads_current_pages(self) -> None:
+        api = LiveDocumentApi()
+        sessions = SessionStore()
+        session = sessions.get("oc_live_links:group:root")
+        session.merchant = {"name": "青禾便当", "id": "crm-1"}
+        session.last_documents = [
+            {
+                "label": "旧链接",
+                "url": "https://example.feishu.cn/wiki/stale",
+            }
+        ]
+        bot = FeishuBotController(
+            api=api,  # type: ignore[arg-type]
+            channel=self.channel,
+            sessions=sessions,
+        )
+
+        asyncio.run(
+            bot.on_message(
+                Message(
+                    "给我这个商户的资料文档链接",
+                    message_id="om_live_links_mentioned",
+                    chat_id="oc_live_links",
+                    chat_type="group",
+                    mentioned_bot=True,
                 )
             )
         )
